@@ -24,6 +24,7 @@ class CameraSnapshot:
     scale: float
     perspective: bool
     model_rotation: QQuaternion
+    point_size: float = 2.0  # viewport point size
 
     # ------------------------------------------------------------------
     # Serialization helpers (QVector3D / QQuaternion → plain floats)
@@ -42,6 +43,7 @@ class CameraSnapshot:
                 self.model_rotation.y(),
                 self.model_rotation.z(),
             ],
+            "point_size": self.point_size,
         }
 
     @classmethod
@@ -57,6 +59,7 @@ class CameraSnapshot:
             scale=float(d["scale"]),
             perspective=bool(d["perspective"]),
             model_rotation=QQuaternion(r[0], r[1], r[2], r[3]),
+            point_size=float(d.get("point_size", 2.0)),
         )
 
 

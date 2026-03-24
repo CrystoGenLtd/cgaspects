@@ -50,6 +50,8 @@ def interpolate_snapshot(a, b, t: float):
     # Perspective: use the value of whichever keyframe we are closer to
     perspective = a.perspective if t < 0.5 else b.perspective
 
+    point_size = a.point_size + (b.point_size - a.point_size) * t
+
     return CameraSnapshot(
         position=position,
         target=target,
@@ -57,4 +59,5 @@ def interpolate_snapshot(a, b, t: float):
         scale=scale,
         perspective=perspective,
         model_rotation=model_rotation,
+        point_size=point_size,
     )

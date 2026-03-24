@@ -39,6 +39,7 @@ class AxesRenderer:
         layout(triangle_strip, max_vertices = 4) out;
 
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelRotMat;
         uniform vec2 u_screenSize;
         uniform float u_axesThickness;
 
@@ -50,8 +51,8 @@ class AxesRenderer:
 
         void main() {
             // Apply view matrix rotation to positions
-            vec3 rotatedStart = mat3(u_viewMat) * gl_in[0].gl_Position.xyz * 0.1;
-            vec3 rotatedEnd = mat3(u_viewMat) * gl_in[1].gl_Position.xyz * 0.1;
+            vec3 rotatedStart = mat3(u_viewMat) * mat3(u_modelRotMat) * gl_in[0].gl_Position.xyz * 0.1;
+            vec3 rotatedEnd = mat3(u_viewMat) * mat3(u_modelRotMat) * gl_in[1].gl_Position.xyz * 0.1;
 
             // Correct for aspect ratio so axes don't stretch with window
             float aspect = u_screenSize.x / u_screenSize.y;
@@ -102,6 +103,7 @@ class AxesRenderer:
         layout(triangle_strip, max_vertices = 128) out;
 
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelRotMat;
         uniform mat4 u_projMat;
         uniform vec2 u_screenSize;
         uniform float u_axesThickness;
@@ -142,7 +144,7 @@ class AxesRenderer:
 
                 // Bottom vertex
                 vec3 pos1 = start + offset;
-                vec3 rotated1 = mat3(u_viewMat) * pos1 * 0.1;
+                vec3 rotated1 = mat3(u_viewMat) * mat3(u_modelRotMat) * pos1 * 0.1;
                 rotated1.x /= aspect;
                 rotated1.xy -= vec2(0.8, 0.8);
                 gl_Position = vec4(rotated1, 1.0);
@@ -153,7 +155,7 @@ class AxesRenderer:
 
                 // Top vertex
                 vec3 pos2 = end + offset;
-                vec3 rotated2 = mat3(u_viewMat) * pos2 * 0.1;
+                vec3 rotated2 = mat3(u_viewMat) * mat3(u_modelRotMat) * pos2 * 0.1;
                 rotated2.x /= aspect;
                 rotated2.xy -= vec2(0.8, 0.8);
                 gl_Position = vec4(rotated2, 1.0);
@@ -185,7 +187,7 @@ class AxesRenderer:
 
                 // Base vertex
                 vec3 pos1 = base + offset;
-                vec3 rotated1 = mat3(u_viewMat) * pos1 * 0.1;
+                vec3 rotated1 = mat3(u_viewMat) * mat3(u_modelRotMat) * pos1 * 0.1;
                 rotated1.x /= aspect;
                 rotated1.xy -= vec2(0.8, 0.8);
                 gl_Position = vec4(rotated1, 1.0);
@@ -195,7 +197,7 @@ class AxesRenderer:
                 EmitVertex();
 
                 // Tip vertex
-                vec3 rotated2 = mat3(u_viewMat) * tip * 0.1;
+                vec3 rotated2 = mat3(u_viewMat) * mat3(u_modelRotMat) * tip * 0.1;
                 rotated2.x /= aspect;
                 rotated2.xy -= vec2(0.8, 0.8);
                 gl_Position = vec4(rotated2, 1.0);
@@ -236,6 +238,7 @@ class AxesRenderer:
         layout(triangle_strip, max_vertices = 10) out;
 
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelRotMat;
         uniform vec2 u_screenSize;
         uniform float u_axesThickness;
 
@@ -246,8 +249,8 @@ class AxesRenderer:
         out vec4 f_color;
 
         void main() {
-            vec3 rotatedStart = mat3(u_viewMat) * gl_in[0].gl_Position.xyz * 0.1;
-            vec3 rotatedEnd = mat3(u_viewMat) * gl_in[1].gl_Position.xyz * 0.1;
+            vec3 rotatedStart = mat3(u_viewMat) * mat3(u_modelRotMat) * gl_in[0].gl_Position.xyz * 0.1;
+            vec3 rotatedEnd = mat3(u_viewMat) * mat3(u_modelRotMat) * gl_in[1].gl_Position.xyz * 0.1;
 
             // Correct for aspect ratio so axes don't stretch with window
             float aspect = u_screenSize.x / u_screenSize.y;

@@ -52,6 +52,7 @@ from .widgets import (
 from .utils.crystallography import Crystallography
 from .animation.keyframe import AnimationTimeline
 from .animation.timeline_widget import KeyframeTimelineWidget
+from .animation.keyframe import Keyframe
 
 log_dict = {"basic": "DEBUG", "console": "INFO"}
 setup_logging(**log_dict)
@@ -154,7 +155,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.settings_dialog = SettingsDialog(self)
         self.openglwidget = VisualisationWidget()
 
-
         self.crystalInfoWidget = CrystalInfoWidget(self)
         self.crystalInfoWidget.setEnabled(False)
         self.crystalInfo_groupBox.layout().addWidget(self.crystalInfoWidget)
@@ -225,11 +225,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.planes_dialog.planeNormalSliderMoved.connect(self._on_plane_normal_slider_moved)
         self.directions_dialog.addPlaneRequested.connect(self._on_add_plane_from_direction)
 
-        # Animation system
+        # Animation system — timeline embedded below the OpenGL widget
         self._animation_timeline = AnimationTimeline()
         self._timeline_dock = KeyframeTimelineWidget(self)
         self._timeline_dock.set_timeline(self._animation_timeline)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self._timeline_dock)
+        self.gl_vLayout.addWidget(self._timeline_dock, 1, 0, 1, 2)
+        self.gl_vLayout.setRowStretch(0, 1)  # OpenGL widget takes all spare height
+        self.gl_vLayout.setRowStretch(1, 0)  # Timeline takes only what it needs
         self._timeline_dock.hide()
         self._keyframe_preview_active = False
         self._render_worker = None
@@ -254,9 +256,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.cluster_analysis_pushButton = QPushButton("Clusters")
         self.cluster_analysis_pushButton.setEnabled(False)
         self.cluster_analysis_pushButton.setToolTip("Perform cluster analysis (DBSCAN/OPTICS)")
-        self.cluster_analysis_pushButton.setSizePolicy(
-            self.aspect_ratio_pushButton.sizePolicy()
-        )
+        self.cluster_analysis_pushButton.setSizePolicy(self.aspect_ratio_pushButton.sizePolicy())
 
         # Find the HBoxLayout inside verticalLayout_2 and replace it with a 2×2 grid
         vbox = self.verticalLayout_2
@@ -392,14 +392,26 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             menuRotLock.addAction(act)
         # Wire after all actions exist so cross-uncheck is safe
         for axis, act in self._rotation_lock_actions.items():
+
             def _on_lock_toggled(checked, a=axis):
                 if checked:
                     for other, other_act in self._rotation_lock_actions.items():
                         if other != a:
                             other_act.setChecked(False)
                 self.openglwidget.toggle_rotation_lock(a, checked)
+
             act.toggled.connect(_on_lock_toggled)
         self.menuView.addMenu(menuRotLock)
+
+        self.actionToggleCameraMode = QAction("Toggle Camera / Object Mode", self)
+        self.actionToggleCameraMode.setObjectName("actionToggleCameraMode")
+        self.actionToggleCameraMode.setShortcut("Tab")
+        self.actionToggleCameraMode.setShortcutContext(Qt.ApplicationShortcut)
+        self.actionToggleCameraMode.setToolTip(
+            "Switch between Camera orbit mode and Object rotation mode (Tab)"
+        )
+        self.actionToggleCameraMode.triggered.connect(self.openglwidget.toggle_interaction_mode)
+        self.menuView.addAction(self.actionToggleCameraMode)
 
         self.menuView.addSeparator()
 
@@ -462,7 +474,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.actionToggleTimeline = QAction("Keyframe Timeline", self)
         self.actionToggleTimeline.setObjectName("actionToggleTimeline")
-        self.actionToggleTimeline.setShortcut("Ctrl+Shift+T")
+        self.actionToggleTimeline.setShortcut("Ctrl+T")
         self.actionToggleTimeline.setCheckable(True)
         self.actionToggleTimeline.setChecked(False)
         self.actionToggleTimeline.triggered.connect(self._toggle_timeline_dock)
@@ -581,6 +593,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def show_thread_monitor(self):
         from .dialogs.thread_monitor_dialog import ThreadMonitorDialog
+
         pools = {
             "Main": self.threadpool,
             "AspectRatio": self.aspectratio.threadpool,
@@ -737,6 +750,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
 
         import matplotlib.cm as _cm
+
         tab10 = _cm.get_cmap("tab10")
         unique_labels = sorted(set(int(l) for l in labels))
         groups = []
@@ -953,19 +967,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         current_d = float(np.dot(normal, np.array(plane.origin, dtype=np.float64)))
         self.planes_dialog.configure_move_slider(d_min, d_max, current_d)
         self._plane_move_state = {
-            'row': row, 'normal': normal,
-            'd_min': d_min, 'd_max': d_max, 'steps': 2000,
+            "row": row,
+            "normal": normal,
+            "d_min": d_min,
+            "d_max": d_max,
+            "steps": 2000,
         }
 
     def _on_plane_normal_slider_moved(self, row, val):
         """Apply inline slider position to the plane origin."""
-        state = getattr(self, '_plane_move_state', None)
-        if state is None or state['row'] != row:
+        state = getattr(self, "_plane_move_state", None)
+        if state is None or state["row"] != row:
             return
-        d_min, d_max, steps = state['d_min'], state['d_max'], state['steps']
+        d_min, d_max, steps = state["d_min"], state["d_max"], state["steps"]
         slider_range = d_max - d_min if d_max > d_min else 1.0
         d = d_min + (val / steps) * slider_range
-        new_origin = tuple(float(v) for v in (state['normal'] * d))
+        new_origin = tuple(float(v) for v in (state["normal"] * d))
         self.planes_dialog.update_plane_origin_from_dialog(row, new_origin)
 
     def welcome_message(self):
@@ -1448,9 +1465,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.summ_df = pd.read_csv(summary_file, encoding="utf-8", encoding_errors="replace")
 
         # Propagate the summary file path to all analysis objects so workers pick it up
-        for analysis_obj in (self.aspectratio, self.growthrate, self.clusteranalysis, self.siteanalysis):
+        for analysis_obj in (
+            self.aspectratio,
+            self.growthrate,
+            self.clusteranalysis,
+            self.siteanalysis,
+        ):
             if analysis_obj.information is not None:
-                analysis_obj.information = analysis_obj.information._replace(summary_file=summary_file)
+                analysis_obj.information = analysis_obj.information._replace(
+                    summary_file=summary_file
+                )
         if list(self.summ_df.columns)[-1].startswith("Unnamed"):
             self.summ_df = self.summ_df.iloc[:, 1:-1]
         else:
@@ -1614,8 +1638,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _add_keyframe(self):
         """Capture the current viewport state as a keyframe."""
-        from .animation.keyframe import Keyframe
-        snap = self.openglwidget.camera.snapshot()
+
+        snap = self.openglwidget.snapshot()
         tl = self._animation_timeline
         # Place at end of timeline + 1 second
         t = tl.keyframes[-1].time + 1.0 if tl.keyframes else 0.0
@@ -1623,7 +1647,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         kf = Keyframe(time=t, camera=snap, data_frame=data_frame)
         tl.add_keyframe(kf)
         self._timeline_dock.refresh()
-        # Show the dock if hidden
+        # Show the timeline panel if hidden
         if not self._timeline_dock.isVisible():
             self._timeline_dock.show()
             self.actionToggleTimeline.setChecked(True)
@@ -1655,8 +1679,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def _open_render_dialog(self):
         """Open the render animation settings dialog."""
         from .animation.render_dialog import RenderAnimationDialog
+
         if len(self._animation_timeline.keyframes) < 2:
             from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.information(
                 self,
                 "No Animation",
@@ -1675,6 +1701,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _on_render_started(self, worker):
         """Bridge: connect render worker's frameRequested to the main-thread render slot."""
+        self._timeline_dock.stop_preview()
         self._render_worker = worker
         worker.frameRequested.connect(self._on_render_frame_requested)
 
@@ -1691,6 +1718,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def _save_animation(self):
         """Save the current animation timeline to a JSON file."""
         import json
+
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Animation", "animation.json", "Animation (*.json)"
         )
@@ -1701,14 +1729,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 json.dump(self._animation_timeline.to_dict(), f, indent=2)
         except Exception as exc:
             from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.critical(self, "Save Error", str(exc))
 
     def _load_animation(self):
         """Load an animation timeline from a JSON file."""
         import json
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Animation", "", "Animation (*.json)"
-        )
+
+        path, _ = QFileDialog.getOpenFileName(self, "Load Animation", "", "Animation (*.json)")
         if not path:
             return
         try:
@@ -1720,6 +1748,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.actionToggleTimeline.setChecked(True)
         except Exception as exc:
             from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.critical(self, "Load Error", str(exc))
 
     def close_opengl_widget(self):

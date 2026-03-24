@@ -50,6 +50,12 @@ class Camera:
         model.rotate(self.model_rotation)
         return model
 
+    def modelRotationMatrix(self):
+        """Pure rotation matrix for the object (no scale), used by axes renderer."""
+        mat = QMatrix4x4()
+        mat.rotate(self.model_rotation)
+        return mat
+
     def viewMatrix(self):
         view = QMatrix4x4()
         view.lookAt(self.position, self.target, self.up)
@@ -104,8 +110,8 @@ class Camera:
 
     def rotate_model(self, dx: float, dy: float) -> None:
         """Accumulate object rotation from mouse delta (non-destructive)."""
-        q_yaw = QQuaternion.fromAxisAndAngle(QVector3D(0, 1, 0), -dx * self.rotationSpeed)
-        q_pitch = QQuaternion.fromAxisAndAngle(QVector3D(1, 0, 0), dy * self.rotationSpeed)
+        q_yaw = QQuaternion.fromAxisAndAngle(self.up, dx * self.rotationSpeed)
+        q_pitch = QQuaternion.fromAxisAndAngle(self.right, -dy * self.rotationSpeed)
         self.model_rotation = (q_yaw * q_pitch * self.model_rotation).normalized()
 
     def reset_model_rotation(self) -> None:

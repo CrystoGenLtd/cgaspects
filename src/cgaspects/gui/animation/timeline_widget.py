@@ -15,20 +15,17 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox,
-    QDockWidget,
     QDoubleSpinBox,
     QGraphicsItem,
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QMenu,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QVBoxLayout,
     QWidget,
-    QMenu,
 )
 
 from .keyframe import AnimationTimeline, Keyframe, INTERPOLATION_MODES
@@ -92,10 +89,25 @@ class _KeyframeItem(QGraphicsItem):
             clamped_x = max(min_x, min(max_x, new_pos.x()))
             new_pos.setX(clamped_x)
             return new_pos
-        if change == QGraphicsItem.ItemPositionHasChanged and self._view:
+        # Do NOT emit keyframeMoved here — rebuild() during drag deletes the live item.
+        # Emit is deferred to mouseReleaseEvent instead.
+        return super().itemChange(change, value)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self._view and self._dragging:
             new_time = self._view._x_to_time(self.x())
             self._view.keyframeMoved.emit(self._index, new_time)
-        return super().itemChange(change, value)
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        self._dragging = True
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._dragging = False
+        self._view.keyframeDoubleClicked.emit(self._index)
+        super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -109,17 +121,69 @@ class _KeyframeItem(QGraphicsItem):
 
 
 # ---------------------------------------------------------------------------
+# Playhead item
+# ---------------------------------------------------------------------------
+
+class _PlayheadItem(QGraphicsItem):
+    """Draggable vertical dashed line marking the current time position."""
+
+    def __init__(self, x: float, ruler_height: int, track_height: int, view: "_TimelineView"):
+        super().__init__()
+        self._ruler_height = ruler_height
+        self._track_height = track_height
+        self._total_height = ruler_height + track_height
+        self._view = view
+        self._suppress_signal = False
+        self.setPos(x, 0)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setZValue(2)
+        self.setCursor(Qt.SizeHorCursor)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-5, 0, 10, self._total_height)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        pen = QPen(QColor(255, 80, 80), 1.5, Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(0, self._ruler_height, 0, self._total_height)
+        # Small triangle handle in the ruler
+        painter.setBrush(QBrush(QColor(255, 80, 80)))
+        painter.setPen(Qt.NoPen)
+        painter.drawPolygon(QPolygonF([
+            QPointF(-5, 0),
+            QPointF(5, 0),
+            QPointF(0, 9),
+        ]))
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange and self._view:
+            new_pos = value
+            new_pos.setY(0)
+            min_x = self._view._time_to_x(0)
+            max_x = self._view._time_to_x(self._view._timeline.duration)
+            new_pos.setX(max(min_x, min(max_x, new_pos.x())))
+            return new_pos
+        if change == QGraphicsItem.ItemPositionHasChanged and self._view and not self._suppress_signal:
+            t = self._view._x_to_time(self.x())
+            self._view.playheadMoved.emit(t)
+        return super().itemChange(change, value)
+
+
+# ---------------------------------------------------------------------------
 # Timeline graphics view
 # ---------------------------------------------------------------------------
 
 class _TimelineView(QGraphicsView):
     """Custom graphics view rendering the ruler, keyframe diamonds, and segment labels."""
 
-    keyframeMoved = Signal(int, float)   # (index, new_time)
+    keyframeMoved = Signal(int, float)      # (index, new_time)
     keyframeRemoved = Signal(int)
     keyframeDuplicated = Signal(int)
-    keyframeSelected = Signal(int)       # index clicked
-    timelineClicked = Signal(float)      # bare click on ruler → preview seek
+    keyframeSelected = Signal(int)          # index clicked
+    keyframeDoubleClicked = Signal(int)     # index double-clicked → seek to keyframe
+    timelineClicked = Signal(float)         # bare click on ruler → preview seek
+    playheadMoved = Signal(float)           # user dragged the playhead
 
     RULER_HEIGHT = 20
     TRACK_HEIGHT = 60
@@ -128,6 +192,8 @@ class _TimelineView(QGraphicsView):
         super().__init__(parent)
         self._timeline = timeline
         self._items: list[_KeyframeItem] = []
+        self._playhead_time: float = 0.0
+        self._playhead_item: Optional[_PlayheadItem] = None
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self.setRenderHint(QPainter.Antialiasing)
@@ -191,7 +257,24 @@ class _TimelineView(QGraphicsView):
             self._scene.addItem(item)
             self._items.append(item)
 
+        # Draw playhead
+        self._playhead_item = _PlayheadItem(
+            self._time_to_x(self._playhead_time),
+            self.RULER_HEIGHT,
+            self.TRACK_HEIGHT,
+            self,
+        )
+        self._scene.addItem(self._playhead_item)
+
         self._scene.setSceneRect(0, 0, self.viewport().width(), total_h)
+
+    def set_playhead_time(self, t: float) -> None:
+        """Move the playhead to the given time without emitting playheadMoved."""
+        self._playhead_time = t
+        if self._playhead_item is not None:
+            self._playhead_item._suppress_signal = True
+            self._playhead_item.setPos(self._time_to_x(t), 0)
+            self._playhead_item._suppress_signal = False
 
     # ------------------------------------------------------------------
     # Drawing ruler via background
@@ -244,13 +327,26 @@ class _TimelineView(QGraphicsView):
                     self.keyframeSelected.emit(it.index)
                     break
 
+    def keyPressEvent(self, event):
+        selected = [it for it in self._items if it.isSelected()]
+        if selected:
+            idx = selected[0].index
+            if event.key() == Qt.Key_D:
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.keyframeDuplicated.emit(idx)
+                else:
+                    self.keyframeRemoved.emit(idx)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # Main dock widget
 # ---------------------------------------------------------------------------
 
-class KeyframeTimelineWidget(QDockWidget):
-    """Dockable keyframe animation timeline panel."""
+class KeyframeTimelineWidget(QWidget):
+    """Inline keyframe animation timeline panel (embedded below the OpenGL viewport)."""
 
     # Signals consumed by MainWindow
     keyframeAddRequested = Signal()
@@ -264,13 +360,7 @@ class KeyframeTimelineWidget(QDockWidget):
     renderRequested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("Keyframe Animation", parent)
-        self.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
-        self.setFeatures(
-            QDockWidget.DockWidgetMovable
-            | QDockWidget.DockWidgetFloatable
-            | QDockWidget.DockWidgetClosable
-        )
+        super().__init__(parent)
 
         self._timeline: Optional[AnimationTimeline] = None
         self._preview_timer = QTimer(self)
@@ -281,8 +371,7 @@ class KeyframeTimelineWidget(QDockWidget):
         self._build_ui()
 
     def _build_ui(self):
-        container = QWidget()
-        main_layout = QVBoxLayout(container)
+        main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(4, 4, 4, 4)
         main_layout.setSpacing(4)
 
@@ -333,7 +422,9 @@ class KeyframeTimelineWidget(QDockWidget):
         self._timeline_view.keyframeRemoved.connect(self._on_kf_removed)
         self._timeline_view.keyframeDuplicated.connect(self._on_kf_duplicated)
         self._timeline_view.keyframeSelected.connect(self._on_kf_selected)
+        self._timeline_view.keyframeDoubleClicked.connect(self._on_kf_double_clicked)
         self._timeline_view.timelineClicked.connect(self._on_timeline_click)
+        self._timeline_view.playheadMoved.connect(self._on_playhead_moved)
 
         # --- Inspector row ---
         inspector = QWidget()
@@ -350,13 +441,6 @@ class KeyframeTimelineWidget(QDockWidget):
         self._spin_kf_time.valueChanged.connect(self._on_inspector_time_changed)
 
         inspector_layout.addWidget(self._spin_kf_time)
-        inspector_layout.addWidget(QLabel("Label:"))
-        self._edit_label = QLineEdit()
-        self._edit_label.setFixedWidth(100)
-        self._edit_label.setEnabled(False)
-        self._edit_label.editingFinished.connect(self._on_inspector_label_changed)
-
-        inspector_layout.addWidget(self._edit_label)
         inspector_layout.addWidget(QLabel("Data frame:"))
         self._spin_data_frame = QSpinBox()
         self._spin_data_frame.setRange(-1, 99999)
@@ -378,8 +462,6 @@ class KeyframeTimelineWidget(QDockWidget):
         main_layout.addWidget(toolbar)
         main_layout.addWidget(self._timeline_view)
         main_layout.addWidget(inspector)
-
-        self.setWidget(container)
 
     # ------------------------------------------------------------------
     # Public API
@@ -432,6 +514,7 @@ class KeyframeTimelineWidget(QDockWidget):
             self._stop_preview()
             return
         self.previewRequested.emit(self._preview_time)
+        self._timeline_view.set_playhead_time(self._preview_time)
         self._preview_time += 1.0 / max(1, self._timeline.fps)
         if self._preview_time > self._timeline.duration:
             self._preview_time = self._timeline.keyframes[0].time  # loop
@@ -444,7 +527,8 @@ class KeyframeTimelineWidget(QDockWidget):
         if self._timeline is None:
             return
         self._timeline.move_keyframe(index, new_time)
-        self._timeline_view.rebuild()
+        # Defer rebuild so we don't delete the item while still inside its mouseReleaseEvent
+        QTimer.singleShot(0, self._timeline_view.rebuild)
         self.keyframeMoved.emit(index, new_time)
 
     def _on_kf_removed(self, index: int):
@@ -471,7 +555,22 @@ class KeyframeTimelineWidget(QDockWidget):
         self._update_inspector(index)
         self.keyframeSelected.emit(index)
 
+    def _on_kf_double_clicked(self, index: int):
+        """Seek the viewport to the exact time of the double-clicked keyframe."""
+        if self._timeline is None or index >= len(self._timeline.keyframes):
+            return
+        t = self._timeline.keyframes[index].time
+        self._preview_time = t
+        self._timeline_view.set_playhead_time(t)
+        self.previewRequested.emit(t)
+
+    def _on_playhead_moved(self, t: float):
+        """User dragged the playhead — seek viewport and sync preview time."""
+        self._preview_time = t
+        self.previewRequested.emit(t)
+
     def _on_timeline_click(self, t: float):
+        self._timeline_view.set_playhead_time(t)
         self.previewRequested.emit(t)
 
     # ------------------------------------------------------------------
@@ -481,7 +580,6 @@ class KeyframeTimelineWidget(QDockWidget):
     def _update_inspector(self, index: Optional[int]):
         has = index is not None and self._timeline is not None and index < len(self._timeline.keyframes)
         self._spin_kf_time.setEnabled(has)
-        self._edit_label.setEnabled(has)
         self._spin_data_frame.setEnabled(has)
 
         # Segment interpolation: enabled if there is a next keyframe
@@ -492,7 +590,6 @@ class KeyframeTimelineWidget(QDockWidget):
             self._spin_kf_time.blockSignals(True)
             self._spin_kf_time.setValue(0)
             self._spin_kf_time.blockSignals(False)
-            self._edit_label.setText("")
             self._spin_data_frame.blockSignals(True)
             self._spin_data_frame.setValue(-1)
             self._spin_data_frame.blockSignals(False)
@@ -502,7 +599,6 @@ class KeyframeTimelineWidget(QDockWidget):
         self._spin_kf_time.blockSignals(True)
         self._spin_kf_time.setValue(kf.time)
         self._spin_kf_time.blockSignals(False)
-        self._edit_label.setText(kf.label)
         self._spin_data_frame.blockSignals(True)
         self._spin_data_frame.setValue(-1 if kf.data_frame is None else kf.data_frame)
         self._spin_data_frame.blockSignals(False)
@@ -519,13 +615,6 @@ class KeyframeTimelineWidget(QDockWidget):
             return
         self._timeline.move_keyframe(self._selected_kf_index, val)
         self._timeline_view.rebuild()
-
-    def _on_inspector_label_changed(self):
-        if self._selected_kf_index is None or self._timeline is None:
-            return
-        idx = self._selected_kf_index
-        if idx < len(self._timeline.keyframes):
-            self._timeline.keyframes[idx].label = self._edit_label.text()
 
     def _on_inspector_data_frame_changed(self, val: int):
         if self._selected_kf_index is None or self._timeline is None:

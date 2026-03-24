@@ -110,12 +110,12 @@ class RenderAnimationDialog(QDialog):
         form.addRow("Resolution:", res_row)
 
         # FPS (display only, from timeline)
-        self._lbl_fps = QLabel(f"{timeline.fps} fps")
+        self._lbl_fps = QLabel(f"{self._timeline.fps} fps")
         form.addRow("Frame rate:", self._lbl_fps)
 
         # Duration / frame count (display only)
-        n = timeline.total_frames()
-        self._lbl_frames = QLabel(f"{n} frames ({timeline.duration:.1f} s)")
+        n = self._timeline.total_frames()
+        self._lbl_frames = QLabel(f"{n} frames ({self._timeline.duration:.1f} s)")
         form.addRow("Frames:", self._lbl_frames)
 
         layout.addLayout(form)
