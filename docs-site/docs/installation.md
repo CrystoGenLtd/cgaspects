@@ -17,8 +17,11 @@ CGAspects depends on the following packages (installed automatically):
 | SciPy | Convex hull, spatial analysis, signal processing |
 | Pandas | Data frames for analysis results |
 | Matplotlib | Scientific plotting |
+| Seaborn | Statistical data visualisation |
+| scikit-learn | Machine learning and clustering |
 | Trimesh | 3D mesh I/O and geometry |
 | PyOpenGL | OpenGL bindings |
+| natsort | Natural sorting of file and directory names |
 
 ---
 
