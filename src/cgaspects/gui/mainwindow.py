@@ -405,10 +405,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.actionToggleCameraMode = QAction("Toggle Camera / Object Mode", self)
         self.actionToggleCameraMode.setObjectName("actionToggleCameraMode")
-        self.actionToggleCameraMode.setShortcut("Tab")
+        self.actionToggleCameraMode.setShortcut("Ctrl+K")
         self.actionToggleCameraMode.setShortcutContext(Qt.ApplicationShortcut)
         self.actionToggleCameraMode.setToolTip(
-            "Switch between Camera orbit mode and Object rotation mode (Tab)"
+            "Switch between Camera orbit mode and Object rotation mode (Ctrl+K)"
         )
         self.actionToggleCameraMode.triggered.connect(self.openglwidget.toggle_interaction_mode)
         self.menuView.addAction(self.actionToggleCameraMode)

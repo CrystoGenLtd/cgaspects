@@ -1553,32 +1553,6 @@ class VisualisationWidget(QOpenGLWidget):
 
         # Draw text labels using QPainter overlay
         self._draw_axis_labels()
-        self._draw_mode_indicator()
-
-    def _draw_mode_indicator(self):
-        """Draw a small CAM/OBJ mode badge in the top-left corner."""
-        from PySide6.QtGui import QPen, QBrush
-        from PySide6.QtCore import QRectF
-
-        label = "OBJ" if self.interaction_mode == "object" else "CAM"
-        color = QColor(220, 120, 30) if self.interaction_mode == "object" else QColor(40, 140, 220)
-
-        painter = QPainter(self)
-        painter.beginNativePainting()
-        painter.endNativePainting()
-        painter.setRenderHint(QPainter.Antialiasing)
-        font = QFont("Arial", 9, QFont.Bold)
-        painter.setFont(font)
-        fm = painter.fontMetrics()
-        text_width = fm.horizontalAdvance(label)
-        padding = 5
-        rect = QRectF(8, 8, text_width + padding * 2, fm.height() + padding)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 140)))
-        painter.setPen(QPen(color, 1.5))
-        painter.drawRoundedRect(rect, 3, 3)
-        painter.setPen(QPen(color))
-        painter.drawText(rect.adjusted(padding, padding / 2, 0, 0), label)
-        painter.end()
 
     def _draw_axis_labels(self):
         """Draw axis labels using QPainter overlay without affecting OpenGL state."""
