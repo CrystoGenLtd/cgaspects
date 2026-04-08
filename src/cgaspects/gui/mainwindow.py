@@ -10,46 +10,38 @@ import pandas as pd
 from natsort import natsorted
 from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QSignalBlocker, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QIcon, Qt, QAction
-from PySide6.QtWidgets import (
-    QFileDialog,
-    QGridLayout,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-)
+from PySide6.QtGui import QAction, QIcon, Qt
+from PySide6.QtWidgets import (QFileDialog, QGridLayout, QMainWindow,
+                               QMessageBox, QProgressBar, QPushButton)
 
 from ..analysis.aspect_ratios import AspectRatio
 from ..analysis.cluster_analysis import ClusterAnalysis
 from ..analysis.growth_rates import GrowthRate
-from ..analysis.site_analysis import SiteAnalysis
 from ..analysis.gui_threads import WorkerXYZ
-from ..fileio.find_data import find_info, locate_xyz_files, parse_structure_file
-from ..fileio.xyz_file import CrystalCloud
-from ..fileio.logging import setup_logging, get_log_file_path
+from ..analysis.site_analysis import SiteAnalysis
+from ..fileio.find_data import (find_info, locate_xyz_files,
+                                parse_molecular_data, parse_structure_file)
+from ..fileio.logging import get_log_file_path, setup_logging
 from ..fileio.opendir import open_directory
+from ..fileio.xyz_file import CrystalCloud
 from .crystal_info import CrystalInfo
 from .dialogs import CrystalInfoWidget, PlottingDialog
-from .dialogs.color_legend_dialog import ColorLegendDialog
-from .dialogs.settings import SettingsDialog
 from .dialogs.about import AboutCGDialog
-from .shortcuts_manager import ShortcutsManager
+from .dialogs.atom_mode_settings_dialog import AtomModeSettingsDialog
+from .dialogs.axes_settings_dialog import AxesSettingsDialog
+from .dialogs.color_legend_dialog import ColorLegendDialog
+from .dialogs.directions_dialog import DirectionsDialog
 from .dialogs.keyboard_shortcuts import KeyboardShortcutsDialog
 from .dialogs.lattice_dialog import LatticeParametersDialog
-from .dialogs.site_highlight_dialog import SiteHighlightDialog
-from .dialogs.axes_settings_dialog import AxesSettingsDialog
-from .dialogs.directions_dialog import DirectionsDialog
 from .dialogs.planes_dialog import PlanesDialog
+from .dialogs.settings import SettingsDialog
+from .dialogs.site_highlight_dialog import SiteHighlightDialog
 from .load_ui import Ui_MainWindow
-from .visualisation.openGL import VisualisationWidget
-from .widgets import (
-    PointInfoToolbar,
-    SimulationVariablesWidget,
-    TextFileViewer,
-    VisualizationSettingsWidget,
-)
+from .shortcuts_manager import ShortcutsManager
 from .utils.crystallography import Crystallography
+from .visualisation.openGL import VisualisationWidget
+from .widgets import (PointInfoToolbar, SimulationVariablesWidget,
+                      TextFileViewer, VisualizationSettingsWidget)
 
 log_dict = {"basic": "DEBUG", "console": "INFO"}
 setup_logging(**log_dict)
@@ -199,6 +191,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 ps_widget.slider.blockSignals(False),
             )
         )
+
+        # Create atom mode settings dialog (non-modal, shown via Crystallography menu)
+        self.atom_mode_settings_dialog = AtomModeSettingsDialog(parent=self)
+        self.atom_mode_settings_dialog.settingsChanged.connect(self._handle_atom_mode_settings)
+        self.openglwidget.styleChanged.connect(self._on_style_changed)
 
         # Create site highlighting dialog
         self.site_highlight_dialog = SiteHighlightDialog(parent=self)
@@ -398,6 +395,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         actStore.triggered.connect(self.openglwidget.store_view)
         self.menuView.addAction(actStore)
 
+        actAtomView = QAction("Toggle Atom View", self)
+        actAtomView.setObjectName("actionToggleAtomView")
+        actAtomView.setShortcut("Shift+V")
+        actAtomView.setToolTip(
+            "Switch between centroid (Spheres) and per-atom view (requires structure file)"
+        )
+        actAtomView.triggered.connect(self.openglwidget.toggle_atom_view)
+        self.menuView.addAction(actAtomView)
+
         menuPointSize = QMenu("Point Size", self)
         actIncrease = QAction("Increase", self)
         actIncrease.setObjectName("actionIncreasePointSize")
@@ -429,6 +435,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionAddPlanes.setToolTip("Add crystallographic planes to the visualization")
         self.actionAddPlanes.triggered.connect(self.show_planes_dialog)
         self.menuCrystallography.addAction(self.actionAddPlanes)
+
+        self.menuCrystallography.addSeparator()
+
+        self.actionAtomModeSettings = QAction("Atom Mode Settings…", self)
+        self.actionAtomModeSettings.setObjectName("actionAtomModeSettings")
+        self.actionAtomModeSettings.setShortcut("Ctrl+Shift+M")
+        self.actionAtomModeSettings.setToolTip(
+            "Adjust per-element colours, atom sizes, and bond radius for Atom view"
+        )
+        self.actionAtomModeSettings.setEnabled(False)   # enabled only in Atom mode
+        self.actionAtomModeSettings.triggered.connect(self.show_atom_mode_settings)
+        self.menuCrystallography.addAction(self.actionAtomModeSettings)
 
         # Tools menu
         self.menuTools = QMenu("Tools", self)
@@ -1200,7 +1218,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.input_folder = folder
         information = find_info(folder)
 
-        # Auto-load structure file for fractional axes if available
+        # Auto-load structure file for fractional axes and molecular data if available
         if information.structure_file:
             cell = parse_structure_file(information.structure_file)
             if cell is not None:
@@ -1215,6 +1233,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
                 self.log_message(
                     f"Auto-loaded lattice parameters: a={cell.a:.2f} b={cell.b:.2f} c={cell.c:.2f}",
+                    "info",
+                )
+
+            # Parse molecular templates for the Atom view (Shift+V)
+            mol_templates = parse_molecular_data(information.structure_file)
+            if mol_templates and self.crystallography is not None:
+                self.openglwidget.set_molecular_data(mol_templates, self.crystallography)
+                self.log_message(
+                    f"Loaded {len(mol_templates)} molecule template(s) — "
+                    "press Shift+V to switch to Atom view",
                     "info",
                 )
 
@@ -1508,10 +1536,46 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.openglwidget.clear_highlighted_sites()
             self.openglwidget.updateSettings(**settings)
 
+        # Keep "Atom Mode Settings" menu item in sync with current style
+        new_style = settings.get("Style", "")
+        self.actionAtomModeSettings.setEnabled(new_style == "Atoms")
+
         fps = self.visualizationSettings.fps()
         if self.fps != fps:
             self.frame_timer.start(1000 // self.fps)
             self.fps = fps
+
+    def show_atom_mode_settings(self):
+        """Open the Atom Mode Settings dialog, populated with current elements."""
+        elements = self.openglwidget.get_visible_elements()
+        if not elements:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self,
+                "Atom Mode Settings",
+                "No molecular data loaded yet.\n"
+                "Load a simulation folder with a structure file and switch to Atom view first.",
+            )
+            return
+        color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
+        self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r)
+        self.atom_mode_settings_dialog.show()
+        self.atom_mode_settings_dialog.raise_()
+        self.atom_mode_settings_dialog.activateWindow()
+
+    def _handle_atom_mode_settings(self, color_overrides, radius_overrides, bond_radius):
+        """Relay atom-mode override changes from the dialog to the OpenGL widget."""
+        self.openglwidget.set_atom_overrides(color_overrides, radius_overrides, bond_radius)
+
+    def _on_style_changed(self, style: str):
+        """Enable / disable the Atom Mode Settings menu item based on the active style."""
+        is_atom = style == "Atoms"
+        self.actionAtomModeSettings.setEnabled(is_atom)
+        # If switching into Atom mode and the dialog is already open, refresh its contents
+        if is_atom and self.atom_mode_settings_dialog.isVisible():
+            elements = self.openglwidget.get_visible_elements()
+            color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
+            self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r)
 
     # Utility function to clear a layout of all its widgets
     def clear_layout(self, layout):

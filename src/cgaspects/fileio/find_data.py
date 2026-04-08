@@ -1,24 +1,17 @@
 import logging
 import time
 from collections import namedtuple
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import numpy as np
 import pandas as pd
 from natsort import natsorted
+from PySide6.QtWidgets import (QApplication, QDialog, QListWidget, QMessageBox,
+                               QPushButton, QVBoxLayout)
 
-from PySide6.QtWidgets import (
-    QApplication,
-    QDialog,
-    QVBoxLayout,
-    QListWidget,
-    QPushButton,
-    QMessageBox,
-)
-
-from ..utils.data_structures import file_info_tuple
 from ..gui.utils.crystallography import Cell
+from ..utils.data_structures import file_info_tuple
 
 logger = logging.getLogger("CA:FileIO")
 
@@ -375,6 +368,123 @@ def combine_xyz_cda(CDA_df, XYZ_df):
     logger.debug("Combined df:\n%s", combine_df)
 
     return combine_df
+
+
+@dataclass
+class MolAtom:
+    symbol: str
+    frac: np.ndarray  # fractional coordinates, shape (3,)
+
+
+@dataclass
+class MolTemplate:
+    formula: str
+    mol_type: int
+    atoms: list[MolAtom]
+    bonds: list[tuple[int, int]]  # 0-based atom index pairs
+
+
+def parse_molecular_data(file_path: str | Path) -> dict[int, MolTemplate] | None:
+    """Parse per-molecule-type atom coordinates and bonds from a CrystalGrower structure file.
+
+    After the 'Non primitive data' lattice block, the file has one block per molecule type:
+
+        FORMULA  TYPE  N_ATOMS/N_BONDS
+        INDEX  SYMBOL  FRAC_X  FRAC_Y  FRAC_Z
+        ...
+        (blank line)
+        ATOM1  ATOM2
+        ...
+        (blank line)
+
+    Returns a dict mapping mol_type (int) → MolTemplate, or None on failure.
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        logger.warning("Structure file not found: %s", file_path)
+        return None
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+        # Locate the "Non primitive data" section
+        start = None
+        for i, line in enumerate(lines):
+            if "Non primitive data" in line:
+                start = i + 3  # skip the two lattice-parameter lines
+                break
+
+        if start is None:
+            logger.warning("'Non primitive data' section not found in %s", file_path)
+            return None
+
+        templates: dict[int, MolTemplate] = {}
+        i = start
+
+        while i < len(lines):
+            raw = lines[i].strip()
+            parts = raw.split()
+
+            # Molecule header: FORMULA  TYPE  N_ATOMS/N_BONDS
+            if len(parts) == 3 and "/" in parts[2]:
+                try:
+                    formula = parts[0]
+                    mol_type = int(parts[1])
+                    n_atoms, n_bonds = map(int, parts[2].split("/"))
+                except ValueError:
+                    i += 1
+                    continue
+
+                i += 1
+                atoms: list[MolAtom] = []
+                for _ in range(n_atoms):
+                    if i >= len(lines):
+                        break
+                    aparts = lines[i].strip().split()
+                    if len(aparts) >= 5:
+                        symbol = aparts[1]
+                        frac = np.array(
+                            [float(aparts[2]), float(aparts[3]), float(aparts[4])],
+                            dtype=np.float64,
+                        )
+                        atoms.append(MolAtom(symbol=symbol, frac=frac))
+                    i += 1
+
+                # Skip blank line(s) between atoms and bonds
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+
+                bonds: list[tuple[int, int]] = []
+                for _ in range(n_bonds):
+                    if i >= len(lines):
+                        break
+                    bparts = lines[i].strip().split()
+                    if len(bparts) == 2:
+                        try:
+                            bonds.append((int(bparts[0]) - 1, int(bparts[1]) - 1))
+                        except ValueError:
+                            pass
+                    i += 1
+
+                templates[mol_type] = MolTemplate(
+                    formula=formula, mol_type=mol_type, atoms=atoms, bonds=bonds
+                )
+            else:
+                i += 1
+
+        if not templates:
+            logger.warning("No molecule templates found in %s", file_path)
+            return None
+
+        logger.info(
+            "Parsed %d molecule template(s) from %s", len(templates), file_path.name
+        )
+        return templates
+
+    except Exception as e:
+        logger.error("Error parsing molecular data from %s: %s", file_path, e)
+        return None
 
 
 def parse_structure_file(file_path: str | Path) -> Cell | None:

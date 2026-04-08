@@ -2,29 +2,31 @@ import logging
 from pathlib import Path
 
 import numpy as np
+import trimesh
 from matplotlib import cm
-from OpenGL.GL import GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
+from OpenGL.GL import (GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
+                       GL_DEPTH_TEST)
 from PySide6 import QtCore
-from PySide6.QtCore import Qt, QUrl, QPoint, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QFont, QVector3D
+from PySide6.QtCore import QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QVector3D
 from PySide6.QtOpenGL import QOpenGLDebugLogger, QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+from scipy.spatial import ConvexHull
 
 from ...fileio.xyz_file import CrystalCloud
+from ..widgets.overlay_widget import TransparentOverlay
+from .atom_renderer import AtomRenderer
 from .axes_renderer import AxesRenderer
+from .bond_renderer import BondRenderer
 from .camera import Camera
 from .direction_renderer import DirectionRenderer
+from .line_renderer import LineRenderer
+from .mesh_renderer import MeshRenderer
 from .plane_renderer import PlaneRenderer
 from .point_cloud_renderer import SimplePointRenderer
 from .sphere_renderer import SphereRenderer
 from .sphere_selection_renderer import SphereSelectionRenderer
-from .mesh_renderer import MeshRenderer
-from .line_renderer import LineRenderer
-from ..widgets.overlay_widget import TransparentOverlay
-import trimesh
-from scipy.spatial import ConvexHull
-
 
 logger = logging.getLogger("CA:OpenGL")
 
@@ -57,6 +59,7 @@ class VisualisationWidget(QOpenGLWidget):
     pointsDeleted = Signal(int)  # Number of points deleted
     pointSizeChanged = Signal(int)  # Emitted when point size changes (integer value)
     legendChanged = Signal(dict)  # Emitted when the colour legend data changes
+    styleChanged = Signal(str)   # Emitted when the render style changes (e.g. "Atoms", "Spheres")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -84,6 +87,18 @@ class VisualisationWidget(QOpenGLWidget):
         self._raw_directions = []
         self._directions_crystallography = None
         self._directions_max_extent = 1.0
+
+        # Atom / bond view state
+        self._mol_templates = None          # dict[int, MolTemplate] from structure file
+        self._mol_crystallography = None    # Crystallography used to convert frac → cart
+        self._mol_cart_templates = {}       # precomputed per-type: (cart_atoms, symbols, bonds)
+        self.atom_renderer = None
+        self.bond_renderer = None
+
+        # Per-element overrides (set via Atom Mode Settings dialog)
+        self._atom_color_overrides: dict[str, tuple[float, float, float]] = {}
+        self._atom_radius_overrides: dict[str, float] = {}  # absolute VdW radius in Å
+        self._bond_radius: float = 0.20                     # bond cylinder radius in Å
 
         # Sphere selection state (Shift + Left click + drag)
         self._sphere_sel_center_world = None  # np.array [x, y, z] — set on press
@@ -603,6 +618,7 @@ class VisualisationWidget(QOpenGLWidget):
 
         if present_and_changed("Style", self.style):
             self.style = kwargs["Style"]
+            self.styleChanged.emit(self.style)
             needs_reinit = True
 
         if present_and_changed("Show Mesh Edges", self.show_mesh_edges):
@@ -946,7 +962,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _draw_sphere_selection(self, gl, uniforms):
         """Draw the transparent selection sphere with alpha blending."""
-        from OpenGL.GL import GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA
+        from OpenGL.GL import GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA
 
         if self.sphere_selection_renderer is None:
             return
@@ -1185,6 +1201,11 @@ class VisualisationWidget(QOpenGLWidget):
         if self.point_cloud_renderer is None:
             return
 
+        if self.style == "Atoms":
+            self._update_atom_view()
+            self.update()
+            return
+
         varray = self.updatePointCloudVertices()
         self.point_cloud_renderer.setPoints(varray)
         self.sphere_renderer.setPoints(varray)
@@ -1372,6 +1393,8 @@ class VisualisationWidget(QOpenGLWidget):
         self.axes_renderer = AxesRenderer()
         self.direction_renderer = DirectionRenderer()
         self.plane_renderer = PlaneRenderer()
+        self.atom_renderer = AtomRenderer(gl)
+        self.bond_renderer = BondRenderer(gl)
         gl.glEnable(GL_DEPTH_TEST)
         gl.glClearColor(color.redF(), color.greenF(), color.blueF(), 1)
 
@@ -1419,6 +1442,188 @@ class VisualisationWidget(QOpenGLWidget):
         self.line_renderer.draw(gl)
         self.line_renderer.release()
 
+    def _draw_atoms(self, gl, uniforms):
+        if self.atom_renderer is None or self.atom_renderer.numberOfInstances() <= 0:
+            return
+        self.atom_renderer.bind(gl)
+        self.atom_renderer.setUniforms(**uniforms)
+        self.atom_renderer.draw(gl)
+        self.atom_renderer.release()
+
+    def _draw_bonds(self, gl, uniforms):
+        if self.bond_renderer is None or self.bond_renderer.numberOfInstances() <= 0:
+            return
+        self.bond_renderer.bind(gl)
+        self.bond_renderer.setUniforms(**uniforms)
+        self.bond_renderer.draw(gl)
+        self.bond_renderer.release()
+
+    # ------------------------------------------------------------------
+    # Atom / molecule view
+    # ------------------------------------------------------------------
+
+    def set_molecular_data(self, mol_templates, crystallography):
+        """Store molecule templates and the crystallography object for frac→cart conversion.
+
+        Parameters
+        ----------
+        mol_templates : dict[int, MolTemplate]
+            Keyed by molecule type (column 0 in the XYZ data).
+        crystallography : Crystallography
+            Used to convert fractional coordinates to Cartesian.
+        """
+        self._mol_templates = mol_templates
+        self._mol_crystallography = crystallography
+        self._mol_cart_templates = {}
+        if mol_templates and crystallography:
+            self._precompute_mol_templates()
+
+    def _precompute_mol_templates(self):
+        """Convert template fractional coords to Cartesian and compute centroids."""
+        from ...utils.periodic_table import get_atom_color, get_atom_radius
+
+        for mol_type, tmpl in self._mol_templates.items():
+            if not tmpl.atoms:
+                continue
+            frac = np.array([a.frac for a in tmpl.atoms], dtype=np.float64)
+            cart = self._mol_crystallography.frac_to_cart(frac).astype(np.float32)
+            centroid = cart.mean(axis=0)
+            colors = np.array(
+                [get_atom_color(a.symbol) for a in tmpl.atoms], dtype=np.float32
+            )
+            radii = np.array(
+                [get_atom_radius(a.symbol) for a in tmpl.atoms], dtype=np.float32
+            )
+            self._mol_cart_templates[mol_type] = {
+                "cart": cart,                                          # (N_atoms, 3)
+                "centroid": centroid,                                  # (3,)
+                "colors": colors,                                      # (N_atoms, 3)
+                "radii": radii,                                        # (N_atoms,)
+                "bonds": tmpl.bonds,                                   # list[(i, j)] 0-based
+                "symbols": [a.symbol for a in tmpl.atoms],            # list[str]
+            }
+
+    def _resolved_atom_colors_radii(self, tmpl: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Return (colors, radii) arrays for a template, with any user overrides applied."""
+        symbols = tmpl["symbols"]  # list[str], one per atom
+        colors = tmpl["colors"].copy()
+        radii = tmpl["radii"].copy()
+        for j, sym in enumerate(symbols):
+            if sym in self._atom_color_overrides:
+                colors[j] = self._atom_color_overrides[sym]
+            if sym in self._atom_radius_overrides:
+                radii[j] = self._atom_radius_overrides[sym]
+        return colors, radii
+
+    def _update_atom_view(self):
+        """Compute atom and bond instances from current centroids and upload to GPU."""
+        if self._mol_crystallography is None or not self._mol_cart_templates:
+            logger.warning("Atom view requested but no molecular data available")
+            return
+        if self.xyz is None:
+            return
+
+        atom_instances = []   # each row: [x,y,z, r,g,b, selected, vdw_radius]
+        bond_instances = []   # each row: [sx,sy,sz, ex,ey,ez, r,g,b, cyl_radius]
+
+        bond_r = self._bond_radius  # Ångströms, set directly by dialog
+
+        mol_types = self.xyz[:, 0].astype(int)
+        positions = self.xyz[:, 3:6].astype(np.float32)
+
+        for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, positions)):
+            tmpl = self._mol_cart_templates.get(mol_type)
+            if tmpl is None:
+                continue
+
+            colors, radii = self._resolved_atom_colors_radii(tmpl)
+
+            # Shift template atoms so their centroid sits on centroid_pos
+            offset = centroid_pos - tmpl["centroid"]
+            atom_positions = tmpl["cart"] + offset   # (N_atoms, 3)
+
+            sel = 1.0 if i in self._selected_points else 0.0
+            sel_col = np.full((len(atom_positions), 1), sel, dtype=np.float32)
+
+            # [x,y,z, r,g,b, selected, radius]
+            block = np.hstack([
+                atom_positions,     # (N,3)
+                colors,             # (N,3)
+                sel_col,            # (N,1)
+                radii[:, None],     # (N,1)
+            ])
+            atom_instances.append(block)
+
+            # Bonds: two half-cylinders per bond
+            for a1, a2 in tmpl["bonds"]:
+                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
+                    continue
+                p1 = atom_positions[a1]
+                p2 = atom_positions[a2]
+                mid = (p1 + p2) * 0.5
+                c1 = colors[a1]
+                c2 = colors[a2]
+                bond_instances.append(np.concatenate([p1, mid, c1, [bond_r]]))
+                bond_instances.append(np.concatenate([mid, p2, c2, [bond_r]]))
+
+        if not atom_instances:
+            logger.warning("No atom instances generated — check molecule type mapping")
+            return
+
+        atom_arr = np.vstack(atom_instances).astype(np.float32)
+        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
+
+        if not self.viewInitialized:
+            self.camera.fitToObject(atom_arr[:, :3])
+            self.viewInitialized = True
+
+        self.atom_renderer.setPoints(atom_arr)
+        self.bond_renderer.setBonds(bond_arr)
+
+    def set_atom_overrides(
+        self,
+        color_overrides: dict[str, tuple[float, float, float]],
+        radius_overrides: dict[str, float],
+        bond_radius: float,
+    ):
+        """Apply per-element color / radius overrides and bond radius, then redraw."""
+        self._atom_color_overrides = color_overrides
+        self._atom_radius_overrides = radius_overrides
+        self._bond_radius = bond_radius
+        if self.style == "Atoms":
+            self._update_atom_view()
+            self.update()
+
+    def get_visible_elements(self) -> list[str]:
+        """Return sorted list of unique element symbols in the currently loaded templates."""
+        symbols: set[str] = set()
+        for tmpl in self._mol_cart_templates.values():
+            symbols.update(tmpl.get("symbols", []))
+        return sorted(symbols)
+
+    def get_atom_overrides(self) -> tuple[dict, dict, float]:
+        """Return current (color_overrides, radius_overrides, bond_radius)."""
+        return (
+            dict(self._atom_color_overrides),
+            dict(self._atom_radius_overrides),
+            self._bond_radius,
+        )
+
+    def toggle_atom_view(self):
+        """Toggle between centroid (Spheres) and atom view. Shift+V shortcut."""
+        if self._mol_templates is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self,
+                "No Molecular Data",
+                "No structure file was found.\n"
+                "Load a CrystalGrower simulation folder that includes a structure file.",
+            )
+            return
+        self.style = "Atoms" if self.style != "Atoms" else "Spheres"
+        self.styleChanged.emit(self.style)
+        self.initGeometry()
+
     def draw(self, gl):
         from PySide6.QtGui import QMatrix4x4, QVector2D
 
@@ -1449,6 +1654,9 @@ class VisualisationWidget(QOpenGLWidget):
             self._draw_mesh(gl, uniforms)
             if self.show_mesh_edges:
                 self._draw_lines(gl, uniforms)
+        elif self.style == "Atoms":
+            self._draw_bonds(gl, uniforms)
+            self._draw_atoms(gl, uniforms)
 
         self.axes_renderer.bind()
         self.axes_renderer.setUniforms(**uniforms)
@@ -1464,7 +1672,8 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _draw_directions_and_planes(self, gl, uniforms):
         """Draw crystallographic directions and planes with transparency support."""
-        from OpenGL.GL import GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_CULL_FACE
+        from OpenGL.GL import (GL_CULL_FACE, GL_ONE_MINUS_SRC_ALPHA,
+                               GL_SRC_ALPHA)
 
         has_directions = (
             self.direction_renderer is not None and self.direction_renderer.numberOfPoints() > 0
@@ -1580,7 +1789,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _project_to_screen(self, pos_3d, mvp):
         """Project a 3D position to screen coordinates."""
-        from PySide6.QtGui import QVector4D, QVector3D
+        from PySide6.QtGui import QVector3D, QVector4D
 
         # Apply rotation-only view transform (ignore camera position/target translation)
         # so axes labels respond only to orientation, not to crystal translation.
