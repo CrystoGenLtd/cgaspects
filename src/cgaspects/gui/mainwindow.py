@@ -1149,6 +1149,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.frame_slider.setValue(self.frame)
             self.frame_spinBox.setValue(self.frame)
             self.frame += 1
+
             if self.playingLoop and self.frame >= num_frames:
                 self.frame = 0
         else:
@@ -1619,6 +1620,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.openglwidget.initGeometry()
         except AttributeError:
             logger.warning("Updating XYZ: No Crystal Data Found!")
+        except IndexError:
+            logger.warning("Frame %s has no point data, skipping.", frame)
+            return False
+        return True
 
     def close_opengl_widget(self):
         if self.current_viewer:

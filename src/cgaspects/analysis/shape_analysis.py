@@ -7,6 +7,7 @@ import numpy as np
 import trimesh
 
 from scipy.spatial import ConvexHull  # pylint: disable=no-name-in-module
+from scipy.spatial import QhullError  # pylint: disable=no-name-in-module
 
 from ..fileio.xyz_file import CrystalCloud, ShapeMetrics
 
@@ -82,8 +83,8 @@ class ShapeAnalyser:
             sa_hull = hull.area
             sa_vol = sa_hull / vol_hull
             sa_vol_ratio_array = np.array([sa_hull, vol_hull, sa_vol])
-        except ValueError as ve:
-            LOG.error("Encountered: %s\nHull information will be set to -1.", ve)
+        except (ValueError, QhullError) as ve:
+            LOG.warning("Encountered: %s\nHull information will be set to -1.", ve)
             sa_vol_ratio_array = np.array([-1, -1, -1])
 
         return sa_vol_ratio_array
@@ -94,7 +95,7 @@ class ShapeAnalyser:
         get_sa_vol: bool = True,
     ) -> Optional[ShapeMetrics]:
         """Calculate comprehensive shape information for crystal coordinates."""
-        if xyz_vals is None or len(xyz_vals) < 3:
+        if xyz_vals is None or len(xyz_vals) < 4:
             return None
 
         # Perform PCA via SVD

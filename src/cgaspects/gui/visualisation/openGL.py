@@ -247,6 +247,8 @@ class VisualisationWidget(QOpenGLWidget):
                 for p in visible
             ]
             self.plane_renderer.set_planes(converted, self._planes_crystallography)
+            if self.style == "Atoms":
+                self._update_atom_view()
             self.update()
         else:
             self.plane_renderer.set_planes(visible, self._planes_crystallography)
@@ -1630,10 +1632,43 @@ class VisualisationWidget(QOpenGLWidget):
         a = self._a_axis()
         cart_positions = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
 
+        # Precompute active slice planes in Cartesian Å space.
+        # plane.origin is stored in a-axis units → multiply by a.
+        slice_planes = []
+        for plane in self._raw_planes:
+            if not plane.slice_enabled:
+                continue
+            normal = np.array(plane.normal, dtype=np.float64)
+            if plane.fractional and self._planes_crystallography is not None:
+                normal = self._planes_crystallography.frac_to_cart(normal[None])[0]
+            n_len = np.linalg.norm(normal)
+            if n_len < 1e-9:
+                continue
+            normal /= n_len
+            origin = np.array(plane.origin, dtype=np.float64) * a
+            slice_planes.append((normal, origin, plane.slice_two_sided, plane.slice_thickness))
+
         for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, cart_positions)):
             tmpl = self._mol_cart_templates.get(mol_type)
             if tmpl is None:
                 continue
+
+            # Apply slice planes: filter by molecule centroid position.
+            if slice_planes:
+                skip = False
+                pos_f64 = centroid_pos.astype(np.float64)
+                for (normal, origin, two_sided, thickness) in slice_planes:
+                    d = np.dot(pos_f64 - origin, normal)
+                    if two_sided:
+                        if abs(d) > thickness / 2.0:
+                            skip = True
+                            break
+                    else:
+                        if d < -thickness:
+                            skip = True
+                            break
+                if skip:
+                    continue
 
             colors, radii = self._resolved_atom_colors_radii(tmpl)
 
