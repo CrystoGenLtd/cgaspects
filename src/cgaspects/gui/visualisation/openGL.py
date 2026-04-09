@@ -27,6 +27,7 @@ from .plane_renderer import PlaneRenderer
 from .point_cloud_renderer import SimplePointRenderer
 from .sphere_renderer import SphereRenderer
 from .sphere_selection_renderer import SphereSelectionRenderer
+from .unit_cell_renderer import UnitCellRenderer
 
 logger = logging.getLogger("CA:OpenGL")
 
@@ -94,6 +95,7 @@ class VisualisationWidget(QOpenGLWidget):
         self._mol_cart_templates = {}       # precomputed per-type: (cart_atoms, symbols, bonds)
         self.atom_renderer = None
         self.bond_renderer = None
+        self.unit_cell_renderer = None
 
         # Per-element overrides (set via Atom Mode Settings dialog)
         self._atom_color_overrides: dict[str, tuple[float, float, float]] = {}
@@ -209,9 +211,19 @@ class VisualisationWidget(QOpenGLWidget):
     def _apply_directions(self):
         if self.direction_renderer is None:
             return
-        self.direction_renderer.set_directions(
-            self._raw_directions, self._directions_crystallography, self._directions_max_extent
-        )
+        if self.style in ("Atoms", "Unit Cell") and self.xyz is not None:
+            from dataclasses import replace
+            a = self._a_axis()
+            cart_extent = self._cart_max_extent()
+            dirs = [
+                replace(d, origin=tuple((np.array(d.origin) * a).tolist()))
+                for d in self._raw_directions
+            ]
+            self.direction_renderer.set_directions(dirs, self._directions_crystallography, cart_extent)
+        else:
+            self.direction_renderer.set_directions(
+                self._raw_directions, self._directions_crystallography, self._directions_max_extent
+            )
         self.update()
 
     def set_planes(self, planes, crystallography=None):
@@ -224,11 +236,74 @@ class VisualisationWidget(QOpenGLWidget):
         if self.plane_renderer is None:
             return
         visible = [p for p in self._raw_planes if p.visible]
-        self.plane_renderer.set_planes(visible, self._planes_crystallography)
-        if self.xyz is not None:
-            self.initGeometry()
-        else:
+        if self.style in ("Atoms", "Unit Cell") and self.xyz is not None:
+            from dataclasses import replace
+            a = self._a_axis()
+            cart_extent = self._cart_max_extent()
+            converted = [
+                replace(p,
+                        origin=tuple((np.array(p.origin) * a).tolist()),
+                        size=p.size_relative * cart_extent)
+                for p in visible
+            ]
+            self.plane_renderer.set_planes(converted, self._planes_crystallography)
             self.update()
+        else:
+            self.plane_renderer.set_planes(visible, self._planes_crystallography)
+            if self.xyz is not None:
+                self.initGeometry()
+            else:
+                self.update()
+
+    def _a_axis(self):
+        """Return the a-axis length in Å, or 1.0 if unavailable."""
+        if self._mol_crystallography is not None and self._mol_crystallography.cell is not None:
+            return float(self._mol_crystallography.cell.a)
+        return 1.0
+
+    def _cart_max_extent(self):
+        """Half-range of the crystal in Cartesian Å (used when in Atoms/Unit Cell mode).
+
+        XYZ coordinates are in units of the a-axis length, so multiply by a.
+        """
+        if self.xyz is None:
+            return self._directions_max_extent
+        frac = self.xyz[:, 3:6].astype(np.float64)
+        extents = frac.max(axis=0) - frac.min(axis=0)
+        return float(extents.max()) / 2.0 * self._a_axis()
+
+    def _frac_max_extent(self):
+        """Half-range of the crystal in raw XYZ lattice units (units of a)."""
+        if self.xyz is None:
+            return 1.0
+        frac = self.xyz[:, 3:6].astype(np.float64)
+        extents = frac.max(axis=0) - frac.min(axis=0)
+        return float(extents.max()) / 2.0
+
+    _ATOM_STYLES = frozenset(("Atoms", "Unit Cell"))
+    _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull"))
+
+    def _rescale_camera_for_style(self, old_style, new_style):
+        """Rescale camera zoom when switching between XYZ-unit and Cartesian spaces.
+
+        XYZ coordinates are in units of the a-axis length. Toggling to Atoms mode
+        scales all world positions by a, so the camera scale must divide by a
+        (and multiply by a when returning to point-cloud mode).
+        Preserves camera orientation (position, target, up/right vectors).
+        """
+        if self._mol_crystallography is None or self.xyz is None:
+            return
+        going_to_cart = old_style in self._FRAC_STYLES and new_style in self._ATOM_STYLES
+        going_to_frac = old_style in self._ATOM_STYLES and new_style in self._FRAC_STYLES
+        if not going_to_cart and not going_to_frac:
+            return
+        a = self._a_axis()
+        if a < 1e-10:
+            return
+        if going_to_cart:
+            self.camera.scale /= a
+        else:
+            self.camera.scale *= a
 
     def highlight_sites(self, highlight_groups, background_color=None):
         """Highlight multiple groups of sites with different colors.
@@ -617,8 +692,10 @@ class VisualisationWidget(QOpenGLWidget):
             needs_reinit = True
 
         if present_and_changed("Style", self.style):
+            old_style = self.style
             self.style = kwargs["Style"]
             self.styleChanged.emit(self.style)
+            self._rescale_camera_for_style(old_style, self.style)
             needs_reinit = True
 
         if present_and_changed("Show Mesh Edges", self.show_mesh_edges):
@@ -1203,6 +1280,15 @@ class VisualisationWidget(QOpenGLWidget):
 
         if self.style == "Atoms":
             self._update_atom_view()
+            self._apply_planes()
+            self._apply_directions()
+            self.update()
+            return
+
+        if self.style == "Unit Cell":
+            self._update_unit_cell_view()
+            self._apply_planes()
+            self._apply_directions()
             self.update()
             return
 
@@ -1395,6 +1481,7 @@ class VisualisationWidget(QOpenGLWidget):
         self.plane_renderer = PlaneRenderer()
         self.atom_renderer = AtomRenderer(gl)
         self.bond_renderer = BondRenderer(gl)
+        self.unit_cell_renderer = UnitCellRenderer(gl)
         gl.glEnable(GL_DEPTH_TEST)
         gl.glClearColor(color.redF(), color.greenF(), color.blueF(), 1)
 
@@ -1458,6 +1545,14 @@ class VisualisationWidget(QOpenGLWidget):
         self.bond_renderer.draw(gl)
         self.bond_renderer.release()
 
+    def _draw_unit_cell(self, gl, uniforms):
+        if self.unit_cell_renderer is None or self.unit_cell_renderer.numberOfVertices() <= 0:
+            return
+        self.unit_cell_renderer.bind()
+        self.unit_cell_renderer.setUniforms(**uniforms)
+        self.unit_cell_renderer.draw(gl)
+        self.unit_cell_renderer.release()
+
     # ------------------------------------------------------------------
     # Atom / molecule view
     # ------------------------------------------------------------------
@@ -1477,6 +1572,8 @@ class VisualisationWidget(QOpenGLWidget):
         self._mol_cart_templates = {}
         if mol_templates and crystallography:
             self._precompute_mol_templates()
+        if crystallography is not None and self.unit_cell_renderer is not None:
+            self.unit_cell_renderer.set_cell(crystallography)
 
     def _precompute_mol_templates(self):
         """Convert template fractional coords to Cartesian and compute centroids."""
@@ -1529,16 +1626,18 @@ class VisualisationWidget(QOpenGLWidget):
         bond_r = self._bond_radius  # Ångströms, set directly by dialog
 
         mol_types = self.xyz[:, 0].astype(int)
-        positions = self.xyz[:, 3:6].astype(np.float32)
+        # XYZ coordinates are in units of the a-axis length; scale to Cartesian Å.
+        a = self._a_axis()
+        cart_positions = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
 
-        for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, positions)):
+        for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, cart_positions)):
             tmpl = self._mol_cart_templates.get(mol_type)
             if tmpl is None:
                 continue
 
             colors, radii = self._resolved_atom_colors_radii(tmpl)
 
-            # Shift template atoms so their centroid sits on centroid_pos
+            # Shift template atoms so their centroid sits on centroid_pos (both in Cartesian)
             offset = centroid_pos - tmpl["centroid"]
             atom_positions = tmpl["cart"] + offset   # (N_atoms, 3)
 
@@ -1580,6 +1679,51 @@ class VisualisationWidget(QOpenGLWidget):
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
 
+    def _update_unit_cell_view(self):
+        """Render the template molecules at their unit-cell positions (no crystal replication)."""
+        if not self._mol_cart_templates:
+            logger.warning("Unit cell view requested but no molecular data available")
+            return
+
+        atom_instances = []
+        bond_instances = []
+        bond_r = self._bond_radius
+
+        for tmpl in self._mol_cart_templates.values():
+            colors, radii = self._resolved_atom_colors_radii(tmpl)
+            atom_positions = tmpl["cart"]   # already in Cartesian, no offset
+
+            sel_col = np.zeros((len(atom_positions), 1), dtype=np.float32)
+            block = np.hstack([
+                atom_positions,
+                colors,
+                sel_col,
+                radii[:, None],
+            ])
+            atom_instances.append(block)
+
+            for a1, a2 in tmpl["bonds"]:
+                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
+                    continue
+                p1 = atom_positions[a1]
+                p2 = atom_positions[a2]
+                mid = (p1 + p2) * 0.5
+                bond_instances.append(np.concatenate([p1, mid, colors[a1], [bond_r]]))
+                bond_instances.append(np.concatenate([mid, p2, colors[a2], [bond_r]]))
+
+        if not atom_instances:
+            return
+
+        atom_arr = np.vstack(atom_instances).astype(np.float32)
+        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
+
+        if not self.viewInitialized:
+            self.camera.fitToObject(atom_arr[:, :3])
+            self.viewInitialized = True
+
+        self.atom_renderer.setPoints(atom_arr)
+        self.bond_renderer.setBonds(bond_arr)
+
     def set_atom_overrides(
         self,
         color_overrides: dict[str, tuple[float, float, float]],
@@ -1593,6 +1737,9 @@ class VisualisationWidget(QOpenGLWidget):
         if self.style == "Atoms":
             self._update_atom_view()
             self.update()
+        elif self.style == "Unit Cell":
+            self._update_unit_cell_view()
+            self.update()
 
     def get_visible_elements(self) -> list[str]:
         """Return sorted list of unique element symbols in the currently loaded templates."""
@@ -1600,6 +1747,20 @@ class VisualisationWidget(QOpenGLWidget):
         for tmpl in self._mol_cart_templates.values():
             symbols.update(tmpl.get("symbols", []))
         return sorted(symbols)
+
+    def get_bond_summary(self) -> dict[tuple[str, str], int]:
+        """Return {(sym_a, sym_b): count} for all bonds across all molecule templates.
+
+        Each pair is stored in sorted order so ('C','H') not ('H','C').
+        """
+        counts: dict[tuple[str, str], int] = {}
+        for tmpl in self._mol_cart_templates.values():
+            syms = tmpl.get("symbols", [])
+            for a1, a2 in tmpl.get("bonds", []):
+                if a1 < len(syms) and a2 < len(syms):
+                    pair = tuple(sorted([syms[a1], syms[a2]]))
+                    counts[pair] = counts.get(pair, 0) + 1
+        return counts
 
     def get_atom_overrides(self) -> tuple[dict, dict, float]:
         """Return current (color_overrides, radius_overrides, bond_radius)."""
@@ -1620,8 +1781,10 @@ class VisualisationWidget(QOpenGLWidget):
                 "Load a CrystalGrower simulation folder that includes a structure file.",
             )
             return
+        old_style = self.style
         self.style = "Atoms" if self.style != "Atoms" else "Spheres"
         self.styleChanged.emit(self.style)
+        self._rescale_camera_for_style(old_style, self.style)
         self.initGeometry()
 
     def draw(self, gl):
@@ -1657,6 +1820,10 @@ class VisualisationWidget(QOpenGLWidget):
         elif self.style == "Atoms":
             self._draw_bonds(gl, uniforms)
             self._draw_atoms(gl, uniforms)
+        elif self.style == "Unit Cell":
+            self._draw_bonds(gl, uniforms)
+            self._draw_atoms(gl, uniforms)
+            self._draw_unit_cell(gl, uniforms)
 
         self.axes_renderer.bind()
         self.axes_renderer.setUniforms(**uniforms)

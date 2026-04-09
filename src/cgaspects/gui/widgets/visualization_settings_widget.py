@@ -316,6 +316,8 @@ class VisualizationSettingsWidget(QWidget):
                 "Spheres",
                 "Points",
                 "Convex Hull",
+                "Atoms",
+                "Unit Cell",
             ),
         )
         self.widgets["Style"] = w

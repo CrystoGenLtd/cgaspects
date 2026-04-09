@@ -2,10 +2,10 @@
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
-from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox,
-                               QGroupBox, QHBoxLayout, QLabel, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QToolButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QColorDialog, QDialog, QDoubleSpinBox, QGroupBox,
+                               QHBoxLayout, QLabel, QPushButton, QScrollArea,
+                               QSizePolicy, QSlider, QToolButton, QVBoxLayout,
+                               QWidget)
 
 DEFAULT_BOND_RADIUS = 0.20   # Ångströms
 
@@ -159,6 +159,16 @@ class AtomModeSettingsDialog(QDialog):
         eg_layout.addWidget(scroll_area)
         outer.addWidget(elements_group)
 
+        # ── Bonds present in structure ─────────────────────────────────
+        self._bonds_group = QGroupBox("Bonds in structure")
+        bonds_outer = QVBoxLayout(self._bonds_group)
+        bonds_outer.setSpacing(2)
+        self._bonds_label = QLabel("No bond data loaded.")
+        self._bonds_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._bonds_label.setWordWrap(True)
+        bonds_outer.addWidget(self._bonds_label)
+        outer.addWidget(self._bonds_group)
+
         # ── Bond radius ────────────────────────────────────────────────
         bond_group = QGroupBox("Bond radius")
         bond_layout = QHBoxLayout(bond_group)
@@ -245,6 +255,7 @@ class AtomModeSettingsDialog(QDialog):
         color_overrides: dict,
         radius_overrides: dict,
         bond_radius: float,
+        bond_summary: dict | None = None,
     ):
         """Rebuild per-element rows for the given element symbols."""
         from ...utils.periodic_table import get_atom_color, get_atom_radius
@@ -275,6 +286,15 @@ class AtomModeSettingsDialog(QDialog):
         self._bond_slider.setValue(int(bond_radius * 100))
         self._bond_spin.blockSignals(False)
         self._bond_slider.blockSignals(False)
+
+        # Bond connectivity summary
+        if bond_summary:
+            lines = []
+            for (s1, s2), count in sorted(bond_summary.items()):
+                lines.append(f"  {s1} — {s2}  ×{count}")
+            self._bonds_label.setText("\n".join(lines))
+        else:
+            self._bonds_label.setText("No bonds found in structure file.")
 
     def reset_all(self):
         for row in self._rows.values():

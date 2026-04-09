@@ -1538,7 +1538,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # Keep "Atom Mode Settings" menu item in sync with current style
         new_style = settings.get("Style", "")
-        self.actionAtomModeSettings.setEnabled(new_style == "Atoms")
+        self.actionAtomModeSettings.setEnabled(new_style in ("Atoms", "Unit Cell"))
 
         fps = self.visualizationSettings.fps()
         if self.fps != fps:
@@ -1558,7 +1558,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             )
             return
         color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
-        self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r)
+        bond_summary = self.openglwidget.get_bond_summary()
+        self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r, bond_summary)
         self.atom_mode_settings_dialog.show()
         self.atom_mode_settings_dialog.raise_()
         self.atom_mode_settings_dialog.activateWindow()
@@ -1568,14 +1569,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.openglwidget.set_atom_overrides(color_overrides, radius_overrides, bond_radius)
 
     def _on_style_changed(self, style: str):
-        """Enable / disable the Atom Mode Settings menu item based on the active style."""
-        is_atom = style == "Atoms"
-        self.actionAtomModeSettings.setEnabled(is_atom)
-        # If switching into Atom mode and the dialog is already open, refresh its contents
-        if is_atom and self.atom_mode_settings_dialog.isVisible():
+        """Keep the Style combo and Atom Mode Settings menu in sync with the active style."""
+        is_mol_style = style in ("Atoms", "Unit Cell")
+        self.actionAtomModeSettings.setEnabled(is_mol_style)
+        style_widget = self.visualizationSettings.widgets.get("Style")
+        if style_widget is not None:
+            style_widget.comboBox.blockSignals(True)
+            style_widget.setValue(style)
+            style_widget.comboBox.blockSignals(False)
+        # If switching into a molecular style and the dialog is already open, refresh it
+        if is_mol_style and self.atom_mode_settings_dialog.isVisible():
             elements = self.openglwidget.get_visible_elements()
             color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
-            self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r)
+            bond_summary = self.openglwidget.get_bond_summary()
+            self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r, bond_summary)
 
     # Utility function to clear a layout of all its widgets
     def clear_layout(self, layout):
