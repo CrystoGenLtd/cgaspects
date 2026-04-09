@@ -345,3 +345,79 @@ class CrystalCloud:
     def get_all_raw_frame_coords(self) -> dict[int, np.ndarray]:
         """Get coordinates for all frames."""
         return self.frames.raw_coords
+
+
+@dataclass
+class DockingData:
+    """Docking site data from a CrystalGrower ``*_docking.XYZ`` file.
+
+    Column layout (0-indexed in the raw array):
+      0 : replicate index
+      1 : molecule type
+      2 : coordination shell  (30 = central, 31 = 1st shell, 32 = 2nd shell)
+      3 : x coordinate
+      4 : y coordinate
+      5 : z coordinate
+      6 : site number
+    """
+
+    filepath: Path
+    raw: np.ndarray  # shape (N, 7)
+
+    # Shell IDs
+    SHELL_CENTRAL = 30
+    SHELL_FIRST = 31
+    SHELL_SECOND = 32
+
+    # Default RGB colours per shell (values in [0, 1])
+    SHELL_COLORS: dict = field(
+        default_factory=lambda: {
+            30: (1.0, 0.35, 0.0),   # orange-red: central molecule
+            31: (0.0, 0.85, 0.2),   # green: 1st coordination shell
+            32: (0.15, 0.45, 1.0),  # blue: 2nd coordination shell
+        }
+    )
+
+    @property
+    def coords(self) -> np.ndarray:
+        return self.raw[:, 3:6]
+
+    @property
+    def shells(self) -> np.ndarray:
+        return self.raw[:, 2].astype(int)
+
+    @property
+    def mol_types(self) -> np.ndarray:
+        return self.raw[:, 1].astype(int)
+
+    @property
+    def site_numbers(self) -> np.ndarray:
+        return self.raw[:, 6].astype(int)
+
+    @property
+    def empty(self) -> bool:
+        return self.raw is None or self.raw.size == 0
+
+    @classmethod
+    def from_file(cls, filepath: Path) -> "DockingData":
+        """Parse a CrystalGrower ``*_docking.XYZ`` file."""
+        filepath = Path(filepath)
+        with filepath.open("r", encoding="utf-8") as f:
+            n_atoms = int(f.readline().strip())
+            f.readline()  # skip "docking file" comment line
+            raw = np.loadtxt(f, max_rows=n_atoms, dtype=float)
+        if raw.ndim == 1:
+            raw = raw[np.newaxis, :]
+        return cls(filepath=filepath, raw=raw)
+
+    def colored_points(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(coords, colors)`` arrays for rendering, coloured by shell.
+
+        Both arrays are float32.  ``colors`` has shape (N, 3) with RGB in [0, 1].
+        """
+        coords = self.coords.astype(np.float32)
+        colors = np.zeros((len(coords), 3), dtype=np.float32)
+        for shell_id, color in self.SHELL_COLORS.items():
+            mask = self.shells == shell_id
+            colors[mask] = color
+        return coords, colors

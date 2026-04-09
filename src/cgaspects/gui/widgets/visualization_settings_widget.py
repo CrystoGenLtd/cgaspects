@@ -318,6 +318,8 @@ class VisualizationSettingsWidget(QWidget):
                 "Convex Hull",
                 "Atoms",
                 "Unit Cell",
+                "Docking",
+                "Docking Atoms",
             ),
         )
         self.widgets["Style"] = w

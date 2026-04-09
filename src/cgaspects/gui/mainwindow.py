@@ -11,19 +11,29 @@ from natsort import natsorted
 from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QSignalBlocker, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, Qt
-from PySide6.QtWidgets import (QFileDialog, QGridLayout, QMainWindow,
-                               QMessageBox, QProgressBar, QPushButton)
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QGridLayout,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+)
 
 from ..analysis.aspect_ratios import AspectRatio
 from ..analysis.cluster_analysis import ClusterAnalysis
 from ..analysis.growth_rates import GrowthRate
 from ..analysis.gui_threads import WorkerXYZ
 from ..analysis.site_analysis import SiteAnalysis
-from ..fileio.find_data import (find_info, locate_xyz_files,
-                                parse_molecular_data, parse_structure_file)
+from ..fileio.find_data import (
+    find_info,
+    locate_xyz_files,
+    parse_molecular_data,
+    parse_structure_file,
+)
 from ..fileio.logging import get_log_file_path, setup_logging
 from ..fileio.opendir import open_directory
-from ..fileio.xyz_file import CrystalCloud
+from ..fileio.xyz_file import CrystalCloud, DockingData
 from .crystal_info import CrystalInfo
 from .dialogs import CrystalInfoWidget, PlottingDialog
 from .dialogs.about import AboutCGDialog
@@ -40,8 +50,12 @@ from .load_ui import Ui_MainWindow
 from .shortcuts_manager import ShortcutsManager
 from .utils.crystallography import Crystallography
 from .visualisation.openGL import VisualisationWidget
-from .widgets import (PointInfoToolbar, SimulationVariablesWidget,
-                      TextFileViewer, VisualizationSettingsWidget)
+from .widgets import (
+    PointInfoToolbar,
+    SimulationVariablesWidget,
+    TextFileViewer,
+    VisualizationSettingsWidget,
+)
 
 log_dict = {"basic": "DEBUG", "console": "INFO"}
 setup_logging(**log_dict)
@@ -130,6 +144,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.cluster_labels_cache: dict = {}
         self._prev_color_by: str | None = None
+        self._docking_file_map: dict[Path, Path] = {}  # normal_xyz -> docking_xyz
 
         self.aboutDialog = None
         self.text_file_viewer = None
@@ -143,7 +158,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.settings_dialog = SettingsDialog(self)
         self.openglwidget = VisualisationWidget()
-
 
         self.crystalInfoWidget = CrystalInfoWidget(self)
         self.crystalInfoWidget.setEnabled(False)
@@ -234,9 +248,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.cluster_analysis_pushButton = QPushButton("Clusters")
         self.cluster_analysis_pushButton.setEnabled(False)
         self.cluster_analysis_pushButton.setToolTip("Perform cluster analysis (DBSCAN/OPTICS)")
-        self.cluster_analysis_pushButton.setSizePolicy(
-            self.aspect_ratio_pushButton.sizePolicy()
-        )
+        self.cluster_analysis_pushButton.setSizePolicy(self.aspect_ratio_pushButton.sizePolicy())
 
         # Find the HBoxLayout inside verticalLayout_2 and replace it with a 2×2 grid
         vbox = self.verticalLayout_2
@@ -372,12 +384,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             menuRotLock.addAction(act)
         # Wire after all actions exist so cross-uncheck is safe
         for axis, act in self._rotation_lock_actions.items():
+
             def _on_lock_toggled(checked, a=axis):
                 if checked:
                     for other, other_act in self._rotation_lock_actions.items():
                         if other != a:
                             other_act.setChecked(False)
                 self.openglwidget.toggle_rotation_lock(a, checked)
+
             act.toggled.connect(_on_lock_toggled)
         self.menuView.addMenu(menuRotLock)
 
@@ -444,7 +458,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionAtomModeSettings.setToolTip(
             "Adjust per-element colours, atom sizes, and bond radius for Atom view"
         )
-        self.actionAtomModeSettings.setEnabled(False)   # enabled only in Atom mode
+        self.actionAtomModeSettings.setEnabled(False)  # enabled only in Atom mode
         self.actionAtomModeSettings.triggered.connect(self.show_atom_mode_settings)
         self.menuCrystallography.addAction(self.actionAtomModeSettings)
 
@@ -547,6 +561,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def show_thread_monitor(self):
         from .dialogs.thread_monitor_dialog import ThreadMonitorDialog
+
         pools = {
             "Main": self.threadpool,
             "AspectRatio": self.aspectratio.threadpool,
@@ -703,6 +718,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
 
         import matplotlib.cm as _cm
+
         tab10 = _cm.get_cmap("tab10")
         unique_labels = sorted(set(int(l) for l in labels))
         groups = []
@@ -919,19 +935,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         current_d = float(np.dot(normal, np.array(plane.origin, dtype=np.float64)))
         self.planes_dialog.configure_move_slider(d_min, d_max, current_d)
         self._plane_move_state = {
-            'row': row, 'normal': normal,
-            'd_min': d_min, 'd_max': d_max, 'steps': 2000,
+            "row": row,
+            "normal": normal,
+            "d_min": d_min,
+            "d_max": d_max,
+            "steps": 2000,
         }
 
     def _on_plane_normal_slider_moved(self, row, val):
         """Apply inline slider position to the plane origin."""
-        state = getattr(self, '_plane_move_state', None)
-        if state is None or state['row'] != row:
+        state = getattr(self, "_plane_move_state", None)
+        if state is None or state["row"] != row:
             return
-        d_min, d_max, steps = state['d_min'], state['d_max'], state['steps']
+        d_min, d_max, steps = state["d_min"], state["d_max"], state["steps"]
         slider_range = d_max - d_min if d_max > d_min else 1.0
         d = d_min + (val / steps) * slider_range
-        new_origin = tuple(float(v) for v in (state['normal'] * d))
+        new_origin = tuple(float(v) for v in (state["normal"] * d))
         self.planes_dialog.update_plane_origin_from_dialog(row, new_origin)
 
     def welcome_message(self):
@@ -996,14 +1015,29 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return False
 
         self.log_message("Reading Images...", "info")
-        xyz_files = locate_xyz_files(folder)
-        print(xyz_files)
+        xyz_files, docking_xyz_files = locate_xyz_files(folder)
 
         # Check for valid data, folder reinitialised as a Path object
         if xyz_files is None:
             return False
 
         self.xyz_files = xyz_files
+
+        # Both crystal and docking files share a common base stem before their
+        # trailing _SUFFIX (e.g. _CGAspects, _sim, _docking, etc.).
+        # Strip the last _segment from each stem to match them up.
+        def _sim_stem(p):
+            parts = p.stem.split("_")
+            return "_".join(parts[:-1]) if len(parts) > 1 else p.stem
+
+        docking_by_stem = {_sim_stem(p): p for p in docking_xyz_files}
+        self._docking_file_map = {
+            xyz_path: docking_by_stem[_sim_stem(xyz_path)]
+            for xyz_path in xyz_files
+            if _sim_stem(xyz_path) in docking_by_stem
+        }
+        if self._docking_file_map:
+            self.log_message(f"Found {len(self._docking_file_map)} docking file(s)", "info")
         self.input_folder = folder
         self.output_folder = None
         self.actionResults_Directory.setEnabled(False)
@@ -1391,7 +1425,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     parent=self,
                     summary_df=self.summ_df,
                 )
-                self.plotting_dialog.connect
+                self.plotting_dialog.trigger_plot()
             else:
                 self.plotting_dialog.setCSV(self.plotting_csv)
                 self.plotting_dialog.trigger_plot()
@@ -1421,9 +1455,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.summ_df = pd.read_csv(summary_file, encoding="utf-8", encoding_errors="replace")
 
         # Propagate the summary file path to all analysis objects so workers pick it up
-        for analysis_obj in (self.aspectratio, self.growthrate, self.clusteranalysis, self.siteanalysis):
+        for analysis_obj in (
+            self.aspectratio,
+            self.growthrate,
+            self.clusteranalysis,
+            self.siteanalysis,
+        ):
             if analysis_obj.information is not None:
-                analysis_obj.information = analysis_obj.information._replace(summary_file=summary_file)
+                analysis_obj.information = analysis_obj.information._replace(
+                    summary_file=summary_file
+                )
         if list(self.summ_df.columns)[-1].startswith("Unnamed"):
             self.summ_df = self.summ_df.iloc[:, 1:-1]
         else:
@@ -1512,11 +1553,34 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.update_XYZ_info(self.openglwidget.xyz)
 
+        self._update_docking_for_current_xyz()
         self.updateVisualizationSettings()
 
         if self.summ_df is not None:
             var_values = self.summ_df.iloc[value, :].values
             self.update_variables(values=var_values)
+
+    def _update_docking_for_current_xyz(self):
+        """Reload docking data for the new XYZ if a docking style is active."""
+        style_widget = self.visualizationSettings.widgets.get("Style")
+        if style_widget is not None and style_widget.value in ("Docking", "Docking Atoms"):
+            self._load_docking_for_current_xyz()
+
+    def _load_docking_for_current_xyz(self):
+        """Load docking data for the current XYZ into the GL widget (for Docking style)."""
+        if self.sim_num is None or not self.xyz_files:
+            return
+        current_path = self.xyz_files[self.sim_num]
+        docking_path = self._docking_file_map.get(current_path)
+        if docking_path is None:
+            self.log_message("No docking file for this simulation", "warning")
+            return
+        try:
+            docking_data = DockingData.from_file(docking_path)
+            self.openglwidget.set_docking_data(docking_data)
+            self.log_message(f"Docking site loaded: {docking_path.name}", "info")
+        except (OSError, ValueError) as exc:
+            self.log_message(f"Failed to load docking file: {exc}", "error")
 
     def updateVisualizationSettings(self):
         pass
@@ -1541,6 +1605,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         new_style = settings.get("Style", "")
         self.actionAtomModeSettings.setEnabled(new_style in ("Atoms", "Unit Cell"))
 
+        # Auto-load docking data when switching to a docking style
+        if new_style in ("Docking", "Docking Atoms"):
+            self._load_docking_for_current_xyz()
+
         fps = self.visualizationSettings.fps()
         if self.fps != fps:
             self.frame_timer.start(1000 // self.fps)
@@ -1551,6 +1619,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         elements = self.openglwidget.get_visible_elements()
         if not elements:
             from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.information(
                 self,
                 "Atom Mode Settings",
@@ -1573,6 +1642,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Keep the Style combo and Atom Mode Settings menu in sync with the active style."""
         is_mol_style = style in ("Atoms", "Unit Cell")
         self.actionAtomModeSettings.setEnabled(is_mol_style)
+        if style in ("Docking", "Docking Atoms"):
+            self._load_docking_for_current_xyz()
         style_widget = self.visualizationSettings.widgets.get("Style")
         if style_widget is not None:
             style_widget.comboBox.blockSignals(True)
@@ -1583,7 +1654,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             elements = self.openglwidget.get_visible_elements()
             color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
             bond_summary = self.openglwidget.get_bond_summary()
-            self.atom_mode_settings_dialog.populate(elements, color_ov, radius_ov, bond_r, bond_summary)
+            self.atom_mode_settings_dialog.populate(
+                elements, color_ov, radius_ov, bond_r, bond_summary
+            )
 
     # Utility function to clear a layout of all its widgets
     def clear_layout(self, layout):

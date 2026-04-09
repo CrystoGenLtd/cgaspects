@@ -162,6 +162,9 @@ class VisualisationWidget(QOpenGLWidget):
         self.highlight_groups = []  # List of (site_set, color) tuples
         self.background_color_override = None  # Background color for non-highlighted sites
 
+        # Docking site data
+        self._docking_data = None   # DockingData instance or None
+
     def pass_XYZ(self, xyz):
         self.xyz = xyz
         logger.debug("XYZ coordinates passed on OpenGL widget")
@@ -282,8 +285,8 @@ class VisualisationWidget(QOpenGLWidget):
         extents = frac.max(axis=0) - frac.min(axis=0)
         return float(extents.max()) / 2.0
 
-    _ATOM_STYLES = frozenset(("Atoms", "Unit Cell"))
-    _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull"))
+    _ATOM_STYLES = frozenset(("Atoms", "Unit Cell", "Docking Atoms"))
+    _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull", "Docking"))
 
     def _rescale_camera_for_style(self, old_style, new_style):
         """Rescale camera zoom when switching between XYZ-unit and Cartesian spaces.
@@ -1294,6 +1297,16 @@ class VisualisationWidget(QOpenGLWidget):
             self.update()
             return
 
+        if self.style == "Docking":
+            self._update_docking_sphere_view()
+            self.update()
+            return
+
+        if self.style == "Docking Atoms":
+            self._update_docking_atom_view()
+            self.update()
+            return
+
         varray = self.updatePointCloudVertices()
         self.point_cloud_renderer.setPoints(varray)
         self.sphere_renderer.setPoints(varray)
@@ -1459,6 +1472,90 @@ class VisualisationWidget(QOpenGLWidget):
                 self.color_by,
             )
             return
+
+    def _update_docking_sphere_view(self):
+        """Upload docking data to the sphere renderer for the Docking style."""
+        if self._docking_data is None or self._docking_data.empty:
+            # Clear the sphere renderer so nothing is drawn
+            if self.sphere_renderer is not None:
+                self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
+            return
+        coords, colors = self._docking_data.colored_points()
+        n = len(coords)
+        selected = np.zeros((n, 1), dtype=np.float32)
+        varray = np.concatenate([coords, colors, selected], axis=1).astype(np.float32)
+        self.sphere_renderer.setPoints(varray)
+        if not self.viewInitialized:
+            self.camera.fitToObject(coords)
+            self.viewInitialized = True
+
+    # ------------------------------------------------------------------ docking
+    def set_docking_data(self, docking_data):
+        """Store docking data and refresh the view if a docking style is active."""
+        self._docking_data = docking_data
+        if self.style in ("Docking", "Docking Atoms"):
+            self.initGeometry()
+        self.update()
+
+    def _update_docking_atom_view(self):
+        """Build atom/bond instances from docking centroids and upload to GPU."""
+        if self._docking_data is None or self._docking_data.empty:
+            if self.atom_renderer is not None:
+                self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
+            if self.bond_renderer is not None:
+                self.bond_renderer.setBonds(None)
+            return
+        if self._mol_crystallography is None or not self._mol_cart_templates:
+            logger.warning("Docking Atoms requested but no molecular data available")
+            return
+
+        a = self._a_axis()
+        mol_types = self._docking_data.mol_types
+        # Docking coords are in XYZ units (same space as crystal); scale to Cartesian Å
+        cart_positions = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
+        shells = self._docking_data.shells
+
+        atom_instances = []
+        bond_instances = []
+        bond_r = self._bond_radius
+
+        for i, (mol_type, centroid_pos, shell) in enumerate(
+            zip(mol_types, cart_positions, shells)
+        ):
+            tmpl = self._mol_cart_templates.get(mol_type)
+            if tmpl is None:
+                continue
+
+            colors, radii = self._resolved_atom_colors_radii(tmpl)
+            offset = centroid_pos - tmpl["centroid"]
+            atom_positions = tmpl["cart"] + offset
+
+            sel_col = np.zeros((len(atom_positions), 1), dtype=np.float32)
+            block = np.hstack([atom_positions, colors, sel_col, radii[:, None]])
+            atom_instances.append(block)
+
+            for a1, a2 in tmpl["bonds"]:
+                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
+                    continue
+                p1 = atom_positions[a1]
+                p2 = atom_positions[a2]
+                mid = (p1 + p2) * 0.5
+                bond_instances.append(np.concatenate([p1, mid, colors[a1], [bond_r]]))
+                bond_instances.append(np.concatenate([mid, p2, colors[a2], [bond_r]]))
+
+        if not atom_instances:
+            logger.warning("No docking atom instances generated")
+            return
+
+        atom_arr = np.vstack(atom_instances).astype(np.float32)
+        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
+
+        if not self.viewInitialized:
+            self.camera.fitToObject(atom_arr[:, :3])
+            self.viewInitialized = True
+
+        self.atom_renderer.setPoints(atom_arr)
+        self.bond_renderer.setBonds(bond_arr)
 
     def initializeGL(self):
         logger.debug("Initialized OpenGL, version info: %s", self.context().format().version())
@@ -1859,6 +1956,11 @@ class VisualisationWidget(QOpenGLWidget):
             self._draw_bonds(gl, uniforms)
             self._draw_atoms(gl, uniforms)
             self._draw_unit_cell(gl, uniforms)
+        elif self.style == "Docking":
+            self._draw_spheres(gl, uniforms)
+        elif self.style == "Docking Atoms":
+            self._draw_bonds(gl, uniforms)
+            self._draw_atoms(gl, uniforms)
 
         self.axes_renderer.bind()
         self.axes_renderer.setUniforms(**uniforms)

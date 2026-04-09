@@ -7,8 +7,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from natsort import natsorted
-from PySide6.QtWidgets import (QApplication, QDialog, QListWidget, QMessageBox,
-                               QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QListWidget,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from ..gui.utils.crystallography import Cell
 from ..utils.data_structures import file_info_tuple
@@ -54,7 +60,6 @@ def filter_xyz_files(crystal_xyz_list):
     suffixes = natsorted(suffixes)
 
     if len(suffixes) == 1:
-
         return [
             f
             for f in crystal_xyz_list
@@ -96,12 +101,15 @@ def locate_xyz_files(xyz_folderpath):
     xyz_folderpath = Path(xyz_folderpath)
 
     crystal_xyz_list = []
+    docking_xyz_list = []
 
     try:
         if xyz_folderpath.is_dir():
             for filepath in Path(xyz_folderpath).rglob("*.XYZ"):
                 if file_empty(filepath):
                     logger.info("Ignore empty XYZ file: %s", filepath)
+                elif filepath.stem.endswith("_docking"):
+                    docking_xyz_list.append(filepath)
                 else:
                     crystal_xyz_list.append(filepath)
 
@@ -112,6 +120,7 @@ def locate_xyz_files(xyz_folderpath):
 
         # Natural sort
         crystal_xyz_list = natsorted(crystal_xyz_list)
+        docking_xyz_list = natsorted(docking_xyz_list)
 
         # Allow user to filter files
         crystal_xyz_list = filter_xyz_files(crystal_xyz_list)
@@ -128,7 +137,7 @@ def locate_xyz_files(xyz_folderpath):
         return None
 
     logger.debug("%s .XYZ Files Found", len(crystal_xyz_list))
-    return crystal_xyz_list
+    return crystal_xyz_list, docking_xyz_list
 
 
 def create_aspects_folder(path):
@@ -181,7 +190,9 @@ def find_info(path):
                 found_simparam_files = True
                 with open(file, "r", encoding="utf-8", errors="replace") as file:
                     lines = file.readlines()
-                growth_mod, structure_file = process_simulation_parameters(lines, supersats, directions, growth_mod, structure_file)
+                growth_mod, structure_file = process_simulation_parameters(
+                    lines, supersats, directions, growth_mod, structure_file, path
+                )
             elif file.name.endswith("count.txt"):
                 count_files.append(file)
 
@@ -215,7 +226,14 @@ def find_info(path):
     )
 
 
-def process_simulation_parameters(lines: list, supersats: list, directions: list, growth_mod, structure_file=None):
+def process_simulation_parameters(
+    lines: list,
+    supersats: list,
+    directions: list,
+    growth_mod: str | None,
+    structure_file: Path | None = None,
+    basedir: Path | None = None,
+):
     get_facets = True
     for line in lines:
         if line.startswith("Starting delta mu value (kcal/mol):"):
@@ -226,7 +244,14 @@ def process_simulation_parameters(lines: list, supersats: list, directions: list
         if line.startswith("File containing TOPOS input?:") and structure_file is None:
             path = line.split(":", 1)[1].strip()
             if path and path != "N/A":
-                structure_file = path
+                path = Path(path)
+
+                if path.exists():
+                    structure_file = path
+                else:
+                    cwd_path = basedir / path.name
+                    if cwd_path.exists():
+                        structure_file = cwd_path
         if line.startswith("Size of crystal") and get_facets:
             frame = lines.index(line) + 1
             for n in range(frame, len(lines)):
@@ -477,9 +502,7 @@ def parse_molecular_data(file_path: str | Path) -> dict[int, MolTemplate] | None
             logger.warning("No molecule templates found in %s", file_path)
             return None
 
-        logger.info(
-            "Parsed %d molecule template(s) from %s", len(templates), file_path.name
-        )
+        logger.info("Parsed %d molecule template(s) from %s", len(templates), file_path.name)
         return templates
 
     except Exception as e:
@@ -537,7 +560,12 @@ def parse_structure_file(file_path: str | Path) -> Cell | None:
         logger.info(
             "Parsed lattice parameters from %s: a=%.4f b=%.4f c=%.4f α=%.3f° β=%.3f° γ=%.3f°",
             file_path.name,
-            a, b, c, alpha, beta, gamma,
+            a,
+            b,
+            c,
+            alpha,
+            beta,
+            gamma,
         )
 
         return Cell(a=a, b=b, c=c, alpha=alpha, beta=beta, gamma=gamma)
