@@ -86,10 +86,16 @@ class LabelledComboBox(QWidget):
     def currentIndexChanged(self, idx):
         self.valueChanged.emit()
 
-    def setOptions(self, options):
-        self.comboBox.removeItems()
-        self.options = options
-        self.comboBox.addItems(options)
+    def setOptions(self, options, default=None):
+        self.comboBox.blockSignals(True)
+        self.comboBox.clear()
+        self.options = list(options)
+        self.comboBox.addItems(self.options)
+        if default is not None and default in self.options:
+            self.comboBox.setCurrentIndex(self.options.index(default))
+        elif self.options:
+            self.comboBox.setCurrentIndex(0)
+        self.comboBox.blockSignals(False)
 
 
 class LabelledComboBoxWithColorPicker(QWidget):
@@ -169,10 +175,16 @@ class LabelledComboBoxWithColorPicker(QWidget):
     def currentIndexChanged(self, idx):
         self.valueChanged.emit()
 
-    def setOptions(self, options):
-        self.comboBox.removeItems()
-        self.options = options
-        self.comboBox.addItems(options)
+    def setOptions(self, options, default=None):
+        self.comboBox.blockSignals(True)
+        self.comboBox.clear()
+        self.options = list(options)
+        self.comboBox.addItems(self.options)
+        if default is not None and default in self.options:
+            self.comboBox.setCurrentIndex(self.options.index(default))
+        elif self.options:
+            self.comboBox.setCurrentIndex(0)
+        self.comboBox.blockSignals(False)
 
 
 def create_colored_icon(color, size=(50, 50)):
@@ -377,3 +389,10 @@ class VisualizationSettingsWidget(QWidget):
             color_by_widget.showColorPicker()
         else:
             color_by_widget.hideColorPicker()
+
+    def setColorByOptions(self, options, default=None):
+        """Replace the Color By combo options (called when render style changes)."""
+        w = self.widgets.get("Color By")
+        if w is not None:
+            w.setOptions(options, default)
+            self._on_color_by_changed()

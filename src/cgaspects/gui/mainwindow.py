@@ -32,6 +32,7 @@ from ..fileio.find_data import (
     parse_structure_file,
 )
 from ..fileio.logging import get_log_file_path, setup_logging
+from ..fileio.pdb_export import write_docking_pdb
 from ..fileio.opendir import open_directory
 from ..fileio.xyz_file import CrystalCloud, DockingData
 from .crystal_info import CrystalInfo
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.cluster_labels_cache: dict = {}
         self._prev_color_by: str | None = None
+        self._prev_style: str | None = None
         self._docking_file_map: dict[Path, Path] = {}  # normal_xyz -> docking_xyz
 
         self.aboutDialog = None
@@ -303,6 +305,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionExportXYZ.triggered.connect(self.export_xyz)
         self.actionExportXYZ.setEnabled(False)  # Disabled until XYZ is loaded
         self.menuFile.addAction(self.actionExportXYZ)
+        self.actionExportDockingPDB = QAction("Export Docking PDB", self)
+        self.actionExportDockingPDB.setObjectName("actionExportDockingPDB")
+        self.actionExportDockingPDB.setShortcut("Ctrl+Shift+D")
+        self.actionExportDockingPDB.setToolTip("Export docking atom-mode structure to a PDB file")
+        self.actionExportDockingPDB.triggered.connect(self.export_docking_pdb)
+        self.actionExportDockingPDB.setEnabled(False)  # Enabled once docking data is loaded
+        self.menuFile.addAction(self.actionExportDockingPDB)
         self.actionPlottingDialog.triggered.connect(self.replotting_called)
 
         self.actionAboutCGAspects.triggered.connect(self.showAboutDialog)
@@ -402,6 +411,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         actReset.setShortcut("R")
         actReset.triggered.connect(self.openglwidget.reset_view)
         self.menuView.addAction(actReset)
+
+        actRecentre = QAction("Recentre View", self)
+        actRecentre.setObjectName("actionRecentreView")
+        actRecentre.setShortcut("F")
+        actRecentre.triggered.connect(self.openglwidget.recentre_view)
+        self.menuView.addAction(actRecentre)
 
         actStore = QAction("Store View Orientation", self)
         actStore.setObjectName("actionStoreView")
@@ -530,6 +545,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if self._colour_legend_dialog is None:
             self._colour_legend_dialog = ColorLegendDialog(parent=self)
             self.openglwidget.legendChanged.connect(self._colour_legend_dialog.update_legend)
+            self._colour_legend_dialog.colorOverrideRequested.connect(
+                self._handle_legend_color_override
+            )
             info = self.openglwidget.get_legend_info()
             if info is not None:
                 self._colour_legend_dialog.update_legend(info)
@@ -539,6 +557,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._colour_legend_dialog.activateWindow()
         else:
             self._colour_legend_dialog.show()
+
+    def _handle_legend_color_override(self, mode: str, key, color):
+        """Route legend colour-pick / reset signals to the GL widget."""
+        gl = self.openglwidget
+        if mode == "reset_all":
+            gl.reset_legend_colors()
+        elif mode == "atom":
+            # key is an element symbol string
+            rgb = tuple(color) if color is not None else None
+            gl.set_legend_element_color(key, rgb)
+        elif mode == "docking_shell":
+            # key is the shell_id integer (comes as str from signal — convert)
+            shell_id = gl._shell_id(key) if isinstance(key, str) else int(key)
+            if shell_id is not None:
+                rgb = tuple(color) if color is not None else None
+                gl.set_legend_shell_color(shell_id, rgb)
 
     def showAboutDialog(self):
         if self.aboutDialog is None:
@@ -799,6 +833,36 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Export the current point cloud to an XYZ file."""
         if hasattr(self, "openglwidget") and self.openglwidget is not None:
             self.openglwidget.exportXYZDialog()
+
+    def export_docking_pdb(self):
+        """Export the current docking atom-mode structure to a PDB file."""
+        gl = self.openglwidget
+        if gl is None or gl._docking_data is None or gl._docking_data.empty:
+            QMessageBox.warning(self, "Export Docking PDB", "No docking data loaded.")
+            return
+        if not gl._mol_cart_templates:
+            QMessageBox.warning(
+                self, "Export Docking PDB", "No molecular templates available — load a structure file first."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Docking PDB", "", "PDB Files (*.pdb);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".pdb"):
+            path += ".pdb"
+        try:
+            out = write_docking_pdb(
+                filepath=path,
+                docking_data=gl._docking_data,
+                mol_cart_templates=gl._mol_cart_templates,
+                a_axis=gl._a_axis(),
+                crystallography=gl._mol_crystallography,
+            )
+            self.log_message(f"Docking PDB exported: {out}", "info")
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Export Docking PDB", str(exc))
 
     def set_message(self, msg):
         self.log_message(message=msg, log_level="info", gui=True)
@@ -1578,6 +1642,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         try:
             docking_data = DockingData.from_file(docking_path)
             self.openglwidget.set_docking_data(docking_data)
+            self.actionExportDockingPDB.setEnabled(True)
             self.log_message(f"Docking site loaded: {docking_path.name}", "info")
         except (OSError, ValueError) as exc:
             self.log_message(f"Failed to load docking file: {exc}", "error")
@@ -1585,8 +1650,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def updateVisualizationSettings(self):
         pass
 
+    _REINIT_VIEW_STYLES = frozenset(("Docking", "Docking Atoms", "Unit Cell"))
+    _DOCKING_VIEW_STYLES = frozenset(("Docking", "Docking Atoms"))
+
     def handleVisualizationSettingsChange(self):
         settings = self.visualizationSettings.settings()
+        new_style = settings.get("Style", "")
+        old_style = self._prev_style  # capture before update
+
+        # Update Color By options when style changes (before reading color_by)
+        if new_style != self._prev_style:
+            self._prev_style = new_style
+            self._update_color_by_options_for_style(new_style, settings)
+            settings = self.visualizationSettings.settings()  # re-read updated color_by
+
         color_by = settings.get("Color By")
         prev = self._prev_color_by
         self._prev_color_by = color_by
@@ -1602,17 +1679,49 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.openglwidget.updateSettings(**settings)
 
         # Keep "Atom Mode Settings" menu item in sync with current style
-        new_style = settings.get("Style", "")
         self.actionAtomModeSettings.setEnabled(new_style in ("Atoms", "Unit Cell"))
 
         # Auto-load docking data when switching to a docking style
         if new_style in ("Docking", "Docking Atoms"):
             self._load_docking_for_current_xyz()
 
+        # Recentre camera whenever crossing the normal ↔ reinit-style boundary
+        # (entering Docking/Unit Cell, or returning to normal mode from them).
+        # Exception: Docking ↔ Docking Atoms only rescales, rotation is preserved.
+        style_changed = new_style != old_style
+        between_docking = old_style in self._DOCKING_VIEW_STYLES and new_style in self._DOCKING_VIEW_STYLES
+        crossing_boundary = style_changed and not between_docking and (
+            (old_style in self._REINIT_VIEW_STYLES) != (new_style in self._REINIT_VIEW_STYLES)
+            or new_style in self._REINIT_VIEW_STYLES
+        )
+        if crossing_boundary:
+            self.openglwidget.recentre_view()
+
         fps = self.visualizationSettings.fps()
         if self.fps != fps:
             self.frame_timer.start(1000 // self.fps)
             self.fps = fps
+
+    def _update_color_by_options_for_style(self, style: str, current_settings: dict):
+        """Update the Color By combo options to match the active render style."""
+        from .visualisation.openGL import VisualisationWidget as _VW
+
+        if style in ("Atoms", "Unit Cell"):
+            options = list(_VW._ATOM_COLOR_BY)
+            default = "Atom"
+        elif style == "Docking":
+            options = list(_VW._DOCKING_COLOR_BY)
+            default = "Coordination Shell"
+        elif style == "Docking Atoms":
+            options = list(_VW._DOCKING_ATOM_COLOR_BY)
+            default = "Atom"
+        else:
+            options = list(_VW._NORMAL_COLOR_BY)
+            default = "Layer"
+
+        current_val = current_settings.get("Color By", "")
+        effective_default = current_val if current_val in options else default
+        self.visualizationSettings.setColorByOptions(options, effective_default)
 
     def show_atom_mode_settings(self):
         """Open the Atom Mode Settings dialog, populated with current elements."""
@@ -1639,7 +1748,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.openglwidget.set_atom_overrides(color_overrides, radius_overrides, bond_radius)
 
     def _on_style_changed(self, style: str):
-        """Keep the Style combo and Atom Mode Settings menu in sync with the active style."""
+        """Keep the Style combo, Color By combo, and Atom Mode Settings menu in sync with the active style."""
         is_mol_style = style in ("Atoms", "Unit Cell")
         self.actionAtomModeSettings.setEnabled(is_mol_style)
         if style in ("Docking", "Docking Atoms"):
@@ -1649,6 +1758,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             style_widget.comboBox.blockSignals(True)
             style_widget.setValue(style)
             style_widget.comboBox.blockSignals(False)
+        # Update Color By options when the style changes externally (e.g. toggle_atom_view shortcut)
+        if style != self._prev_style:
+            self._prev_style = style
+            current_settings = self.visualizationSettings.settings()
+            self._update_color_by_options_for_style(style, current_settings)
         # If switching into a molecular style and the dialog is already open, refresh it
         if is_mol_style and self.atom_mode_settings_dialog.isVisible():
             elements = self.openglwidget.get_visible_elements()

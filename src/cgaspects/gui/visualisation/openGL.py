@@ -61,6 +61,7 @@ class VisualisationWidget(QOpenGLWidget):
     pointSizeChanged = Signal(int)  # Emitted when point size changes (integer value)
     legendChanged = Signal(dict)  # Emitted when the colour legend data changes
     styleChanged = Signal(str)   # Emitted when the render style changes (e.g. "Atoms", "Spheres")
+    colorByOptionsChanged = Signal(list, str)  # (options_list, default_option)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -152,6 +153,10 @@ class VisualisationWidget(QOpenGLWidget):
             "Atom/Molecule Number": 1,
             "Layer": 2,
             "Single Colour": -1,
+            # Atom/docking-specific modes (not used in point-cloud path)
+            "Atom": -2,
+            "Coordination Shell": -3,
+            "Atom Type": -4,
             "Site Number": 6,
             "Particle Energy": 7,
         }
@@ -164,6 +169,7 @@ class VisualisationWidget(QOpenGLWidget):
 
         # Docking site data
         self._docking_data = None   # DockingData instance or None
+        self._docking_shell_color_overrides: dict[int, tuple[float, float, float]] = {}
 
     def pass_XYZ(self, xyz):
         self.xyz = xyz
@@ -288,6 +294,17 @@ class VisualisationWidget(QOpenGLWidget):
     _ATOM_STYLES = frozenset(("Atoms", "Unit Cell", "Docking Atoms"))
     _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull", "Docking"))
 
+    # (shell_id, display_name) pairs — use _shell_name() / _shell_id() helpers
+    _SHELL_NAMES: tuple = ((30, "Central"), (31, "1st Shell"), (32, "2nd Shell"))
+
+    _NORMAL_COLOR_BY = (
+        "Layer", "Atom/Molecule Type", "Atom/Molecule Number",
+        "Single Colour", "Site Number", "Particle Energy",
+    )
+    _ATOM_COLOR_BY = ("Atom",) + _NORMAL_COLOR_BY
+    _DOCKING_COLOR_BY = ("Coordination Shell", "Atom Type")
+    _DOCKING_ATOM_COLOR_BY = ("Atom", "Coordination Shell", "Atom Type")
+
     def _rescale_camera_for_style(self, old_style, new_style):
         """Rescale camera zoom when switching between XYZ-unit and Cartesian spaces.
 
@@ -309,6 +326,28 @@ class VisualisationWidget(QOpenGLWidget):
             self.camera.scale /= a
         else:
             self.camera.scale *= a
+
+    def recentre_view(self):
+        """Fit the camera to the current geometry.  Used as a menu action (F)
+        and called automatically when entering Docking / Unit Cell styles."""
+        coords = None
+        if self.style == "Docking":
+            if self._docking_data is not None and not self._docking_data.empty:
+                coords = self._docking_data.coords.astype(np.float32)
+        elif self.style == "Docking Atoms":
+            if self._docking_data is not None and not self._docking_data.empty:
+                a = self._a_axis()
+                coords = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
+        elif self.style in ("Atoms", "Unit Cell"):
+            if self._mol_crystallography is not None and self.xyz is not None:
+                a = self._a_axis()
+                coords = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
+        elif self.xyz is not None:
+            coords = self.xyz[:, 3:6].astype(np.float32)
+
+        if coords is not None and len(coords) > 0:
+            self.camera.fitToObject(coords)
+            self.update()
 
     def highlight_sites(self, highlight_groups, background_color=None):
         """Highlight multiple groups of sites with different colors.
@@ -701,6 +740,8 @@ class VisualisationWidget(QOpenGLWidget):
             self.style = kwargs["Style"]
             self.styleChanged.emit(self.style)
             self._rescale_camera_for_style(old_style, self.style)
+            opts, default = self._color_by_options_for_style(self.style)
+            self.colorByOptionsChanged.emit(list(opts), default)
             needs_reinit = True
 
         if present_and_changed("Show Mesh Edges", self.show_mesh_edges):
@@ -719,7 +760,7 @@ class VisualisationWidget(QOpenGLWidget):
             self.single_color = kwargs.get("Single Color", self.single_color)
             needs_reinit = True
 
-        if present_and_changed("Point Size", self.point_size):
+        if "Point Size" in kwargs:
             self.point_size = float(kwargs["Point Size"])
 
         if "Axes Thickness" in kwargs:
@@ -1334,6 +1375,10 @@ class VisualisationWidget(QOpenGLWidget):
             pcd_points = xyz[:, 3:6]
             pcd_colors = None
 
+            # Atom/docking-specific modes not valid in point-cloud path; fall back to Layer
+            if color_axis < -1:
+                color_axis = 2
+
             if xyz.shape[1] <= 6 and color_axis >= 6:
                 logger.warning(
                     "Old CrystalGrower version! %s option not available for colouring.",
@@ -1473,6 +1518,210 @@ class VisualisationWidget(QOpenGLWidget):
             )
             return
 
+    @classmethod
+    def _shell_name(cls, shell_id: int) -> str:
+        for sid, name in cls._SHELL_NAMES:
+            if sid == shell_id:
+                return name
+        return str(shell_id)
+
+    @classmethod
+    def _shell_id(cls, name: str) -> int | None:
+        for sid, n in cls._SHELL_NAMES:
+            if n == name:
+                return sid
+        return None
+
+    def _emit_atom_legend(self):
+        """Build and emit a legend for the current Atoms/Unit Cell view."""
+        if not self._mol_cart_templates:
+            return
+        if self.color_by == "Atom":
+            # One row per unique element symbol, using resolved colors
+            seen: dict[str, tuple] = {}
+            for tmpl in self._mol_cart_templates.values():
+                colors, _ = self._resolved_atom_colors_radii(tmpl)
+                for sym, rgb in zip(tmpl["symbols"], colors):
+                    if sym not in seen:
+                        seen[sym] = tuple(float(v) for v in rgb)
+            rows = [(sym, seen[sym]) for sym in sorted(seen)]
+            info = {
+                "color_by": "Atom",
+                "colormap": self.colormap,
+                "min_val": 0.0,
+                "max_val": float(len(rows) - 1),
+                "rows": rows,
+                "mode": "atom",        # signals legend dialog to use symbol labels
+            }
+        else:
+            # Colormap-based: build legend from xyz data
+            if self.xyz is None:
+                return
+            col_idx = self.columnLabelToIndex.get(self.color_by, 2)
+            if col_idx < -1:
+                col_idx = 2
+            if col_idx == -1:
+                rgb = np.array(
+                    [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
+                    dtype=np.float32,
+                )
+                rows = [(None, tuple(rgb.tolist()))]
+                info = {
+                    "color_by": self.color_by,
+                    "colormap": self.colormap,
+                    "min_val": 0.0,
+                    "max_val": 0.0,
+                    "rows": rows,
+                    "mode": "colormap",
+                }
+            else:
+                if col_idx == 3:
+                    axis_vis = np.arange(self.xyz.shape[0], dtype=np.float32)
+                else:
+                    axis_vis = self.xyz[:, col_idx].astype(np.float32)
+                layers = self.xyz[:, 2]
+                max_layers = int(np.nanmax(layers[layers < 99]))
+                min_val = 1.0 if col_idx == 2 else float(np.nanmin(axis_vis))
+                max_val = float(max_layers) if col_idx == 2 else float(np.nanmax(axis_vis))
+                range_val = max_val - min_val if max_val != min_val else 1.0
+                unique_vals = np.unique(axis_vis)
+                norm_unique = (unique_vals - min_val) / range_val
+                unique_rgb = self.availableColormaps[self.colormap](norm_unique)[:, :3]
+                rows = [(float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)]
+                info = {
+                    "color_by": self.color_by,
+                    "colormap": self.colormap,
+                    "min_val": min_val,
+                    "max_val": max_val,
+                    "rows": rows,
+                    "mode": "colormap",
+                }
+        self._legend_info = info
+        self.legendChanged.emit(info)
+
+    def _emit_docking_legend(self):
+        """Build and emit a legend for the current Docking/Docking Atoms view."""
+        if self._docking_data is None or self._docking_data.empty:
+            return
+
+        if self.color_by == "Coordination Shell":
+            rows = []
+            for shell_id, default_color in self._docking_data.SHELL_COLORS.items():
+                color = self._docking_shell_color_overrides.get(shell_id, default_color)
+                rows.append((self._shell_name(shell_id), tuple(float(v) for v in color)))
+            info = {
+                "color_by": "Coordination Shell",
+                "colormap": self.colormap,
+                "min_val": 0.0,
+                "max_val": float(len(rows) - 1),
+                "rows": rows,
+                "mode": "docking_shell",
+            }
+        elif self.color_by == "Atom Type":
+            mol_types = self._docking_data.mol_types.astype(np.float32)
+            min_val, max_val = float(mol_types.min()), float(mol_types.max())
+            range_val = max_val - min_val if max_val != min_val else 1.0
+            unique_vals = np.unique(mol_types)
+            norm_unique = (unique_vals - min_val) / range_val
+            unique_rgb = self.availableColormaps[self.colormap](norm_unique)[:, :3]
+            rows = [(float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)]
+            info = {
+                "color_by": "Atom Type",
+                "colormap": self.colormap,
+                "min_val": min_val,
+                "max_val": max_val,
+                "rows": rows,
+                "mode": "colormap",
+            }
+        elif self.color_by == "Atom" and self._mol_cart_templates:
+            # Atom-element coloring in Docking Atoms mode
+            seen: dict[str, tuple] = {}
+            for tmpl in self._mol_cart_templates.values():
+                colors, _ = self._resolved_atom_colors_radii(tmpl)
+                for sym, rgb in zip(tmpl["symbols"], colors):
+                    if sym not in seen:
+                        seen[sym] = tuple(float(v) for v in rgb)
+            rows = [(sym, seen[sym]) for sym in sorted(seen)]
+            info = {
+                "color_by": "Atom",
+                "colormap": self.colormap,
+                "min_val": 0.0,
+                "max_val": float(len(rows) - 1),
+                "rows": rows,
+                "mode": "atom",
+            }
+        else:
+            return
+        self._legend_info = info
+        self.legendChanged.emit(info)
+
+    def _color_by_options_for_style(self, style: str) -> tuple[tuple, str]:
+        """Return (options_tuple, default_option) for the given render style."""
+        if style in ("Atoms", "Unit Cell"):
+            return self._ATOM_COLOR_BY, "Atom"
+        elif style == "Docking":
+            return self._DOCKING_COLOR_BY, "Coordination Shell"
+        elif style == "Docking Atoms":
+            return self._DOCKING_ATOM_COLOR_BY, "Atom"
+        else:
+            return self._NORMAL_COLOR_BY, "Layer"
+
+    def _centroid_colormap_colors(self, xyz: np.ndarray) -> np.ndarray:
+        """Return (N, 3) float32 colours for each xyz centroid row based on color_by.
+
+        Used in Atoms/Unit Cell mode when color_by != "Atom".
+        """
+        col_idx = self.columnLabelToIndex.get(self.color_by, 2)
+        # Fall back to Layer for special modes not handled here
+        if col_idx < -1:
+            col_idx = 2
+
+        layers = xyz[:, 2]
+        max_layers = int(np.nanmax(layers[layers < 99]))
+
+        if col_idx == -1:
+            rgb = np.array(
+                [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
+                dtype=np.float32,
+            )
+            return np.tile(rgb, (xyz.shape[0], 1))
+
+        if xyz.shape[1] <= 6 and col_idx >= 6:
+            col_idx = 3  # Atom/Molecule Number fallback
+
+        if col_idx == 3:
+            axis_vis = np.arange(xyz.shape[0], dtype=np.float32)
+        else:
+            axis_vis = xyz[:, col_idx].astype(np.float32)
+
+        if col_idx == 2:
+            min_val, max_val = 1.0, float(max_layers)
+        else:
+            min_val = float(np.nanmin(axis_vis))
+            max_val = float(np.nanmax(axis_vis))
+
+        range_val = max_val - min_val if max_val != min_val else 1.0
+        normalized = (axis_vis - min_val) / range_val
+        return self.availableColormaps[self.colormap](normalized)[:, :3].astype(np.float32)
+
+    def _docking_centroid_colors(self) -> np.ndarray:
+        """Return (N, 3) float32 colours for docking centroids based on color_by."""
+        n = len(self._docking_data.coords)
+        if self.color_by == "Atom Type":
+            mol_types = self._docking_data.mol_types.astype(np.float32)
+            min_val, max_val = mol_types.min(), mol_types.max()
+            range_val = max_val - min_val if max_val != min_val else 1.0
+            normalized = (mol_types - min_val) / range_val
+            return self.availableColormaps[self.colormap](normalized)[:, :3].astype(np.float32)
+        else:
+            # Default: Coordination Shell — respect per-shell overrides
+            colors = np.zeros((n, 3), dtype=np.float32)
+            for shell_id, default_color in self._docking_data.SHELL_COLORS.items():
+                color = self._docking_shell_color_overrides.get(shell_id, default_color)
+                mask = self._docking_data.shells == shell_id
+                colors[mask] = color
+            return colors
+
     def _update_docking_sphere_view(self):
         """Upload docking data to the sphere renderer for the Docking style."""
         if self._docking_data is None or self._docking_data.empty:
@@ -1480,7 +1729,8 @@ class VisualisationWidget(QOpenGLWidget):
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
             return
-        coords, colors = self._docking_data.colored_points()
+        coords = self._docking_data.coords.astype(np.float32)
+        colors = self._docking_centroid_colors()
         n = len(coords)
         selected = np.zeros((n, 1), dtype=np.float32)
         varray = np.concatenate([coords, colors, selected], axis=1).astype(np.float32)
@@ -1488,10 +1738,15 @@ class VisualisationWidget(QOpenGLWidget):
         if not self.viewInitialized:
             self.camera.fitToObject(coords)
             self.viewInitialized = True
+        self._emit_docking_legend()
 
     # ------------------------------------------------------------------ docking
     def set_docking_data(self, docking_data):
         """Store docking data and refresh the view if a docking style is active."""
+        if docking_data is not None and not docking_data.empty:
+            # Centre coords at the world origin so that camera target (0,0,0)
+            # is always the object centre — orbit and zoom then work correctly.
+            docking_data.raw[:, 3:6] -= docking_data.raw[:, 3:6].mean(axis=0)
         self._docking_data = docking_data
         if self.style in ("Docking", "Docking Atoms"):
             self.initGeometry()
@@ -1519,6 +1774,10 @@ class VisualisationWidget(QOpenGLWidget):
         bond_instances = []
         bond_r = self._bond_radius
 
+        # Pre-compute per-centroid colors for non-Atom modes
+        use_atom_colors = self.color_by == "Atom"
+        centroid_colors = None if use_atom_colors else self._docking_centroid_colors()
+
         for i, (mol_type, centroid_pos, shell) in enumerate(
             zip(mol_types, cart_positions, shells)
         ):
@@ -1526,7 +1785,13 @@ class VisualisationWidget(QOpenGLWidget):
             if tmpl is None:
                 continue
 
-            colors, radii = self._resolved_atom_colors_radii(tmpl)
+            if use_atom_colors:
+                colors, radii = self._resolved_atom_colors_radii(tmpl)
+            else:
+                centroid_color = centroid_colors[i]  # (3,)
+                colors = np.tile(centroid_color, (len(tmpl["cart"]), 1))
+                radii = tmpl["radii"].copy()
+
             offset = centroid_pos - tmpl["centroid"]
             atom_positions = tmpl["cart"] + offset
 
@@ -1556,6 +1821,7 @@ class VisualisationWidget(QOpenGLWidget):
 
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
+        self._emit_docking_legend()
 
     def initializeGL(self):
         logger.debug("Initialized OpenGL, version info: %s", self.context().format().version())
@@ -1729,6 +1995,10 @@ class VisualisationWidget(QOpenGLWidget):
         a = self._a_axis()
         cart_positions = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
 
+        # Pre-compute per-centroid colormap colours for non-Atom modes
+        use_atom_colors = self.color_by == "Atom"
+        centroid_colors = None if use_atom_colors else self._centroid_colormap_colors(self.xyz)
+
         # Precompute active slice planes in Cartesian Å space.
         # plane.origin is stored in a-axis units → multiply by a.
         slice_planes = []
@@ -1767,7 +2037,12 @@ class VisualisationWidget(QOpenGLWidget):
                 if skip:
                     continue
 
-            colors, radii = self._resolved_atom_colors_radii(tmpl)
+            if use_atom_colors:
+                colors, radii = self._resolved_atom_colors_radii(tmpl)
+            else:
+                centroid_color = centroid_colors[i]  # (3,)
+                colors = np.tile(centroid_color, (len(tmpl["cart"]), 1))
+                radii = tmpl["radii"].copy()
 
             # Shift template atoms so their centroid sits on centroid_pos (both in Cartesian)
             offset = centroid_pos - tmpl["centroid"]
@@ -1810,6 +2085,7 @@ class VisualisationWidget(QOpenGLWidget):
 
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
+        self._emit_atom_legend()
 
     def _update_unit_cell_view(self):
         """Render the template molecules at their unit-cell positions (no crystal replication)."""
@@ -1855,6 +2131,7 @@ class VisualisationWidget(QOpenGLWidget):
 
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
+        self._emit_atom_legend()
 
     def set_atom_overrides(
         self,
@@ -1872,6 +2149,31 @@ class VisualisationWidget(QOpenGLWidget):
         elif self.style == "Unit Cell":
             self._update_unit_cell_view()
             self.update()
+
+    def set_legend_element_color(self, symbol: str, color: tuple[float, float, float] | None):
+        """Override or reset the colour for an element symbol, then redraw."""
+        if color is None:
+            self._atom_color_overrides.pop(symbol, None)
+        else:
+            self._atom_color_overrides[symbol] = color
+        if self.style in ("Atoms", "Unit Cell", "Docking Atoms"):
+            self.initGeometry()
+
+    def set_legend_shell_color(self, shell_id: int, color: tuple[float, float, float] | None):
+        """Override or reset the colour for a docking coordination shell, then redraw."""
+        if color is None:
+            self._docking_shell_color_overrides.pop(shell_id, None)
+        else:
+            self._docking_shell_color_overrides[shell_id] = color
+        if self.style in ("Docking", "Docking Atoms"):
+            self.initGeometry()
+
+    def reset_legend_colors(self):
+        """Clear all legend-driven colour overrides (element and shell) and redraw."""
+        self._atom_color_overrides.clear()
+        self._docking_shell_color_overrides.clear()
+        if self.style in ("Atoms", "Unit Cell", "Docking", "Docking Atoms"):
+            self.initGeometry()
 
     def get_visible_elements(self) -> list[str]:
         """Return sorted list of unique element symbols in the currently loaded templates."""
