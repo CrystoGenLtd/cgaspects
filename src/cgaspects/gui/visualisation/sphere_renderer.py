@@ -27,6 +27,7 @@ class SphereRenderer(QOpenGLExtraFunctions):
         out float v_selected;
         uniform float u_pointSize;
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelMat;
         uniform mat4 u_modelViewProjectionMat;
 
         void main() {
@@ -45,7 +46,7 @@ class SphereRenderer(QOpenGLExtraFunctions):
           mat4 normalTransform = inverse(transpose(transform));
           vec4 posTransformed = transform * vec4(vertexPosition, 1);
 
-          v_normal = normalize(mat3(u_viewMat) * mat3(normalTransform) * vertexPosition);
+          v_normal = normalize(mat3(u_viewMat) * mat3(u_modelMat) * mat3(normalTransform) * vertexPosition);
           v_position = posTransformed.xyz;
           v_color = vec4(color, 1.0f);
           gl_Position = u_modelViewProjectionMat * vec4(v_position, 1.0);

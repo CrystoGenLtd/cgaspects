@@ -34,6 +34,7 @@ class Camera:
         self.rotationSpeed = 1.0
         self.zoomSpeed = 0.02
         self.scale = 1.0
+        self.model_rotation = QQuaternion()  # identity = no object rotation
         self.distance = (self.position - self.target).length()
         self.storeOrientation()
 
@@ -45,10 +46,15 @@ class Camera:
 
     def modelMatrix(self):
         model = QMatrix4x4()
-        # can adjust these later if for some bizarre reason
-        # you'd want different scales in this program
         model.scale(self.scale, self.scale, self.scale)
+        model.rotate(self.model_rotation)
         return model
+
+    def modelRotationMatrix(self):
+        """Pure rotation matrix for the object (no scale), used by axes renderer."""
+        mat = QMatrix4x4()
+        mat.rotate(self.model_rotation)
+        return mat
 
     def viewMatrix(self):
         view = QMatrix4x4()
@@ -89,6 +95,7 @@ class Camera:
             self.right,
             self.up,
             self.scale,
+            QQuaternion(self.model_rotation),
         )
 
     def resetOrientation(self):
@@ -98,7 +105,18 @@ class Camera:
             self.right,
             self.up,
             self.scale,
+            self.model_rotation,
         ) = self._stored_orientation
+
+    def rotate_model(self, dx: float, dy: float) -> None:
+        """Accumulate object rotation from mouse delta (non-destructive)."""
+        q_yaw = QQuaternion.fromAxisAndAngle(self.up, dx * self.rotationSpeed)
+        q_pitch = QQuaternion.fromAxisAndAngle(self.right, -dy * self.rotationSpeed)
+        self.model_rotation = (q_yaw * q_pitch * self.model_rotation).normalized()
+
+    def reset_model_rotation(self) -> None:
+        """Reset the object rotation to identity."""
+        self.model_rotation = QQuaternion()
 
     def compute_relative_mouse_pos(self, event_pos):
         mouse_x = (self.right * event_pos.windowPos().x()).normalized()
@@ -187,3 +205,29 @@ class Camera:
 
     def projectionMode(self):
         return "Perspective" if self.perspectiveProjection else "Orthographic"
+
+    def snapshot(self) -> "CameraSnapshot":
+        """Return a CameraSnapshot capturing the full animatable camera + object state."""
+        from ..animation.keyframe import CameraSnapshot
+        return CameraSnapshot(
+            position=QVector3D(self.position),
+            target=QVector3D(self.target),
+            up=QVector3D(self.up),
+            scale=self.scale,
+            perspective=self.perspectiveProjection,
+            model_rotation=QQuaternion(self.model_rotation),
+        )
+
+    def restore_snapshot(self, snap: "CameraSnapshot") -> None:
+        """Apply a CameraSnapshot, recomputing derived camera vectors."""
+        self.position = QVector3D(snap.position)
+        self.target = QVector3D(snap.target)
+        self.up = QVector3D(snap.up)
+        self.scale = snap.scale
+        self.perspectiveProjection = snap.perspective
+        self.model_rotation = QQuaternion(snap.model_rotation)
+        # Recompute derived vectors
+        self.screen = (self.target - self.position).normalized()
+        self.right = QVector3D.crossProduct(self.up, self.screen).normalized()
+        self.up = QVector3D.crossProduct(self.screen, self.right).normalized()
+        self.distance = (self.position - self.target).length()

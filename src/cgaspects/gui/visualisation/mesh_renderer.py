@@ -86,10 +86,11 @@ class MeshRenderer:
         out vec4 v_color;
         out vec3 v_normal;
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelMat;
         uniform mat4 u_modelViewProjectionMat;
 
         void main() {
-          v_normal = normalize(mat3(u_viewMat) * normal);
+          v_normal = normalize(mat3(u_viewMat) * mat3(u_modelMat) * normal);
           v_color = vec4(color, 1.0f);
           gl_Position = u_modelViewProjectionMat * vec4(position, 1.0);
         }

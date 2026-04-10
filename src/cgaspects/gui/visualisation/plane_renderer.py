@@ -27,6 +27,7 @@ class PlaneRenderer:
 
         uniform mat4 u_modelViewProjectionMat;
         uniform mat4 u_viewMat;
+        uniform mat4 u_modelMat;
 
         out vec4 f_color;
         out vec3 v_normal;
@@ -34,7 +35,7 @@ class PlaneRenderer:
 
         void main() {
             gl_Position = u_modelViewProjectionMat * vec4(position, 1.0);
-            v_normal = mat3(u_viewMat) * normal;
+            v_normal = mat3(u_viewMat) * mat3(u_modelMat) * normal;
             v_fragPos = position;
             f_color = vec4(color, alpha);
         }

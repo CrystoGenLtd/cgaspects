@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+import dataclasses
 
 import numpy as np
 import trimesh
@@ -8,7 +9,7 @@ from OpenGL.GL import (GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
                        GL_DEPTH_TEST)
 from PySide6 import QtCore
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QVector3D
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QQuaternion, QVector3D
 from PySide6.QtOpenGL import QOpenGLDebugLogger, QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
@@ -71,6 +72,7 @@ class VisualisationWidget(QOpenGLWidget):
         self.camera = Camera()
         self.restrict_axis = None
         self.rotation_lock_axis = None  # "x", "y", "z", or None; toggled by menu actions
+        self.interaction_mode = "camera"  # "camera" | "object"
         self.geom = self.geometry()
         self.centre = self.geom.center()
         # print(self.geom)
@@ -464,6 +466,22 @@ class VisualisationWidget(QOpenGLWidget):
         image = self.renderToImage(float(resolution[0]))
         image.save(file_name)
 
+    def snapshot(self):
+        """Return a CameraSnapshot including all current viewport render settings."""
+
+        return dataclasses.replace(self.camera.snapshot(), point_size=self.point_size)
+
+    def apply_camera_snapshot(self, snap) -> None:
+        """Apply a CameraSnapshot (camera + render settings) and schedule a repaint."""
+        self.camera.restore_snapshot(snap)
+        self.point_size = snap.point_size
+        self.pointSizeChanged.emit(int(round(snap.point_size)))
+        self.update()
+
+    def render_animation_frame(self, scale: float = 1.0):
+        """Render the current view to a QImage (used by the animation render worker)."""
+        return self.renderToImage(scale)
+
     def saveMeshDialog(self):
         # Ask user for mesh file format
         mesh_formats = [".obj", ".stl", ".ply", ".glb", ".off"]
@@ -813,6 +831,11 @@ class VisualisationWidget(QOpenGLWidget):
                     self._sphere_sel_active = False
             # Plain left click: camera orbit only (handled in mouseMoveEvent)
 
+    def toggle_interaction_mode(self):
+        """Toggle between camera orbit mode and object rotation mode."""
+        self.interaction_mode = "object" if self.interaction_mode == "camera" else "camera"
+        self.update()
+
     def keyPressEvent(self, event):
         dx, dy = 0, 0
         self.restrict_axis = None
@@ -837,7 +860,10 @@ class VisualisationWidget(QOpenGLWidget):
 
         super().keyPressEvent(event)
 
-        self.camera.orbit(dx, dy)
+        if self.interaction_mode == "object":
+            self.camera.rotate_model(dx, dy)
+        else:
+            self.camera.orbit(dx, dy, restrict_axis=self.restrict_axis)
         self.update()
 
     def keyReleaseEvent(self, event):
@@ -906,6 +932,12 @@ class VisualisationWidget(QOpenGLWidget):
         else:
             return
 
+        # The object axes may be rotated by model_rotation (OBJ mode), so always
+        # align to the rendered axis direction rather than the raw world axis.
+        q = self.camera.model_rotation
+        direction = q.rotatedVector(direction)
+        up = q.rotatedVector(up)
+
         # Set camera position along the negative direction, looking toward target
         distance = (self.camera.position - self.camera.target).length()
         self.camera.position = self.camera.target - direction * distance
@@ -917,12 +949,23 @@ class VisualisationWidget(QOpenGLWidget):
     # Public viewport action methods (wired to menu QActions)
     # ------------------------------------------------------------------
 
-    def align_view_x(self): self._align_view_to_axis("x")
-    def align_view_y(self): self._align_view_to_axis("y")
-    def align_view_z(self): self._align_view_to_axis("z")
-    def align_view_a(self): self._align_view_to_axis("a")
-    def align_view_b(self): self._align_view_to_axis("b")
-    def align_view_c(self): self._align_view_to_axis("c")
+    def align_view_x(self):
+        self._align_view_to_axis("x")
+
+    def align_view_y(self):
+        self._align_view_to_axis("y")
+
+    def align_view_z(self):
+        self._align_view_to_axis("z")
+
+    def align_view_a(self):
+        self._align_view_to_axis("a")
+
+    def align_view_b(self):
+        self._align_view_to_axis("b")
+
+    def align_view_c(self):
+        self._align_view_to_axis("c")
 
     def reset_view(self):
         self.camera.resetOrientation()
@@ -1251,8 +1294,28 @@ class VisualisationWidget(QOpenGLWidget):
                 self._sphere_sel_active = True
                 self._sphere_sel_radius = self._compute_sphere_radius(event.pos())
                 self._update_sphere_selection()
+            elif self.interaction_mode == "object":
+                axis = self.rotation_lock_axis
+                if axis:
+                    q = QQuaternion.fromAxisAndAngle(
+                        QVector3D(
+                            1 if axis == "x" else 0,
+                            1 if axis == "y" else 0,
+                            1 if axis == "z" else 0,
+                        ),
+                        dx * self.camera.rotationSpeed,
+                    )
+                    self.camera.model_rotation = (q * self.camera.model_rotation).normalized()
+                else:
+                    self.camera.rotate_model(dx, dy)
             elif self.rotation_lock_axis:
-                self.rotatePointCloud(dx, self.rotation_lock_axis)
+                # Camera mode with rotation lock: orbit restricted to axis
+                self.camera.orbit(
+                    dx,
+                    dy,
+                    restrict_axis=self.rotation_lock_axis,
+                    event_pos=event.pos() - self.geometry().center(),
+                )
             else:
                 self.camera.orbit(
                     dx,
@@ -1289,35 +1352,13 @@ class VisualisationWidget(QOpenGLWidget):
                 self.update()
 
     def rotatePointCloud(self, dx, axis):
-        if self.xyz is None:
+        """Deprecated: rotates object via model matrix instead of mutating vertex data."""
+        axis_map = {"x": QVector3D(1, 0, 0), "y": QVector3D(0, 1, 0), "z": QVector3D(0, 0, 1)}
+        if axis not in axis_map:
             return
-
-        angle = np.radians(dx * self.camera.rotationSpeed)
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-
-        # Define rotation matrices for X, Y, and Z axes
-        if axis == "x":
-            rotation_matrix = np.array(
-                [[1, 0, 0], [0, cos_a, -sin_a], [0, sin_a, cos_a]], dtype=np.float32
-            )
-        elif axis == "y":
-            rotation_matrix = np.array(
-                [[cos_a, 0, sin_a], [0, 1, 0], [-sin_a, 0, cos_a]], dtype=np.float32
-            )
-        elif axis == "z":
-            rotation_matrix = np.array(
-                [[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]], dtype=np.float32
-            )
-        else:
-            return
-
-        # Apply rotation to the XYZ points
-        points = self.xyz[:, 3:6]
-        rotated_points = points @ rotation_matrix.T
-
-        # Update the point cloud with rotated points
-        self.xyz[:, 3:6] = rotated_points
-        self.initGeometry()
+        q = QQuaternion.fromAxisAndAngle(axis_map[axis], dx * self.camera.rotationSpeed)
+        self.camera.model_rotation = (q * self.camera.model_rotation).normalized()
+        self.update()
 
     def initGeometry(self):
         # self.update()
@@ -1426,7 +1467,9 @@ class VisualisationWidget(QOpenGLWidget):
                 unique_vals = np.unique(axis_vis)
                 norm_unique = (unique_vals - min_val) / range_val
                 unique_rgb = self.availableColormaps[self.colormap](norm_unique)[:, :3]
-                legend_rows = [(float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)]
+                legend_rows = [
+                    (float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)
+                ]
 
             self._legend_info = {
                 "color_by": self.color_by,
@@ -2228,10 +2271,13 @@ class VisualisationWidget(QOpenGLWidget):
         view = self.camera.viewMatrix()
         proj = self.camera.projectionMatrix(self.aspect_ratio)
         modelView = self.camera.modelViewMatrix()
+        model = self.camera.modelMatrix()
         axes = QMatrix4x4()
         screen_size = QVector2D(*self.screen_size)
 
         uniforms = {
+            "u_modelMat": model,
+            "u_modelRotMat": self.camera.modelRotationMatrix(),
             "u_viewMat": view,
             "u_modelViewProjectionMat": mvp,
             "u_pointSize": self.point_size,
@@ -2401,7 +2447,9 @@ class VisualisationWidget(QOpenGLWidget):
         # so axes labels respond only to orientation, not to crystal translation.
         view = self.camera.viewMatrix()
         view.setColumn(3, QVector4D(0.0, 0.0, 0.0, 1.0))
-        rotated = view.map(QVector3D(pos_3d[0], pos_3d[1], pos_3d[2])) * 0.1
+        model_rot = self.camera.modelRotationMatrix()
+        world_pos = model_rot.map(QVector3D(pos_3d[0], pos_3d[1], pos_3d[2]))
+        rotated = view.map(world_pos) * 0.1
 
         # Offset to corner (matching the geometry shader)
         screen_offset = QVector3D(0.8, 0.8, 0.0)
