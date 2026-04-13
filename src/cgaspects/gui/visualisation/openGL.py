@@ -5,8 +5,7 @@ import dataclasses
 import numpy as np
 import trimesh
 from matplotlib import cm
-from OpenGL.GL import (GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
-                       GL_DEPTH_TEST)
+from OpenGL.GL import GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
 from PySide6 import QtCore
 from PySide6.QtCore import QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QQuaternion, QVector3D
@@ -61,7 +60,7 @@ class VisualisationWidget(QOpenGLWidget):
     pointsDeleted = Signal(int)  # Number of points deleted
     pointSizeChanged = Signal(int)  # Emitted when point size changes (integer value)
     legendChanged = Signal(dict)  # Emitted when the colour legend data changes
-    styleChanged = Signal(str)   # Emitted when the render style changes (e.g. "Atoms", "Spheres")
+    styleChanged = Signal(str)  # Emitted when the render style changes (e.g. "Atoms", "Spheres")
     colorByOptionsChanged = Signal(list, str)  # (options_list, default_option)
 
     def __init__(self, *args, **kwargs):
@@ -92,10 +91,15 @@ class VisualisationWidget(QOpenGLWidget):
         self._directions_crystallography = None
         self._directions_max_extent = 1.0
 
+        # Coordinate scale: set to a-axis length (Å) once unit cell info is available.
+        # After being set, all xyz[:,3:6] are pre-multiplied by this factor so that
+        # centroid coordinates live in Cartesian Å in both point-cloud and atom modes.
+        self._coord_scale: float = 1.0
+
         # Atom / bond view state
-        self._mol_templates = None          # dict[int, MolTemplate] from structure file
-        self._mol_crystallography = None    # Crystallography used to convert frac → cart
-        self._mol_cart_templates = {}       # precomputed per-type: (cart_atoms, symbols, bonds)
+        self._mol_templates = None  # dict[int, MolTemplate] from structure file
+        self._mol_crystallography = None  # Crystallography used to convert frac → cart
+        self._mol_cart_templates = {}  # precomputed per-type: (cart_atoms, symbols, bonds)
         self.atom_renderer = None
         self.bond_renderer = None
         self.unit_cell_renderer = None
@@ -103,7 +107,7 @@ class VisualisationWidget(QOpenGLWidget):
         # Per-element overrides (set via Atom Mode Settings dialog)
         self._atom_color_overrides: dict[str, tuple[float, float, float]] = {}
         self._atom_radius_overrides: dict[str, float] = {}  # absolute VdW radius in Å
-        self._bond_radius: float = 0.20                     # bond cylinder radius in Å
+        self._bond_radius: float = 0.20  # bond cylinder radius in Å
 
         # Sphere selection state (Shift + Left click + drag)
         self._sphere_sel_center_world = None  # np.array [x, y, z] — set on press
@@ -170,10 +174,13 @@ class VisualisationWidget(QOpenGLWidget):
         self.background_color_override = None  # Background color for non-highlighted sites
 
         # Docking site data
-        self._docking_data = None   # DockingData instance or None
+        self._docking_data = None  # DockingData instance or None
         self._docking_shell_color_overrides: dict[int, tuple[float, float, float]] = {}
 
     def pass_XYZ(self, xyz):
+        if xyz is not None and self._coord_scale != 1.0:
+            xyz = xyz.copy().astype(np.float64)
+            xyz[:, 3:6] *= self._coord_scale
         self.xyz = xyz
         logger.debug("XYZ coordinates passed on OpenGL widget")
 
@@ -188,7 +195,7 @@ class VisualisationWidget(QOpenGLWidget):
             if self.crystal.empty:
                 self.showNoDataOverlay()
                 return
-            self.xyz = self.crystal.get_raw_frame_coords(0)
+            self.pass_XYZ(self.crystal.get_raw_frame_coords(0))
             self.initGeometry()
             self.update()
 
@@ -197,6 +204,27 @@ class VisualisationWidget(QOpenGLWidget):
         self.overlay.setText("No point data available for this simulation")
         self.overlay.setVisible(True)
         self.update()
+
+    def apply_coord_scale(self, crystallography) -> None:
+        """Pre-scale centroid coordinates to Cartesian Å using the a-axis from crystallography.
+
+        Safe to call multiple times: the scale is only applied once (when _coord_scale == 1.0).
+        This covers the lattice-dialog path where set_molecular_data is never called.
+        """
+        if crystallography is None or crystallography.cell is None:
+            return
+        a = float(crystallography.cell.a)
+        if a < 1e-10 or a == 1.0 or self._coord_scale != 1.0:
+            return
+        self._coord_scale = a
+        if self.xyz is not None:
+            self.xyz = self.xyz.copy().astype(np.float64)
+            self.xyz[:, 3:6] *= a
+            self.viewInitialized = False
+            self.initGeometry()
+        logger.info(
+            "Centroid coordinates pre-scaled to Cartesian Å (a=%.4f Å) via crystallography", a
+        )
 
     def set_fractional_axes(self, crystallography):
         """Set the axes to fractional coordinates using the provided crystallography object."""
@@ -222,19 +250,10 @@ class VisualisationWidget(QOpenGLWidget):
     def _apply_directions(self):
         if self.direction_renderer is None:
             return
-        if self.style in ("Atoms", "Unit Cell") and self.xyz is not None:
-            from dataclasses import replace
-            a = self._a_axis()
-            cart_extent = self._cart_max_extent()
-            dirs = [
-                replace(d, origin=tuple((np.array(d.origin) * a).tolist()))
-                for d in self._raw_directions
-            ]
-            self.direction_renderer.set_directions(dirs, self._directions_crystallography, cart_extent)
-        else:
-            self.direction_renderer.set_directions(
-                self._raw_directions, self._directions_crystallography, self._directions_max_extent
-            )
+        extent = self._cart_max_extent() if self.xyz is not None else self._directions_max_extent
+        self.direction_renderer.set_directions(
+            self._raw_directions, self._directions_crystallography, extent
+        )
         self.update()
 
     def set_planes(self, planes, crystallography=None):
@@ -246,27 +265,21 @@ class VisualisationWidget(QOpenGLWidget):
     def _apply_planes(self):
         if self.plane_renderer is None:
             return
+        from dataclasses import replace
+
         visible = [p for p in self._raw_planes if p.visible]
-        if self.style in ("Atoms", "Unit Cell") and self.xyz is not None:
-            from dataclasses import replace
-            a = self._a_axis()
-            cart_extent = self._cart_max_extent()
-            converted = [
-                replace(p,
-                        origin=tuple((np.array(p.origin) * a).tolist()),
-                        size=p.size_relative * cart_extent)
-                for p in visible
-            ]
-            self.plane_renderer.set_planes(converted, self._planes_crystallography)
-            if self.style == "Atoms":
-                self._update_atom_view()
-            self.update()
+        if self.xyz is not None:
+            extent = self._cart_max_extent()
+            converted = [replace(p, size=p.size_relative * extent) for p in visible]
         else:
-            self.plane_renderer.set_planes(visible, self._planes_crystallography)
-            if self.xyz is not None:
-                self.initGeometry()
+            converted = visible
+        self.plane_renderer.set_planes(converted, self._planes_crystallography)
+        if self.xyz is not None:
+            if self.style in ("Atoms", "Unit Cell"):
+                self._update_atom_view()
             else:
-                self.update()
+                self.initGeometry()
+        self.update()
 
     def _a_axis(self):
         """Return the a-axis length in Å, or 1.0 if unavailable."""
@@ -275,23 +288,16 @@ class VisualisationWidget(QOpenGLWidget):
         return 1.0
 
     def _cart_max_extent(self):
-        """Half-range of the crystal in Cartesian Å (used when in Atoms/Unit Cell mode).
-
-        XYZ coordinates are in units of the a-axis length, so multiply by a.
-        """
+        """Half-range of the crystal in world units (Å after pre-scaling)."""
         if self.xyz is None:
             return self._directions_max_extent
-        frac = self.xyz[:, 3:6].astype(np.float64)
-        extents = frac.max(axis=0) - frac.min(axis=0)
-        return float(extents.max()) / 2.0 * self._a_axis()
+        coords = self.xyz[:, 3:6].astype(np.float64)
+        extents = coords.max(axis=0) - coords.min(axis=0)
+        return float(extents.max()) / 2.0
 
     def _frac_max_extent(self):
-        """Half-range of the crystal in raw XYZ lattice units (units of a)."""
-        if self.xyz is None:
-            return 1.0
-        frac = self.xyz[:, 3:6].astype(np.float64)
-        extents = frac.max(axis=0) - frac.min(axis=0)
-        return float(extents.max()) / 2.0
+        """Half-range of the crystal in world units (same as _cart_max_extent after pre-scaling)."""
+        return self._cart_max_extent()
 
     _ATOM_STYLES = frozenset(("Atoms", "Unit Cell", "Docking Atoms"))
     _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull", "Docking"))
@@ -300,34 +306,20 @@ class VisualisationWidget(QOpenGLWidget):
     _SHELL_NAMES: tuple = ((30, "Central"), (31, "1st Shell"), (32, "2nd Shell"))
 
     _NORMAL_COLOR_BY = (
-        "Layer", "Atom/Molecule Type", "Atom/Molecule Number",
-        "Single Colour", "Site Number", "Particle Energy",
+        "Layer",
+        "Atom/Molecule Type",
+        "Atom/Molecule Number",
+        "Single Colour",
+        "Site Number",
+        "Particle Energy",
     )
     _ATOM_COLOR_BY = ("Atom",) + _NORMAL_COLOR_BY
     _DOCKING_COLOR_BY = ("Coordination Shell", "Atom Type")
     _DOCKING_ATOM_COLOR_BY = ("Atom", "Coordination Shell", "Atom Type")
 
     def _rescale_camera_for_style(self, old_style, new_style):
-        """Rescale camera zoom when switching between XYZ-unit and Cartesian spaces.
-
-        XYZ coordinates are in units of the a-axis length. Toggling to Atoms mode
-        scales all world positions by a, so the camera scale must divide by a
-        (and multiply by a when returning to point-cloud mode).
-        Preserves camera orientation (position, target, up/right vectors).
-        """
-        if self._mol_crystallography is None or self.xyz is None:
-            return
-        going_to_cart = old_style in self._FRAC_STYLES and new_style in self._ATOM_STYLES
-        going_to_frac = old_style in self._ATOM_STYLES and new_style in self._FRAC_STYLES
-        if not going_to_cart and not going_to_frac:
-            return
-        a = self._a_axis()
-        if a < 1e-10:
-            return
-        if going_to_cart:
-            self.camera.scale /= a
-        else:
-            self.camera.scale *= a
+        """No-op: centroid coordinates are pre-scaled to Cartesian Å in pass_XYZ,
+        so all render styles share the same world-space scale."""
 
     def recentre_view(self):
         """Fit the camera to the current geometry.  Used as a menu action (F)
@@ -341,9 +333,8 @@ class VisualisationWidget(QOpenGLWidget):
                 a = self._a_axis()
                 coords = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
         elif self.style in ("Atoms", "Unit Cell"):
-            if self._mol_crystallography is not None and self.xyz is not None:
-                a = self._a_axis()
-                coords = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
+            if self.xyz is not None:
+                coords = self.xyz[:, 3:6].astype(np.float32)
         elif self.xyz is not None:
             coords = self.xyz[:, 3:6].astype(np.float32)
 
@@ -475,7 +466,7 @@ class VisualisationWidget(QOpenGLWidget):
         """Apply a CameraSnapshot (camera + render settings) and schedule a repaint."""
         self.camera.restore_snapshot(snap)
         self.point_size = snap.point_size
-        self.pointSizeChanged.emit(int(round(snap.point_size)))
+        self.pointSizeChanged.emit(round(snap.point_size))
         self.update()
 
     def render_animation_frame(self, scale: float = 1.0):
@@ -781,9 +772,8 @@ class VisualisationWidget(QOpenGLWidget):
         if "Point Size" in kwargs:
             self.point_size = float(kwargs["Point Size"])
 
-        if "Axes Thickness" in kwargs:
-            if self.axes_renderer is not None:
-                self.axes_renderer.set_axes_thickness(float(kwargs["Axes Thickness"]))
+        if "Axes Thickness" in kwargs and self.axes_renderer is not None:
+            self.axes_renderer.set_axes_thickness(float(kwargs["Axes Thickness"]))
 
         if needs_reinit:
             self.initGeometry()
@@ -1336,20 +1326,19 @@ class VisualisationWidget(QOpenGLWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton:
-            if self._sphere_sel_center_world is not None:
-                if not self._sphere_sel_active:
-                    # Plain Shift+Click (no drag): toggle the anchor point
-                    self.select_point(self._sphere_sel_anchor_idx, toggle=True)
-                else:
-                    # Emit final selection signal after sphere drag
-                    self.selectionChanged.emit(self._selected_points.copy(), None)
-                # Clear sphere selection state
-                self._sphere_sel_active = False
-                self._sphere_sel_center_world = None
-                self._sphere_sel_anchor_idx = None
-                self._sphere_sel_radius = 0.0
-                self.update()
+        if event.button() == QtCore.Qt.LeftButton and self._sphere_sel_center_world is not None:
+            if not self._sphere_sel_active:
+                # Plain Shift+Click (no drag): toggle the anchor point
+                self.select_point(self._sphere_sel_anchor_idx, toggle=True)
+            else:
+                # Emit final selection signal after sphere drag
+                self.selectionChanged.emit(self._selected_points.copy(), None)
+            # Clear sphere selection state
+            self._sphere_sel_active = False
+            self._sphere_sel_center_world = None
+            self._sphere_sel_anchor_idx = None
+            self._sphere_sel_radius = 0.0
+            self.update()
 
     def rotatePointCloud(self, dx, axis):
         """Deprecated: rotates object via model matrix instead of mutating vertex data."""
@@ -1594,7 +1583,7 @@ class VisualisationWidget(QOpenGLWidget):
                 "min_val": 0.0,
                 "max_val": float(len(rows) - 1),
                 "rows": rows,
-                "mode": "atom",        # signals legend dialog to use symbol labels
+                "mode": "atom",  # signals legend dialog to use symbol labels
             }
         else:
             # Colormap-based: build legend from xyz data
@@ -1605,7 +1594,11 @@ class VisualisationWidget(QOpenGLWidget):
                 col_idx = 2
             if col_idx == -1:
                 rgb = np.array(
-                    [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
+                    [
+                        self.single_color.redF(),
+                        self.single_color.greenF(),
+                        self.single_color.blueF(),
+                    ],
                     dtype=np.float32,
                 )
                 rows = [(None, tuple(rgb.tolist()))]
@@ -1821,9 +1814,7 @@ class VisualisationWidget(QOpenGLWidget):
         use_atom_colors = self.color_by == "Atom"
         centroid_colors = None if use_atom_colors else self._docking_centroid_colors()
 
-        for i, (mol_type, centroid_pos, shell) in enumerate(
-            zip(mol_types, cart_positions, shells)
-        ):
+        for i, (mol_type, centroid_pos, shell) in enumerate(zip(mol_types, cart_positions, shells)):
             tmpl = self._mol_cart_templates.get(mol_type)
             if tmpl is None:
                 continue
@@ -1978,10 +1969,30 @@ class VisualisationWidget(QOpenGLWidget):
         self._mol_templates = mol_templates
         self._mol_crystallography = crystallography
         self._mol_cart_templates = {}
+
+        # Pre-scale centroid coordinates to Cartesian Å now that we have the unit cell.
+        # This is done once: if _coord_scale is already set, the incoming XYZ are already
+        # in Å and no further rescaling is needed.
+        a = self._a_axis()
+        scale_applied = False
+        if a > 1e-10 and a != 1.0 and self._coord_scale == 1.0:
+            self._coord_scale = a
+            if self.xyz is not None:
+                self.xyz = self.xyz.copy().astype(np.float64)
+                self.xyz[:, 3:6] *= a
+                scale_applied = True
+            logger.info("Centroid coordinates pre-scaled to Cartesian Å (a=%.4f Å)", a)
+
         if mol_templates and crystallography:
             self._precompute_mol_templates()
         if crystallography is not None and self.unit_cell_renderer is not None:
             self.unit_cell_renderer.set_cell(crystallography)
+
+        # Refresh the viewport so the first display uses scaled coordinates.
+        # Reset viewInitialized so fitToObject runs again with the correctly scaled coords.
+        if scale_applied:
+            self.viewInitialized = False
+            self.initGeometry()
 
     def _precompute_mol_templates(self):
         """Convert template fractional coords to Cartesian and compute centroids."""
@@ -1993,19 +2004,15 @@ class VisualisationWidget(QOpenGLWidget):
             frac = np.array([a.frac for a in tmpl.atoms], dtype=np.float64)
             cart = self._mol_crystallography.frac_to_cart(frac).astype(np.float32)
             centroid = cart.mean(axis=0)
-            colors = np.array(
-                [get_atom_color(a.symbol) for a in tmpl.atoms], dtype=np.float32
-            )
-            radii = np.array(
-                [get_atom_radius(a.symbol) for a in tmpl.atoms], dtype=np.float32
-            )
+            colors = np.array([get_atom_color(a.symbol) for a in tmpl.atoms], dtype=np.float32)
+            radii = np.array([get_atom_radius(a.symbol) for a in tmpl.atoms], dtype=np.float32)
             self._mol_cart_templates[mol_type] = {
-                "cart": cart,                                          # (N_atoms, 3)
-                "centroid": centroid,                                  # (3,)
-                "colors": colors,                                      # (N_atoms, 3)
-                "radii": radii,                                        # (N_atoms,)
-                "bonds": tmpl.bonds,                                   # list[(i, j)] 0-based
-                "symbols": [a.symbol for a in tmpl.atoms],            # list[str]
+                "cart": cart,  # (N_atoms, 3)
+                "centroid": centroid,  # (3,)
+                "colors": colors,  # (N_atoms, 3)
+                "radii": radii,  # (N_atoms,)
+                "bonds": tmpl.bonds,  # list[(i, j)] 0-based
+                "symbols": [a.symbol for a in tmpl.atoms],  # list[str]
             }
 
     def _resolved_atom_colors_radii(self, tmpl: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -2028,22 +2035,20 @@ class VisualisationWidget(QOpenGLWidget):
         if self.xyz is None:
             return
 
-        atom_instances = []   # each row: [x,y,z, r,g,b, selected, vdw_radius]
-        bond_instances = []   # each row: [sx,sy,sz, ex,ey,ez, r,g,b, cyl_radius]
+        atom_instances = []  # each row: [x,y,z, r,g,b, selected, vdw_radius]
+        bond_instances = []  # each row: [sx,sy,sz, ex,ey,ez, r,g,b, cyl_radius]
 
         bond_r = self._bond_radius  # Ångströms, set directly by dialog
 
         mol_types = self.xyz[:, 0].astype(int)
-        # XYZ coordinates are in units of the a-axis length; scale to Cartesian Å.
-        a = self._a_axis()
-        cart_positions = (self.xyz[:, 3:6].astype(np.float64) * a).astype(np.float32)
+        # Coordinates are pre-scaled to Cartesian Å by pass_XYZ / set_molecular_data.
+        cart_positions = self.xyz[:, 3:6].astype(np.float32)
 
         # Pre-compute per-centroid colormap colours for non-Atom modes
         use_atom_colors = self.color_by == "Atom"
         centroid_colors = None if use_atom_colors else self._centroid_colormap_colors(self.xyz)
 
         # Precompute active slice planes in Cartesian Å space.
-        # plane.origin is stored in a-axis units → multiply by a.
         slice_planes = []
         for plane in self._raw_planes:
             if not plane.slice_enabled:
@@ -2055,7 +2060,7 @@ class VisualisationWidget(QOpenGLWidget):
             if n_len < 1e-9:
                 continue
             normal /= n_len
-            origin = np.array(plane.origin, dtype=np.float64) * a
+            origin = np.array(plane.origin, dtype=np.float64)  # already in Å
             slice_planes.append((normal, origin, plane.slice_two_sided, plane.slice_thickness))
 
         for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, cart_positions)):
@@ -2067,7 +2072,7 @@ class VisualisationWidget(QOpenGLWidget):
             if slice_planes:
                 skip = False
                 pos_f64 = centroid_pos.astype(np.float64)
-                for (normal, origin, two_sided, thickness) in slice_planes:
+                for normal, origin, two_sided, thickness in slice_planes:
                     d = np.dot(pos_f64 - origin, normal)
                     if two_sided:
                         if abs(d) > thickness / 2.0:
@@ -2089,18 +2094,20 @@ class VisualisationWidget(QOpenGLWidget):
 
             # Shift template atoms so their centroid sits on centroid_pos (both in Cartesian)
             offset = centroid_pos - tmpl["centroid"]
-            atom_positions = tmpl["cart"] + offset   # (N_atoms, 3)
+            atom_positions = tmpl["cart"] + offset  # (N_atoms, 3)
 
             sel = 1.0 if i in self._selected_points else 0.0
             sel_col = np.full((len(atom_positions), 1), sel, dtype=np.float32)
 
             # [x,y,z, r,g,b, selected, radius]
-            block = np.hstack([
-                atom_positions,     # (N,3)
-                colors,             # (N,3)
-                sel_col,            # (N,1)
-                radii[:, None],     # (N,1)
-            ])
+            block = np.hstack(
+                [
+                    atom_positions,  # (N,3)
+                    colors,  # (N,3)
+                    sel_col,  # (N,1)
+                    radii[:, None],  # (N,1)
+                ]
+            )
             atom_instances.append(block)
 
             # Bonds: two half-cylinders per bond
@@ -2142,15 +2149,17 @@ class VisualisationWidget(QOpenGLWidget):
 
         for tmpl in self._mol_cart_templates.values():
             colors, radii = self._resolved_atom_colors_radii(tmpl)
-            atom_positions = tmpl["cart"]   # already in Cartesian, no offset
+            atom_positions = tmpl["cart"]  # already in Cartesian, no offset
 
             sel_col = np.zeros((len(atom_positions), 1), dtype=np.float32)
-            block = np.hstack([
-                atom_positions,
-                colors,
-                sel_col,
-                radii[:, None],
-            ])
+            block = np.hstack(
+                [
+                    atom_positions,
+                    colors,
+                    sel_col,
+                    radii[:, None],
+                ]
+            )
             atom_instances.append(block)
 
             for a1, a2 in tmpl["bonds"]:
@@ -2251,6 +2260,7 @@ class VisualisationWidget(QOpenGLWidget):
         """Toggle between centroid (Spheres) and atom view. Shift+V shortcut."""
         if self._mol_templates is None:
             from PySide6.QtWidgets import QMessageBox
+
             QMessageBox.information(
                 self,
                 "No Molecular Data",
@@ -2324,8 +2334,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _draw_directions_and_planes(self, gl, uniforms):
         """Draw crystallographic directions and planes with transparency support."""
-        from OpenGL.GL import (GL_CULL_FACE, GL_ONE_MINUS_SRC_ALPHA,
-                               GL_SRC_ALPHA)
+        from OpenGL.GL import GL_CULL_FACE, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA
 
         has_directions = (
             self.direction_renderer is not None and self.direction_renderer.numberOfPoints() > 0

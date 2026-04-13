@@ -14,6 +14,73 @@ from .interpolation import easing, interpolate_snapshot
 INTERPOLATION_MODES = ["linear", "ease_in_out", "ease_in", "ease_out", "constant"]
 
 
+# ---------------------------------------------------------------------------
+# PlaneData / DirectionData serialization helpers
+# (kept here to avoid importing from utils inside the interpolation module)
+# ---------------------------------------------------------------------------
+
+def _plane_to_dict(p) -> dict:
+    return {
+        "normal": list(p.normal),
+        "origin": list(p.origin),
+        "fractional": p.fractional,
+        "size": p.size,
+        "size_relative": p.size_relative,
+        "color": list(p.color),
+        "alpha": p.alpha,
+        "visible": p.visible,
+        "slice_enabled": p.slice_enabled,
+        "slice_two_sided": p.slice_two_sided,
+        "slice_thickness": p.slice_thickness,
+    }
+
+
+def _plane_from_dict(d: dict):
+    from ...utils.crystal_items import PlaneData
+    return PlaneData(
+        normal=tuple(d["normal"]),
+        origin=tuple(d["origin"]),
+        fractional=d["fractional"],
+        size=d["size"],
+        size_relative=d["size_relative"],
+        color=tuple(d["color"]),
+        alpha=d["alpha"],
+        visible=d.get("visible", True),
+        slice_enabled=d.get("slice_enabled", False),
+        slice_two_sided=d.get("slice_two_sided", True),
+        slice_thickness=d.get("slice_thickness", 5.0),
+    )
+
+
+def _direction_to_dict(d) -> dict:
+    return {
+        "vector": list(d.vector),
+        "origin": list(d.origin),
+        "fractional": d.fractional,
+        "style": d.style,
+        "thickness": d.thickness,
+        "length": d.length,
+        "length_relative": d.length_relative,
+        "color": list(d.color),
+        "alpha": d.alpha,
+    }
+
+
+def _direction_from_dict(d: dict):
+    from ...utils.crystal_items import DirectionData
+    return DirectionData(
+        vector=tuple(d["vector"]),
+        origin=tuple(d["origin"]),
+        fractional=d["fractional"],
+        style=d["style"],
+        thickness=d["thickness"],
+        length=d["length"],
+        length_relative=d["length_relative"],
+        color=tuple(d["color"]),
+        alpha=d["alpha"],
+    )
+
+
 @dataclass
 class CameraSnapshot:
     """Gimbal-lock-free snapshot of the full animatable viewport state."""
@@ -24,7 +91,17 @@ class CameraSnapshot:
     scale: float
     perspective: bool
     model_rotation: QQuaternion
-    point_size: float = 2.0  # viewport point size
+    point_size: float = 2.0           # viewport point size
+
+    # View / style state
+    style: str = "Spheres"            # render style (Spheres, Points, Atoms, …)
+    color_by: str = "Layer"           # coloring column
+    colormap: str = "Viridis"         # matplotlib colormap name
+    single_color: tuple = (0.5, 0.5, 0.5, 1.0)  # RGBA 0-1 for Single Colour mode
+
+    # Planes and directions (store the dataclass instances directly; serialized in to_dict)
+    planes: list = field(default_factory=list)      # list of PlaneData
+    directions: list = field(default_factory=list)  # list of DirectionData
 
     # ------------------------------------------------------------------
     # Serialization helpers (QVector3D / QQuaternion → plain floats)
@@ -44,6 +121,12 @@ class CameraSnapshot:
                 self.model_rotation.z(),
             ],
             "point_size": self.point_size,
+            "style": self.style,
+            "color_by": self.color_by,
+            "colormap": self.colormap,
+            "single_color": list(self.single_color),
+            "planes": [_plane_to_dict(p) for p in self.planes],
+            "directions": [_direction_to_dict(d) for d in self.directions],
         }
 
     @classmethod
@@ -60,6 +143,12 @@ class CameraSnapshot:
             perspective=bool(d["perspective"]),
             model_rotation=QQuaternion(r[0], r[1], r[2], r[3]),
             point_size=float(d.get("point_size", 2.0)),
+            style=d.get("style", "Spheres"),
+            color_by=d.get("color_by", "Layer"),
+            colormap=d.get("colormap", "Viridis"),
+            single_color=tuple(d.get("single_color", [0.5, 0.5, 0.5, 1.0])),
+            planes=[_plane_from_dict(pd) for pd in d.get("planes", [])],
+            directions=[_direction_from_dict(dd) for dd in d.get("directions", [])],
         )
 
 

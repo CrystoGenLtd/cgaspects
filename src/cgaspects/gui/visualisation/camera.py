@@ -67,9 +67,7 @@ class Camera:
     def projectionMatrix(self, aspectRatio):
         projection = QMatrix4x4()
         if self.perspectiveProjection:
-            projection.perspective(
-                self.fieldOfView, aspectRatio, self.nearPlane, self.farPlane
-            )
+            projection.perspective(self.fieldOfView, aspectRatio, self.nearPlane, self.farPlane)
         else:
             halfWidth = aspectRatio * self.orthoSize
             halfHeight = self.orthoSize
@@ -84,9 +82,7 @@ class Camera:
         return projection
 
     def modelViewProjectionMatrix(self, aspectRatio):
-        return (
-            self.projectionMatrix(aspectRatio) * self.viewMatrix() * self.modelMatrix()
-        )
+        return self.projectionMatrix(aspectRatio) * self.viewMatrix() * self.modelMatrix()
 
     def storeOrientation(self):
         self._stored_orientation = (
@@ -123,7 +119,9 @@ class Camera:
         mouse_y = (self.up * event_pos.windowPos().y()).normalized()
         return (mouse_x + mouse_y).normalized()
 
-    def orbit(self, dx, dy, restrict_axis=None, event_pos=QVector3D(0, 0, 0)):
+    def orbit(self, dx, dy, restrict_axis=None, event_pos=None):
+        if event_pos is None:
+            event_pos = QVector3D(0, 0, 0)
         # Create quaternions representing the rotations
         q_pitch = QQuaternion.fromAxisAndAngle(self.right, dy * self.rotationSpeed)
         q_yaw = QQuaternion.fromAxisAndAngle(self.up, -dx * self.rotationSpeed)
@@ -143,9 +141,7 @@ class Camera:
             move_vec = QVector3D(dx, dy, 0).normalized()
             roll_direction = QVector3D.crossProduct(pos_vec, move_vec).z()
             roll_magnitude = np.sqrt(dx**2 + dy**2) * self.rotationSpeed
-            q_roll = QQuaternion.fromAxisAndAngle(
-                self.screen, -roll_direction * roll_magnitude
-            )
+            q_roll = QQuaternion.fromAxisAndAngle(self.screen, -roll_direction * roll_magnitude)
 
         # Rotate the position around the target
         direction = self.position - self.target
@@ -194,7 +190,7 @@ class Camera:
         elif kind.lower() == "perspective":
             self.perspectiveProjection = True
         else:
-            LOG.error("unknown projection mode", kind)
+            LOG.error(f"unknown projection mode: {kind}")
 
     def fitToObject(self, points):
         extents, axes = pca(points)
@@ -209,6 +205,7 @@ class Camera:
     def snapshot(self) -> "CameraSnapshot":
         """Return a CameraSnapshot capturing the full animatable camera + object state."""
         from ..animation.keyframe import CameraSnapshot
+
         return CameraSnapshot(
             position=QVector3D(self.position),
             target=QVector3D(self.target),

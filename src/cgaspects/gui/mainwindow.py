@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import sys
@@ -694,6 +695,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 # Switch to fractional axes
                 self.current_axes_type = "fractional"
                 self.openglwidget.set_fractional_axes(self.crystallography)
+                self.openglwidget.apply_coord_scale(self.crystallography)
                 self.actionToggleAxes.setText("Switch to Cartesian Axes")
 
                 # Update crystallography dialogs
@@ -1889,8 +1891,26 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _add_keyframe(self):
         """Capture the current viewport state as a keyframe."""
-
         snap = self.openglwidget.snapshot()
+
+        # Capture style / colour settings
+        settings = self.visualizationSettings.settings()
+        single_color_q = settings.get("Single Color")
+        if single_color_q is not None and hasattr(single_color_q, "getRgbF"):
+            sc = single_color_q.getRgbF()  # (r, g, b, a) floats 0-1
+        else:
+            sc = (0.5, 0.5, 0.5, 1.0)
+
+        snap = dataclasses.replace(
+            snap,
+            style=settings.get("Style", self.openglwidget.style),
+            color_by=settings.get("Color By", self.openglwidget.color_by),
+            colormap=settings.get("Color Map", self.openglwidget.colormap),
+            single_color=sc,
+            planes=list(self.openglwidget._raw_planes),
+            directions=list(self.openglwidget._raw_directions),
+        )
+
         tl = self._animation_timeline
         # Place at end of timeline + 1 second
         t = tl.keyframes[-1].time + 1.0 if tl.keyframes else 0.0
@@ -1903,8 +1923,37 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._timeline_dock.show()
             self.actionToggleTimeline.setChecked(True)
 
+    def _apply_snapshot_view_state(self, snapshot) -> None:
+        """Apply style, colour, planes, and directions from a snapshot to the viewport."""
+        from PySide6.QtGui import QColor as _QColor
+
+        sc = snapshot.single_color
+        q_single = _QColor.fromRgbF(
+            max(0.0, min(1.0, sc[0])),
+            max(0.0, min(1.0, sc[1])),
+            max(0.0, min(1.0, sc[2])),
+            max(0.0, min(1.0, sc[3])),
+        )
+        # Apply style/colour settings first; camera restore below will overwrite any
+        # side-effect camera rescaling from a style switch.
+        self.openglwidget.updateSettings(**{
+            "Style": snapshot.style,
+            "Color By": snapshot.color_by,
+            "Color Map": snapshot.colormap,
+            "Single Color": q_single,
+        })
+        # Restore camera (overwrites any scale side-effect from updateSettings)
+        self.openglwidget.apply_camera_snapshot(snapshot)
+        # Apply planes / directions
+        self.openglwidget.set_planes(snapshot.planes, self.crystallography)
+        self.openglwidget.set_directions(
+            snapshot.directions,
+            self.crystallography,
+            self.openglwidget._directions_max_extent,
+        )
+
     def _on_preview_tick(self, t: float):
-        """Apply interpolated camera state for preview at time t."""
+        """Apply interpolated viewport state for preview at time t."""
         tl = self._animation_timeline
         if len(tl.keyframes) < 2:
             return
@@ -1918,7 +1967,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             snapshot, data_frame = tl.get_state_at_time(t)
         except ValueError:
             return
-        self.openglwidget.apply_camera_snapshot(snapshot)
+        self._apply_snapshot_view_state(snapshot)
         if data_frame is not None and self.frame_list:
             frame_idx = max(0, min(data_frame, len(self.frame_list) - 1))
             if frame_idx != self.frame:
@@ -1958,7 +2007,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _on_render_frame_requested(self, frame_idx: int, snapshot, data_frame):
         """Main-thread slot: render one frame and return the QImage to the worker."""
-        self.openglwidget.apply_camera_snapshot(snapshot)
+        self._apply_snapshot_view_state(snapshot)
         if data_frame is not None and self.frame_list:
             frame_idx_clamped = max(0, min(data_frame, len(self.frame_list) - 1))
             self.update_frame(frame_idx_clamped)
