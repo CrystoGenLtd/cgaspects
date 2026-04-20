@@ -1,6 +1,6 @@
 # CGAspects
 
-CGAspects is a CrystalGrower data analysis tool equipped with a PySide6 GUI. 
+CGAspects is a CrystoGen (formerly CrystalGrower) data analysis tool equipped with a PySide6 GUI. 
 
 ## Features
 
@@ -22,7 +22,7 @@ pip install cgaspects
 1. Clone the CGAspects repository (shallow clone with depth 1):
 
     ```bash
-    git clone --depth=1 https://github.com/CrystalGrowerOrg/cgaspects.git
+    git clone --depth=1 https://github.com/crystogenltd/cgaspects.git
     cd cgaspects
     ```
 
@@ -85,14 +85,14 @@ CGAspects is currently in Beta stage.
 
 ## Contributions
 
-Contributions are welcome! Please read the [contribution guidelines](https://github.com/CrystalGrowerOrg/cgaspects/blob/main/CONTRIBUTING.md) before submitting a pull request.
+Contributions are welcome! Please read the [contribution guidelines](https://github.com/crystogenltd/cgaspects/blob/main/CONTRIBUTING.md) before submitting a pull request.
 
 ## Links
 
-- [Homepage](https://github.com/CrystalGrowerOrg/cgaspects)
-- [Documentation](https://crystalgrowerorg.github.io/cgaspects/)
-- [Repository](https://github.com/CrystalGrowerOrg/cgaspects)
-- [Submit Issues](https://github.com/CrystalGrowerOrg/cgaspects/issues)
+- [Homepage](https://github.com/crystogenltd/cgaspects)
+- [Documentation](https://crystogenltd.github.io/cgaspects/)
+- [Repository](https://github.com/crystogenltd/cgaspects)
+- [Submit Issues](https://github.com/crystogenltd/cgaspects/issues)
 
 ## Contact
 

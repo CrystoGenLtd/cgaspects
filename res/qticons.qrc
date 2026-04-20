@@ -35,16 +35,9 @@
         <file>material_icons/png/folder-sync.png</file>
         <file>material_icons/png/pause-box.png</file>
         <file>material_icons/png/play-box.png</file>
-        <file>app_icons/CGAspects.icns</file>
     </qresource>
     <qresource prefix="/app_icons">
         <file>app_icons/CGAspects.png</file>
-        <file>app_icons/CGAspects.icns</file>
-        <file>app_icons/CG_black.png</file>
-        <file>app_icons/CG_Full_Colour.png</file>
-        <file>app_icons/CG_Full_Colour_white_lettering.png</file>
-        <file>app_icons/CG_white.png</file>
         <file>app_icons/Overlay.png</file>
-        <file>app_icons/CG_gray.png</file>
     </qresource>
 </RCC>

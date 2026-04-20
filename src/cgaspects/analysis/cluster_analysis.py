@@ -1,4 +1,4 @@
-"""Cluster analysis module using DBSCAN/OPTICS on CrystalGrower XYZ files."""
+"""Cluster analysis module using DBSCAN/OPTICS on CrystoGen XYZ files."""
 
 import logging
 from pathlib import Path

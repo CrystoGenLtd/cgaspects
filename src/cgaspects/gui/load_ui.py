@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'window.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.7.2
+## Created by: Qt User Interface Compiler version 6.10.2
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -31,7 +31,7 @@ class Ui_MainWindow(object):
         MainWindow.setEnabled(True)
         MainWindow.resize(1280, 790)
         icon = QIcon()
-        icon.addFile(u":/app_icons/app_icons/CG_gray.png", QSize(), QIcon.Mode.Normal, QIcon.State.Off)
+        icon.addFile(u":/app_icons/app_icons/CGAspects.png", QSize(), QIcon.Mode.Normal, QIcon.State.Off)
         MainWindow.setWindowIcon(icon)
         self.actionOpen_Simulations = QAction(MainWindow)
         self.actionOpen_Simulations.setObjectName(u"actionOpen_Simulations")
@@ -601,7 +601,7 @@ class Ui_MainWindow(object):
         self.action3_3.setText(QCoreApplication.translate("MainWindow", u"3", None))
         self.actionImport.setText(QCoreApplication.translate("MainWindow", u"Open Directory", None))
 #if QT_CONFIG(tooltip)
-        self.actionImport.setToolTip(QCoreApplication.translate("MainWindow", u"Import crystalgrower output directory", None))
+        self.actionImport.setToolTip(QCoreApplication.translate("MainWindow", u"Import crystogen output directory", None))
 #endif // QT_CONFIG(tooltip)
 #if QT_CONFIG(shortcut)
         self.actionImport.setShortcut(QCoreApplication.translate("MainWindow", u"Ctrl+O", None))
@@ -663,7 +663,7 @@ class Ui_MainWindow(object):
         self.frameZeroLabel.setText(QCoreApplication.translate("MainWindow", u"0", None))
         self.frameMaxLabel.setText(QCoreApplication.translate("MainWindow", u"60", None))
 #if QT_CONFIG(tooltip)
-        self.import_pushButton.setToolTip(QCoreApplication.translate("MainWindow", u"Import crystalgrower output directory", None))
+        self.import_pushButton.setToolTip(QCoreApplication.translate("MainWindow", u"Import crystogen output directory", None))
 #endif // QT_CONFIG(tooltip)
         self.import_pushButton.setText(QCoreApplication.translate("MainWindow", u"Open Directory", None))
 #if QT_CONFIG(tooltip)

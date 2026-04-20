@@ -2,7 +2,7 @@
 
 Access via the **Calculate Growth Rates** button in the left panel (enabled when size files are present in the loaded folder).
 
-Growth rate analysis measures how the crystal grows along selected crystallographic directions over time, using size data from the CrystalGrower simulation output.
+Growth rate analysis measures how the crystal grows along selected crystallographic directions over time, using size data from the CrystoGen simulation output.
 
 ---
 

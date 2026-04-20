@@ -210,7 +210,15 @@ class PlottingDialog(QDialog):
                 col
                 for col in self.df.columns
                 if col.startswith(
-                    ("interaction", "Int_", "int_", "tile", "temperature", "starting_delmu", "excess")
+                    (
+                        "interaction",
+                        "Int_",
+                        "int_",
+                        "tile",
+                        "temperature",
+                        "starting_delmu",
+                        "excess",
+                    )
                 )
             ]
             self.interaction_columns.insert(0, "None")
@@ -282,7 +290,7 @@ class PlottingDialog(QDialog):
             self.sa_permutation_labels = [
                 "Events/Population vs Energy",
                 "Sites vs Events/Population",
-                "Events vs Population"
+                "Events vs Population",
             ]
 
         logger.info("Default plot types found: %s", self.plot_types)
@@ -387,11 +395,15 @@ class PlottingDialog(QDialog):
         self.button_filter_data = QPushButton("Filter Data")
         self.button_filter_data.setToolTip("Filter the data shown in the plot")
         self.button_smooth_data = QPushButton("Smooth/Extrapolate Data")
-        self.button_smooth_data.setToolTip("Apply smoothing, interpolation, and extrapolation to growth rate data")
+        self.button_smooth_data.setToolTip(
+            "Apply smoothing, interpolation, and extrapolation to growth rate data"
+        )
         self.button_smooth_data.hide()  # Hidden by default, only shown in Growth Rates mode
 
         self.button_reset_layout = QPushButton("Reset Layout")
-        self.button_reset_layout.setToolTip("Reset the figure layout (useful after switching to/from 4D mode)")
+        self.button_reset_layout.setToolTip(
+            "Reset the figure layout (useful after switching to/from 4D mode)"
+        )
 
         self.button_group_data = QPushButton("Group")
         self.button_group_data.setToolTip(
@@ -1014,11 +1026,14 @@ class PlottingDialog(QDialog):
         """Open (or raise) the persistent, non-modal axes customisation dialog."""
         if self._axes_dialog is None or not self._axes_dialog.isVisible():
             current_labels = {
-                "title":      self.custom_title or self.title,
+                "title": self.custom_title or self.title,
                 "title_auto": self.title,
-                "xlabel":     self.custom_xlabel     or (self.x_label if isinstance(self.x_label, PlotAxisLabel) else PlotAxisLabel()),
-                "ylabel":     self.custom_ylabel     or (self.y_label if isinstance(self.y_label, PlotAxisLabel) else PlotAxisLabel()),
-                "cbar_label": self.custom_cbar_label or (self.c_label if isinstance(self.c_label, PlotAxisLabel) else PlotAxisLabel()),
+                "xlabel": self.custom_xlabel
+                or (self.x_label if isinstance(self.x_label, PlotAxisLabel) else PlotAxisLabel()),
+                "ylabel": self.custom_ylabel
+                or (self.y_label if isinstance(self.y_label, PlotAxisLabel) else PlotAxisLabel()),
+                "cbar_label": self.custom_cbar_label
+                or (self.c_label if isinstance(self.c_label, PlotAxisLabel) else PlotAxisLabel()),
             }
             self._axes_dialog = AxesCustomizationDialog(current_labels, parent=self)
             self._axes_dialog.setWindowModality(QtCore.Qt.NonModal)
@@ -1037,11 +1052,17 @@ class PlottingDialog(QDialog):
 
         xlabel = result.get("xlabel")
         ylabel = result.get("ylabel")
-        cbar   = result.get("cbar_label")
+        cbar = result.get("cbar_label")
 
-        self.custom_xlabel     = xlabel if isinstance(xlabel, PlotAxisLabel) and xlabel.is_user_set else None
-        self.custom_ylabel     = ylabel if isinstance(ylabel, PlotAxisLabel) and ylabel.is_user_set else None
-        self.custom_cbar_label = cbar   if isinstance(cbar,   PlotAxisLabel) and cbar.is_user_set   else None
+        self.custom_xlabel = (
+            xlabel if isinstance(xlabel, PlotAxisLabel) and xlabel.is_user_set else None
+        )
+        self.custom_ylabel = (
+            ylabel if isinstance(ylabel, PlotAxisLabel) and ylabel.is_user_set else None
+        )
+        self.custom_cbar_label = (
+            cbar if isinstance(cbar, PlotAxisLabel) and cbar.is_user_set else None
+        )
 
         logger.debug("Axes updated: %s", result)
         self.trigger_plot()
@@ -1066,9 +1087,7 @@ class PlottingDialog(QDialog):
             return
 
         dialog = SmoothingDialog(
-            series_names=series_names,
-            existing_configs=self.smoothing_configs,
-            parent=self
+            series_names=series_names, existing_configs=self.smoothing_configs, parent=self
         )
 
         if dialog.exec() == QDialog.Accepted:
@@ -1322,19 +1341,21 @@ class PlottingDialog(QDialog):
         self._set_c_label()
         self._apply_axis_conversions()
         self.plot()
-        self.labels_updated.emit({
-            "title":      self.custom_title or self.title,
-            "title_auto": self.title,
-            "xlabel":     self.custom_xlabel     or self.x_label,
-            "ylabel":     self.custom_ylabel     or self.y_label,
-            "cbar_label": self.custom_cbar_label or self.c_label,
-        })
+        self.labels_updated.emit(
+            {
+                "title": self.custom_title or self.title,
+                "title_auto": self.title,
+                "xlabel": self.custom_xlabel or self.x_label,
+                "ylabel": self.custom_ylabel or self.y_label,
+                "cbar_label": self.custom_cbar_label or self.c_label,
+            }
+        )
 
     def _apply_axis_conversions(self):
         """Apply any active unit conversions stored on x/y/c labels to the data arrays."""
         pairs = [
-            (self.custom_xlabel     or self.x_label, "x_data"),
-            (self.custom_ylabel     or self.y_label, "y_data"),
+            (self.custom_xlabel or self.x_label, "x_data"),
+            (self.custom_ylabel or self.y_label, "y_data"),
             (self.custom_cbar_label or self.c_label, "c_data"),
         ]
         for label, attr in pairs:
@@ -1582,7 +1603,9 @@ class PlottingDialog(QDialog):
                             sign = 1 if site_data.get("occupation") else -1
                             y_value = sign * site_data["total_population"]
 
-                    elif plotting_mode == "Events per Step" or plotting_mode == "Population per Step":
+                    elif (
+                        plotting_mode == "Events per Step" or plotting_mode == "Population per Step"
+                    ):
                         # Use per-step values
                         events_series = site_data.get("events")
                         population_series = site_data.get("population")
@@ -1633,9 +1656,11 @@ class PlottingDialog(QDialog):
 
         # Filter out bulk site if checkbox is checked and we're in population mode
         # For permutation 0 and 2, check x_values; for permutation 1, check y_values
-        if self.checkbox_hide_bulk.isChecked() and plotting_mode in ["Total Population", "Population per Step"]:
+        if self.checkbox_hide_bulk.isChecked() and plotting_mode in [
+            "Total Population",
+            "Population per Step",
+        ]:
             if x_values:
-
                 # Determine which axis contains population data
                 if permutation == 0:
                     # Population is on x-axis
@@ -1767,6 +1792,7 @@ class PlottingDialog(QDialog):
         Always overwrites the auto labels; user overrides are stored separately in
         ``custom_xlabel`` / ``custom_ylabel`` and applied at display time.
         """
+
         def _set_x(label: PlotAxisLabel) -> None:
             self.x_label = label
 
@@ -1787,14 +1813,22 @@ class PlottingDialog(QDialog):
                     self.title = "Site Analysis: Total Population vs Energy"
                 elif plotting_mode == "Events per Step":
                     if param_value is not None:
-                        _set_x(PlotAxisLabel(f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"))
+                        _set_x(
+                            PlotAxisLabel(
+                                f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"
+                            )
+                        )
                         self.title = f"Site Analysis: Events vs Energy (t={time_index})"
                     else:
                         _set_x(PlotAxisLabel("Events per Step (Growth (+), Dissolution (-))"))
                         self.title = "Site Analysis: Events vs Energy"
                 elif plotting_mode == "Population per Step":
                     if param_value is not None:
-                        _set_x(PlotAxisLabel(f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"))
+                        _set_x(
+                            PlotAxisLabel(
+                                f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"
+                            )
+                        )
                         self.title = f"Site Analysis: Population vs Energy (t={time_index})"
                     else:
                         _set_x(PlotAxisLabel("Population per Step (Grown (+), Ungrown (-))"))
@@ -1811,14 +1845,22 @@ class PlottingDialog(QDialog):
                     self.title = "Site Analysis: Sites vs Total Population"
                 elif plotting_mode == "Events per Step":
                     if param_value is not None:
-                        _set_y(PlotAxisLabel(f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"))
+                        _set_y(
+                            PlotAxisLabel(
+                                f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"
+                            )
+                        )
                         self.title = f"Site Analysis: Sites vs Events (t={time_index})"
                     else:
                         _set_y(PlotAxisLabel("Events per Step (Growth (+), Dissolution (-))"))
                         self.title = "Site Analysis: Sites vs Events per Step"
                 elif plotting_mode == "Population per Step":
                     if param_value is not None:
-                        _set_y(PlotAxisLabel(f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"))
+                        _set_y(
+                            PlotAxisLabel(
+                                f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"
+                            )
+                        )
                         self.title = f"Site Analysis: Sites vs Population (t={time_index})"
                     else:
                         _set_y(PlotAxisLabel("Population per Step (Grown (+), Ungrown (-))"))
@@ -1831,8 +1873,16 @@ class PlottingDialog(QDialog):
                     self.title = "Site Analysis: Events vs Population"
                 else:
                     if param_value is not None:
-                        _set_x(PlotAxisLabel(f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"))
-                        _set_y(PlotAxisLabel(f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"))
+                        _set_x(
+                            PlotAxisLabel(
+                                f"Events at {param_name.capitalize()}={param_value:.2f} (Growth (+), Dissolution (-))"
+                            )
+                        )
+                        _set_y(
+                            PlotAxisLabel(
+                                f"Population at {param_name.capitalize()}={param_value:.2f} (Grown (+), Ungrown (-))"
+                            )
+                        )
                         self.title = f"Site Analysis: Events vs Population (t={time_index})"
                     else:
                         _set_x(PlotAxisLabel("Events per Step (Growth (+), Dissolution (-))"))
@@ -1886,7 +1936,6 @@ class PlottingDialog(QDialog):
         if self.plot_type == "Site Analysis":
             # Use variable dropdown to control color for Site Analysis
             if self.variable != "None" and self.variable and hasattr(self, "_site_metadata"):
-
                 # Special handling for "filter" - binary color based on filter match
                 if self.variable == "filter":
                     interaction_filters = self.interaction_filters
@@ -1901,7 +1950,9 @@ class PlottingDialog(QDialog):
                             # Check interaction filters if present
                             if interaction_filters:
                                 site_interactions = site_meta.get("interactions", {})
-                                matches = matches and self._check_interaction_filter(site_interactions, interaction_filters)
+                                matches = matches and self._check_interaction_filter(
+                                    site_interactions, interaction_filters
+                                )
 
                             # Check data filters if present
                             # Note: site_meta already contains "site_number" from metadata creation
@@ -1984,7 +2035,12 @@ class PlottingDialog(QDialog):
         elif self.plot_type == "4D":
             # custom_c holds the Z axis column — must NOT be cleared here.
             # variable drives the colour (4th) dimension.
-            if self.variable != "None" and self.variable and self.df is not None and self.variable in self.df.columns:
+            if (
+                self.variable != "None"
+                and self.variable
+                and self.df is not None
+                and self.variable in self.df.columns
+            ):
                 self.c_data = self.df[self.variable]
                 self.c_name = self.variable
         elif self.plot_type != "Custom":
@@ -2009,7 +2065,9 @@ class PlottingDialog(QDialog):
         if self.plot_type == "Custom":
             variable = self.custom_c
         elif self.plot_type == "Heatmap":
-            self.c_label = PlotAxisLabel.from_column(self.c_name) if self.c_name else PlotAxisLabel()
+            self.c_label = (
+                PlotAxisLabel.from_column(self.c_name) if self.c_name else PlotAxisLabel()
+            )
             return
 
         self.c_label = PlotAxisLabel()
@@ -2043,6 +2101,7 @@ class PlottingDialog(QDialog):
         self.figure.clear()
         if self.plot_type == "4D":
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
             self.ax = self.figure.add_subplot(111, projection="3d")
         else:
             self.ax = self.figure.add_subplot(111)
@@ -2134,12 +2193,17 @@ class PlottingDialog(QDialog):
                             self._set_legend() if self.show_legend else None
                         else:
                             use_variable = bool(self.variable and self.variable != "None")
-                            line = True if (self.plot_type == "Growth Rates" and not use_variable) else False
+                            line = (
+                                True
+                                if (self.plot_type == "Growth Rates" and not use_variable)
+                                else False
+                            )
                             for i, y in enumerate(self.y_data):
                                 # Plot original data
                                 show_original = (
-                                    self.plot_type == "Growth Rates" and
-                                    self.smoothing_legend_mode in ["Show Both Original and Processed", "Show Original Only"]
+                                    self.plot_type == "Growth Rates"
+                                    and self.smoothing_legend_mode
+                                    in ["Show Both Original and Processed", "Show Original Only"]
                                 )
 
                                 if show_original or y not in self.smoothing_configs:
@@ -2148,19 +2212,24 @@ class PlottingDialog(QDialog):
                                         y=self._ensure_pd_series(self.df[y]),
                                         c=self.c_data,
                                         add_line=line,
-                                        label=y if y not in self.smoothing_configs else f"{y} (original)",
+                                        label=y
+                                        if y not in self.smoothing_configs
+                                        else f"{y} (original)",
                                         marker=markers[i % len(markers)],
                                     )
 
                                 # Plot processed (smoothed/interpolated/extrapolated) data
                                 if self.plot_type == "Growth Rates" and y in self.smoothing_configs:
-                                    show_processed = self.smoothing_legend_mode in ["Show Both Original and Processed", "Show Processed Only"]
+                                    show_processed = self.smoothing_legend_mode in [
+                                        "Show Both Original and Processed",
+                                        "Show Processed Only",
+                                    ]
 
                                     if show_processed:
                                         x_processed, y_processed = self._apply_smoothing(
                                             self.x_data,
                                             self._ensure_pd_series(self.df[y]),
-                                            self.smoothing_configs[y]
+                                            self.smoothing_configs[y],
                                         )
 
                                         self._plot(
@@ -2194,7 +2263,7 @@ class PlottingDialog(QDialog):
             # Set discrete ticks for binary filter variable
             if self.variable == "filter":
                 self.cbar.set_ticks([0, 1])
-                self.cbar.set_ticklabels(['Unfiltered', 'Filtered'])
+                self.cbar.set_ticklabels(["Unfiltered", "Filtered"])
 
         # Apply 2D axis inversions (all non-4D modes)
         if self.checkbox_invert_x.isChecked():
@@ -2261,26 +2330,35 @@ class PlottingDialog(QDialog):
 
         for i, direction in enumerate(self.directions):
             y_mean = self.y_data[direction].to_numpy()
-            y_err = (
-                self.gr_y_err[direction].to_numpy()
-                if self.gr_y_err is not None
-                else None
-            )
+            y_err = self.gr_y_err[direction].to_numpy() if self.gr_y_err is not None else None
 
             if use_variable:
                 # Draw error caps in neutral grey so the colormap drives colour
                 if y_err is not None:
                     self.ax.errorbar(
-                        self.x_data, y_mean, yerr=y_err,
-                        fmt="none", ecolor="grey", capsize=4, alpha=0.5,
+                        self.x_data,
+                        y_mean,
+                        yerr=y_err,
+                        fmt="none",
+                        ecolor="grey",
+                        capsize=4,
+                        alpha=0.5,
                     )
                 sc = self.ax.scatter(
-                    self.x_data, y_mean,
-                    c=c_vals, cmap=self.cmap, vmin=vmin, vmax=vmax,
+                    self.x_data,
+                    y_mean,
+                    c=c_vals,
+                    cmap=self.cmap,
+                    vmin=vmin,
+                    vmax=vmax,
                     marker=markers[i % len(markers)],
-                    s=self.point_size, label=direction, zorder=5,
+                    s=self.point_size,
+                    label=direction,
+                    zorder=5,
                 )
-                self.plot_objects[direction] = self.plot_obj_tuple(scatter=sc, line=None, trendline=None)
+                self.plot_objects[direction] = self.plot_obj_tuple(
+                    scatter=sc, line=None, trendline=None
+                )
             else:
                 self.ax.errorbar(
                     self.x_data,
@@ -2297,7 +2375,7 @@ class PlottingDialog(QDialog):
         if c is not None:
             # Use binary colormap for filter variable (colorblind-safe: orange for unfiltered, blue for filtered)
             if self.variable == "filter":
-                cmap = matplotlib.colors.ListedColormap(['#E69F00', '#56B4E9'])
+                cmap = matplotlib.colors.ListedColormap(["#E69F00", "#56B4E9"])
             else:
                 cmap = self.cmap
         else:
@@ -2310,7 +2388,9 @@ class PlottingDialog(QDialog):
             "c": c,
             "cmap": cmap,
             "s": self.point_size,
-            "label": label if (self.plot_type != "Growth Rates" or bool(self.variable and self.variable != "None")) else None,
+            "label": label
+            if (self.plot_type != "Growth Rates" or bool(self.variable and self.variable != "None"))
+            else None,
             "marker": marker,
         }
 
@@ -2413,7 +2493,9 @@ class PlottingDialog(QDialog):
             leaf_rotation=45,
         )
 
-        title = self.custom_title if self.custom_title else "Hierarchical Clustering of Interactions"
+        title = (
+            self.custom_title if self.custom_title else "Hierarchical Clustering of Interactions"
+        )
         self.ax.set_title(title)
         self.ax.set_ylabel("Distance (Ward)")
         self.ax.set_xlabel(f"Interactions  [clustered by: {', '.join(metric_cols)}]")
@@ -2581,7 +2663,7 @@ class PlottingDialog(QDialog):
             self.ax.grid(True)
 
         # tight_layout is unreliable with 3D axes — suppress the warning
-        
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             try:
@@ -2652,10 +2734,7 @@ class PlottingDialog(QDialog):
                 permutation = self.permutation
 
                 # Common information for all permutations
-                base_info = (
-                    f"File: {file_prefix}\n"
-                    f"Site Number: {site_num}\n"
-                )
+                base_info = f"File: {file_prefix}\nSite Number: {site_num}\n"
 
                 # Permutation-specific information
                 if permutation == 0:
@@ -2663,8 +2742,7 @@ class PlottingDialog(QDialog):
                     if plotting_mode == "Total Events":
                         current_value = site_meta.get("total_events", 0)
                         text = (
-                            base_info +
-                            f"Total Events: {current_value}\n"
+                            base_info + f"Total Events: {current_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
                             f"Status: {occupation_status}"
@@ -2672,8 +2750,7 @@ class PlottingDialog(QDialog):
                     elif plotting_mode == "Total Population":
                         current_value = site_meta.get("total_population", 0)
                         text = (
-                            base_info +
-                            f"Total Population: {current_value}\n"
+                            base_info + f"Total Population: {current_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
                             f"Status: {occupation_status}"
@@ -2682,8 +2759,7 @@ class PlottingDialog(QDialog):
                         total_value = site_meta.get("total_events", "N/A")
                         current_value = abs(x)
                         text = (
-                            base_info +
-                            f"Events (t={time_index}): {current_value:.1f}\n"
+                            base_info + f"Events (t={time_index}): {current_value:.1f}\n"
                             f"Total Events: {total_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
@@ -2693,8 +2769,7 @@ class PlottingDialog(QDialog):
                         total_value = site_meta.get("total_population", "N/A")
                         current_value = abs(x)
                         text = (
-                            base_info +
-                            f"Population (t={time_index}): {current_value:.1f}\n"
+                            base_info + f"Population (t={time_index}): {current_value:.1f}\n"
                             f"Total Population: {total_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
@@ -2706,8 +2781,7 @@ class PlottingDialog(QDialog):
                     if plotting_mode == "Total Events":
                         current_value = site_meta.get("total_events", 0)
                         text = (
-                            base_info +
-                            f"Total Events: {current_value}\n"
+                            base_info + f"Total Events: {current_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
                             f"Status: {occupation_status}"
@@ -2715,8 +2789,7 @@ class PlottingDialog(QDialog):
                     elif plotting_mode == "Total Population":
                         current_value = site_meta.get("total_population", 0)
                         text = (
-                            base_info +
-                            f"Total Population: {current_value}\n"
+                            base_info + f"Total Population: {current_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
                             f"Status: {occupation_status}"
@@ -2725,8 +2798,7 @@ class PlottingDialog(QDialog):
                         total_value = site_meta.get("total_events", "N/A")
                         current_value = abs(y)
                         text = (
-                            base_info +
-                            f"Events (t={time_index}): {current_value:.1f}\n"
+                            base_info + f"Events (t={time_index}): {current_value:.1f}\n"
                             f"Total Events: {total_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
@@ -2736,8 +2808,7 @@ class PlottingDialog(QDialog):
                         total_value = site_meta.get("total_population", "N/A")
                         current_value = abs(y)
                         text = (
-                            base_info +
-                            f"Population (t={time_index}): {current_value:.1f}\n"
+                            base_info + f"Population (t={time_index}): {current_value:.1f}\n"
                             f"Total Population: {total_value}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
@@ -2750,8 +2821,7 @@ class PlottingDialog(QDialog):
                     population_value = abs(y)
                     if plotting_mode in ["Total Events", "Total Population"]:
                         text = (
-                            base_info +
-                            f"Total Events: {events_value:.1f}\n"
+                            base_info + f"Total Events: {events_value:.1f}\n"
                             f"Total Population: {population_value:.1f}\n"
                             f"Energy: {energy:.2f}\n"
                             f"Coordination: {coordination}\n"
@@ -2761,8 +2831,7 @@ class PlottingDialog(QDialog):
                         total_events = site_meta.get("total_events", "N/A")
                         total_population = site_meta.get("total_population", "N/A")
                         text = (
-                            base_info +
-                            f"Events (t={time_index}): {events_value:.1f}\n"
+                            base_info + f"Events (t={time_index}): {events_value:.1f}\n"
                             f"Population (t={time_index}): {population_value:.1f}\n"
                             f"Total Events: {total_events}\n"
                             f"Total Population: {total_population}\n"
@@ -3035,7 +3104,7 @@ def main():
     # csv_data = pd.DataFrame(
     #     {"x": [1, 2, 3, 4, 5], "y": [2, 4, 6, 8, 10], "c": ["A", "B", "A", "B", "A"]}
     # )
-    csv_data = "/Users/alvin/CrystalGrower/CrystalSystems/SolventMaps/Xemium/form1/full.csv"
+    csv_data = "path.csv"
 
     # Create an instance of PlottingDialog
     dialog = PlottingDialog(csv_data)

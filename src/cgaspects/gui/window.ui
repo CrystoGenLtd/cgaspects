@@ -18,7 +18,7 @@
   </property>
   <property name="windowIcon">
    <iconset resource="../../../res/qticons.qrc">
-    <normaloff>:/app_icons/app_icons/CG_gray.png</normaloff>:/app_icons/app_icons/CG_gray.png</iconset>
+    <normaloff>:/app_icons/app_icons/CGAspects.png</normaloff>:/app_icons/app_icons/CGAspects.png</iconset>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QGridLayout" name="gridLayout">
@@ -199,7 +199,7 @@
             </size>
            </property>
            <property name="toolTip">
-            <string>Import crystalgrower output directory</string>
+            <string>Import crystogen output directory</string>
            </property>
            <property name="text">
             <string>Open Directory</string>
@@ -905,7 +905,7 @@
     <string>Open Directory</string>
    </property>
    <property name="toolTip">
-    <string>Import crystalgrower output directory</string>
+    <string>Import crystogen output directory</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+O</string>
@@ -1024,7 +1024,7 @@
   <action name="actionAboutCGAspects">
    <property name="icon">
     <iconset resource="../../../res/qticons.qrc">
-     <normaloff>:/app_icons/app_icons/CG_gray.png</normaloff>:/app_icons/app_icons/CG_gray.png</iconset>
+     <normaloff>:/app_icons/app_icons/CGAspects.png</normaloff>:/app_icons/app_icons/CGAspects.png</iconset>
    </property>
    <property name="text">
     <string>About CGAspects...</string>

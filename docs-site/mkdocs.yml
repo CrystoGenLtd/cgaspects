@@ -1,9 +1,9 @@
 site_name: CGAspects Manual
 site_description: User manual for CGAspects — crystal growth simulation analysis and visualisation
-site_author: CrystalGrower Team
-site_url: https://crystalgrowerorg.github.io/cgaspects/
-repo_url: https://github.com/CrystalGrowerOrg/cgaspects
-repo_name: CrystalGrowerOrg/cgaspects
+site_author: CrystoGen Team
+site_url: https://crystogenltd.github.io/cgaspects/
+repo_url: https://github.com/crystogenltd/cgaspects
+repo_name: crystogenltd/cgaspects
 
 theme:
   name: material

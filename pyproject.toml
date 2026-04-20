@@ -2,7 +2,7 @@
 name = "cgaspects"
 version = "0.9.8.post2"
 requires-python = ">=3.10"
-description = "An analysis tool and companion for CrystalGrower"
+description = "An analysis tool and companion for CrystoGen"
 
 authors = [
     { name = "Alvin J. Walisinghe", email = "jennerwalisinghe@gmail.com" },
@@ -46,9 +46,9 @@ dependencies = [
 
 
 [project.urls]
-homepage = "https://github.com/CrystalGrowerOrg/cgaspects"
-repository = "https://github.com/CrystalGrowerOrg/cgaspects"
-documentation = "https://crystalgrowerorg.github.io/cgaspects/"
+homepage = "https://github.com/crystogenltd/cgaspects"
+repository = "https://github.com/crystogenltd/cgaspects"
+documentation = "https://crystogenltd.github.io/cgaspects/"
 
 [project.scripts]
 cgaspects = "cgaspects.gui.mainwindow:main"

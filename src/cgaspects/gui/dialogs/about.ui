@@ -25,27 +25,36 @@
        <verstretch>0</verstretch>
       </sizepolicy>
      </property>
+     <property name="minimumSize">
+      <size>
+       <width>160</width>
+       <height>160</height>
+      </size>
+     </property>
      <property name="maximumSize">
       <size>
-       <width>161</width>
-       <height>203</height>
+       <width>160</width>
+       <height>160</height>
       </size>
      </property>
      <property name="text">
       <string/>
      </property>
      <property name="pixmap">
-      <pixmap resource="../../../../res/qticons.qrc">:/app_icons/app_icons/CG_Full_Colour.png</pixmap>
+      <pixmap resource="../../../../res/qticons.qrc">:/app_icons/app_icons/CGAspects.png</pixmap>
      </property>
      <property name="scaledContents">
-      <bool>true</bool>
+      <bool>false</bool>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
      </property>
     </widget>
    </item>
    <item>
     <widget class="QLabel" name="aboutLabel">
      <property name="text">
-      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-size:24pt; font-weight:696;&quot;&gt;CGAspects&lt;/span&gt;&lt;/p&gt;&lt;p&gt;CGAspects is part of the &lt;a href=&quot;https://crystalgrower.org/&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;Crystal&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://crystalgrower.org/&quot;&gt;&lt;span style=&quot; font-style:italic; text-decoration: underline; color:#007af4;&quot;&gt;Grower&lt;/span&gt;&lt;/a&gt; suite of programs.&lt;/p&gt;&lt;p&gt;Authors: &lt;span style=&quot; font-weight:696;&quot;&gt;Alvin Jenner Walisinghe, Nathan de Bruyn and Peter R. Spackman&lt;/span&gt;&lt;/p&gt;&lt;p&gt;The code is publicly available on &lt;a href=&quot;https://github.com/CrystalGrowerOrg/cgaspects&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;GItHub&lt;/span&gt;&lt;/a&gt; and documentation is available at the website.&lt;/p&gt;&lt;p&gt;When using &lt;span style=&quot; font-weight:696;&quot;&gt;Crystal&lt;/span&gt;&lt;span style=&quot; font-style:italic;&quot;&gt;Grower&lt;/span&gt; to simulate the crystal growth of your materials, please cite it in your scientific publications as follows:&lt;/p&gt;&lt;p&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;M. W. Anderson et al. &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; font-style:italic; text-decoration: underline; color:#007af4;&quot;&gt;Nature, &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;544&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, 456–459 (2017)&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;p&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;A. R. Hill et al.. &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; font-style:italic; text-decoration: underline; color:#007af4;&quot;&gt;Chem. Sci.&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;12&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, 1126–1146 (2021)&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=&quot; font-size:24pt; font-weight:696;&quot;&gt;CGAspects&lt;/span&gt;&lt;/p&gt;&lt;p&gt;CGAspects is part of the &lt;a href=&quot;https://crystogen.org/&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;CrystoGen&lt;/span&gt;&lt;/a&gt; (formerly CrystalGrower) suite of programs.&lt;/p&gt;&lt;p&gt;Authors: &lt;span style=&quot; font-weight:696;&quot;&gt;Alvin Jenner Walisinghe, Nathan de Bruyn and Peter R. Spackman&lt;/span&gt;&lt;/p&gt;&lt;p&gt;The code is publicly available on &lt;a href=&quot;https://github.com/crystogenltd/cgaspects&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;GItHub&lt;/span&gt;&lt;/a&gt; and documentation is available at the website.&lt;/p&gt;&lt;p&gt;When using &lt;span style=&quot; font-weight:696;&quot;&gt;CrystoGen&lt;/span&gt; to simulate the crystal growth of your materials, please cite it in your scientific publications as follows:&lt;/p&gt;&lt;p&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;M. W. Anderson et al. &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; font-style:italic; text-decoration: underline; color:#007af4;&quot;&gt;Nature, &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;544&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://www.nature.com/articles/nature21684&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, 456–459 (2017)&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;p&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;A. R. Hill et al.. &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; font-style:italic; text-decoration: underline; color:#007af4;&quot;&gt;Chem. Sci.&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, &lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; font-weight:696; text-decoration: underline; color:#007af4;&quot;&gt;12&lt;/span&gt;&lt;/a&gt;&lt;a href=&quot;https://pubs.rsc.org/en/content/articlelanding/2021/sc/d0sc05017b#!divAbstract&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#007af4;&quot;&gt;, 1126–1146 (2021)&lt;/span&gt;&lt;/a&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>

@@ -26,7 +26,7 @@ logger = logging.getLogger("CA:LatticeDialog")
 
 
 class LatticeParametersDialog(QDialog):
-    """Dialog for entering lattice parameters either manually or from a CrystalGrower file."""
+    """Dialog for entering lattice parameters either manually or from a CrystoGen file."""
 
     parametersAccepted = Signal(Cell)
 
@@ -82,14 +82,14 @@ class LatticeParametersDialog(QDialog):
         file_layout = QVBoxLayout()
 
         file_info_label = QLabel(
-            "Select a structure file (CIF or CrystalGrower format).\n"
+            "Select a structure file (CIF or CrystoGen format).\n"
             "Lattice parameters will be extracted automatically."
         )
         file_info_label.setWordWrap(True)
 
         file_button_layout = QHBoxLayout()
         self.file_path_edit = QLineEdit()
-        self.file_path_edit.setPlaceholderText("Path to CIF or CrystalGrower Structure File...")
+        self.file_path_edit.setPlaceholderText("Path to CIF or CrystoGen Structure File...")
         self.file_path_edit.setReadOnly(True)
 
         self.browse_button = QPushButton("Browse")
@@ -135,12 +135,12 @@ class LatticeParametersDialog(QDialog):
         self.gamma_edit.setText(str(cell.gamma))
 
     def browse_file(self):
-        """Open file dialog to select CrystalGrower structure file or CIF file."""
+        """Open file dialog to select CrystoGen structure file or CIF file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Structure File",
             "",
-            "All Files (*);;CIF Files (*.cif);;CrystalGrower Files (*)"
+            "All Files (*);;CIF Files (*.cif);;CrystoGen Files (*)"
         )
 
         if file_path:
@@ -153,7 +153,7 @@ class LatticeParametersDialog(QDialog):
 
     def parse_structure_file(self, file_path: str):
         """
-        Parse CrystalGrower structure file to extract lattice parameters.
+        Parse CrystoGen structure file to extract lattice parameters.
 
         The file format has a section starting with 'Non primitive data' followed by
         lattice parameters:

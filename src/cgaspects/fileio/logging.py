@@ -5,7 +5,7 @@ from pathlib import Path
 
 def get_log_file_path():
     """Get the path to the log file, creating directories if needed."""
-    log_dir = Path.home() / ".crystalgrower" / "cgaspects"
+    log_dir = Path.home() / ".crystogen" / "cgaspects"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir / "report.log"
 

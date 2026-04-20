@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'plotsavedialog.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.7.2
+## Created by: Qt User Interface Compiler version 6.10.2
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -34,17 +34,17 @@ class Ui_PlotSaveDialog(object):
         self.fileTypeLabel = QLabel(self.groupBox)
         self.fileTypeLabel.setObjectName(u"fileTypeLabel")
 
-        self.formLayout.setWidget(0, QFormLayout.LabelRole, self.fileTypeLabel)
+        self.formLayout.setWidget(0, QFormLayout.ItemRole.LabelRole, self.fileTypeLabel)
 
         self.fileTypeComboBox = QComboBox(self.groupBox)
         self.fileTypeComboBox.setObjectName(u"fileTypeComboBox")
 
-        self.formLayout.setWidget(0, QFormLayout.FieldRole, self.fileTypeComboBox)
+        self.formLayout.setWidget(0, QFormLayout.ItemRole.FieldRole, self.fileTypeComboBox)
 
         self.dpiLabel = QLabel(self.groupBox)
         self.dpiLabel.setObjectName(u"dpiLabel")
 
-        self.formLayout.setWidget(3, QFormLayout.LabelRole, self.dpiLabel)
+        self.formLayout.setWidget(3, QFormLayout.ItemRole.LabelRole, self.dpiLabel)
 
         self.dpiSpinBox = QSpinBox(self.groupBox)
         self.dpiSpinBox.setObjectName(u"dpiSpinBox")
@@ -53,28 +53,28 @@ class Ui_PlotSaveDialog(object):
         self.dpiSpinBox.setSingleStep(10)
         self.dpiSpinBox.setValue(300)
 
-        self.formLayout.setWidget(3, QFormLayout.FieldRole, self.dpiSpinBox)
+        self.formLayout.setWidget(3, QFormLayout.ItemRole.FieldRole, self.dpiSpinBox)
 
         self.fileLabel = QLabel(self.groupBox)
         self.fileLabel.setObjectName(u"fileLabel")
 
-        self.formLayout.setWidget(5, QFormLayout.LabelRole, self.fileLabel)
+        self.formLayout.setWidget(5, QFormLayout.ItemRole.LabelRole, self.fileLabel)
 
         self.fileLineEdit = QLineEdit(self.groupBox)
         self.fileLineEdit.setObjectName(u"fileLineEdit")
 
-        self.formLayout.setWidget(5, QFormLayout.FieldRole, self.fileLineEdit)
+        self.formLayout.setWidget(5, QFormLayout.ItemRole.FieldRole, self.fileLineEdit)
 
         self.filePushButton = QPushButton(self.groupBox)
         self.filePushButton.setObjectName(u"filePushButton")
 
-        self.formLayout.setWidget(6, QFormLayout.LabelRole, self.filePushButton)
+        self.formLayout.setWidget(6, QFormLayout.ItemRole.LabelRole, self.filePushButton)
 
         self.transparentCheckBox = QCheckBox(self.groupBox)
         self.transparentCheckBox.setObjectName(u"transparentCheckBox")
         self.transparentCheckBox.setLayoutDirection(Qt.RightToLeft)
 
-        self.formLayout.setWidget(6, QFormLayout.FieldRole, self.transparentCheckBox)
+        self.formLayout.setWidget(6, QFormLayout.ItemRole.FieldRole, self.transparentCheckBox)
 
 
         self.verticalLayout.addWidget(self.groupBox)

@@ -46,9 +46,9 @@ CGAspects reads:
 
 ---
 
-### CrystalGrower Structure File
+### CrystoGen Structure File
 
-The simulation structure file produced by CrystalGrower. Contains lattice parameters and optionally crystallographic direction information.
+The simulation structure file produced by CrystoGen. Contains lattice parameters and optionally crystallographic direction information.
 
 Auto-loaded if present in the data folder.
 
@@ -64,7 +64,7 @@ Contains crystal dimensions along each crystallographic direction at each time s
 
 ### Simulation Parameters File
 
-A text file (`.txt`) produced by CrystalGrower containing:
+A text file (`.txt`) produced by CrystoGen containing:
 - List of crystallographic directions used in the simulation
 - Supersaturation levels
 - Other simulation metadata

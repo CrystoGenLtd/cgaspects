@@ -36,7 +36,7 @@ pip install cgaspects
 ## Install from Source
 
 ```bash
-git clone https://github.com/CrystalGrowerOrg/cgaspects.git
+git clone https://github.com/crystogenltd/cgaspects.git
 cd cgaspects
 pip install -e .
 ```

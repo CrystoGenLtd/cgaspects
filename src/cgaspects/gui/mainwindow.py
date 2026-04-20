@@ -927,7 +927,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             "############################################", log_level="info", gui=False
         )
         self.log_message(
-            "     The CrystalGrower Data Analysis Program",
+            "     The CrystoGen Data Analysis Program",
             log_level="info",
             gui=False,
         )
@@ -1681,7 +1681,7 @@ def main():
 
     set_default_opengl_version(3, 3)
     # Setting taskbar icon permissions - windows
-    appid = "CrystalGrower.CGAspects.0.8.0"
+    appid = "CrystoGen.CGAspects.0.8.0"
     import ctypes
 
     if hasattr(ctypes, "windll"):

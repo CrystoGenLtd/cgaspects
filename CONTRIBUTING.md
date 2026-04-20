@@ -1,12 +1,12 @@
 # Contributing to CGAspects
 
-We are thrilled that you are interested in contributing to CGAspects! As a scientific data analysis software, CGAspects aims to provide a reliable, efficient, and user-friendly tool for analysing data for all CrystalGrower users. Your contributions are important in achieving this goal.
+We are thrilled that you are interested in contributing to CGAspects! As a scientific data analysis software, CGAspects aims to provide a reliable, efficient, and user-friendly tool for analysing data for all CrystoGen users. Your contributions are important in achieving this goal.
 
 ## How to Contribute
 
 There are many ways to contribute to CGAspects:
 
-1. **Submit Bug Reports or Feature Requests**: If you find a bug or have an idea for a new feature or improvement, please [submit an issue](https://github.com/CrystalGrowerOrg/cgaspects/issues). Clearly describe the issue or idea, including steps to reproduce the bug or detailed explanations of the proposed feature.
+1. **Submit Bug Reports or Feature Requests**: If you find a bug or have an idea for a new feature or improvement, please [submit an issue](https://github.com/crystogenltd/cgaspects/issues). Clearly describe the issue or idea, including steps to reproduce the bug or detailed explanations of the proposed feature.
 
 2. **Contribute Code**: We welcome code contributions via pull requests. Whether it's fixing a bug, adding a new feature, or improving documentation, your help is much appreciated.
 
@@ -36,6 +36,6 @@ We are committed to making participation in this project a harassment-free exper
 
 ## Questions?
 
-If you have any questions or need further clarification about contributing, please feel free to [open an issue](https://github.com/CrystalGrowerOrg/cgaspects/issues) or contact one of the project maintainers directly.
+If you have any questions or need further clarification about contributing, please feel free to [open an issue](https://github.com/crystogenltd/cgaspects/issues) or contact one of the project maintainers directly.
 
 Thank you for contributing to CGAspects!

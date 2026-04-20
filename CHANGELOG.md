@@ -56,7 +56,7 @@ All notable changes to this project since the new XYZ parser (commit 7990fa4).
   - Option to hide bulk sites in visualization
 
 - **Log file management** (db4db76, 2025-12-22)
-  - Log files now stored in `.crystalgrower` folder
+  - Log files now stored in `.crystogen` folder
   - Text file viewer widget for viewing logs
   - Standalone growth rate plotter utility
 

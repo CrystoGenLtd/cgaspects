@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'settings.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.7.2
+## Created by: Qt User Interface Compiler version 6.10.2
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -65,7 +65,7 @@ class Ui_settings_Dialog(object):
         font3.setItalic(False)
         self.zoom_label.setFont(font3)
 
-        self.formLayout.setWidget(0, QFormLayout.LabelRole, self.zoom_label)
+        self.formLayout.setWidget(0, QFormLayout.ItemRole.LabelRole, self.zoom_label)
 
         self.zoom_slider = QSlider(self.groupBox)
         self.zoom_slider.setObjectName(u"zoom_slider")
@@ -83,26 +83,26 @@ class Ui_settings_Dialog(object):
         self.zoom_slider.setOrientation(Qt.Horizontal)
         self.zoom_slider.setTickPosition(QSlider.NoTicks)
 
-        self.formLayout.setWidget(0, QFormLayout.FieldRole, self.zoom_slider)
+        self.formLayout.setWidget(0, QFormLayout.ItemRole.FieldRole, self.zoom_slider)
 
         self.pointsize_label = QLabel(self.groupBox)
         self.pointsize_label.setObjectName(u"pointsize_label")
         self.pointsize_label.setFont(font3)
 
-        self.formLayout.setWidget(1, QFormLayout.LabelRole, self.pointsize_label)
+        self.formLayout.setWidget(1, QFormLayout.ItemRole.LabelRole, self.pointsize_label)
 
         self.point_slider = QSlider(self.groupBox)
         self.point_slider.setObjectName(u"point_slider")
         self.point_slider.setOrientation(Qt.Horizontal)
 
-        self.formLayout.setWidget(1, QFormLayout.FieldRole, self.point_slider)
+        self.formLayout.setWidget(1, QFormLayout.ItemRole.FieldRole, self.point_slider)
 
         self.brightness_label = QLabel(self.groupBox)
         self.brightness_label.setObjectName(u"brightness_label")
         self.brightness_label.setEnabled(False)
         self.brightness_label.setFont(font3)
 
-        self.formLayout.setWidget(2, QFormLayout.LabelRole, self.brightness_label)
+        self.formLayout.setWidget(2, QFormLayout.ItemRole.LabelRole, self.brightness_label)
 
         self.brightness_slider = QSlider(self.groupBox)
         self.brightness_slider.setObjectName(u"brightness_slider")
@@ -110,28 +110,28 @@ class Ui_settings_Dialog(object):
         self.brightness_slider.setMaximum(100)
         self.brightness_slider.setOrientation(Qt.Horizontal)
 
-        self.formLayout.setWidget(2, QFormLayout.FieldRole, self.brightness_slider)
+        self.formLayout.setWidget(2, QFormLayout.ItemRole.FieldRole, self.brightness_slider)
 
         self.resolution_label = QLabel(self.groupBox)
         self.resolution_label.setObjectName(u"resolution_label")
         self.resolution_label.setEnabled(False)
         self.resolution_label.setFont(font3)
 
-        self.formLayout.setWidget(3, QFormLayout.LabelRole, self.resolution_label)
+        self.formLayout.setWidget(3, QFormLayout.ItemRole.LabelRole, self.resolution_label)
 
         self.resolution_slider = QSlider(self.groupBox)
         self.resolution_slider.setObjectName(u"resolution_slider")
         self.resolution_slider.setEnabled(False)
         self.resolution_slider.setOrientation(Qt.Horizontal)
 
-        self.formLayout.setWidget(3, QFormLayout.FieldRole, self.resolution_slider)
+        self.formLayout.setWidget(3, QFormLayout.ItemRole.FieldRole, self.resolution_slider)
 
         self.point_type_label = QLabel(self.groupBox)
         self.point_type_label.setObjectName(u"point_type_label")
         self.point_type_label.setEnabled(True)
         self.point_type_label.setFont(font3)
 
-        self.formLayout.setWidget(4, QFormLayout.LabelRole, self.point_type_label)
+        self.formLayout.setWidget(4, QFormLayout.ItemRole.LabelRole, self.point_type_label)
 
         self.pointtype_comboBox = QComboBox(self.groupBox)
         self.pointtype_comboBox.setObjectName(u"pointtype_comboBox")
@@ -144,13 +144,13 @@ class Ui_settings_Dialog(object):
         self.pointtype_comboBox.setMinimumSize(QSize(0, 0))
         self.pointtype_comboBox.setStyleSheet(u"")
 
-        self.formLayout.setWidget(4, QFormLayout.FieldRole, self.pointtype_comboBox)
+        self.formLayout.setWidget(4, QFormLayout.ItemRole.FieldRole, self.pointtype_comboBox)
 
         self.colour_mode_label = QLabel(self.groupBox)
         self.colour_mode_label.setObjectName(u"colour_mode_label")
         self.colour_mode_label.setFont(font3)
 
-        self.formLayout.setWidget(5, QFormLayout.LabelRole, self.colour_mode_label)
+        self.formLayout.setWidget(5, QFormLayout.ItemRole.LabelRole, self.colour_mode_label)
 
         self.colourmode_comboBox = QComboBox(self.groupBox)
         self.colourmode_comboBox.setObjectName(u"colourmode_comboBox")
@@ -159,13 +159,13 @@ class Ui_settings_Dialog(object):
         self.colourmode_comboBox.setMinimumSize(QSize(100, 0))
         self.colourmode_comboBox.setStyleSheet(u"")
 
-        self.formLayout.setWidget(5, QFormLayout.FieldRole, self.colourmode_comboBox)
+        self.formLayout.setWidget(5, QFormLayout.ItemRole.FieldRole, self.colourmode_comboBox)
 
         self.colour_label = QLabel(self.groupBox)
         self.colour_label.setObjectName(u"colour_label")
         self.colour_label.setFont(font3)
 
-        self.formLayout.setWidget(6, QFormLayout.LabelRole, self.colour_label)
+        self.formLayout.setWidget(6, QFormLayout.ItemRole.LabelRole, self.colour_label)
 
         self.colour_comboBox = QComboBox(self.groupBox)
         self.colour_comboBox.setObjectName(u"colour_comboBox")
@@ -174,13 +174,13 @@ class Ui_settings_Dialog(object):
         self.colour_comboBox.setMinimumSize(QSize(100, 0))
         self.colour_comboBox.setStyleSheet(u"")
 
-        self.formLayout.setWidget(6, QFormLayout.FieldRole, self.colour_comboBox)
+        self.formLayout.setWidget(6, QFormLayout.ItemRole.FieldRole, self.colour_comboBox)
 
         self.colour_label_2 = QLabel(self.groupBox)
         self.colour_label_2.setObjectName(u"colour_label_2")
         self.colour_label_2.setFont(font3)
 
-        self.formLayout.setWidget(7, QFormLayout.LabelRole, self.colour_label_2)
+        self.formLayout.setWidget(7, QFormLayout.ItemRole.LabelRole, self.colour_label_2)
 
         self.bgcolour_comboBox = QComboBox(self.groupBox)
         self.bgcolour_comboBox.setObjectName(u"bgcolour_comboBox")
@@ -192,20 +192,20 @@ class Ui_settings_Dialog(object):
         self.bgcolour_comboBox.setMinimumSize(QSize(100, 0))
         self.bgcolour_comboBox.setStyleSheet(u"")
 
-        self.formLayout.setWidget(7, QFormLayout.FieldRole, self.bgcolour_comboBox)
+        self.formLayout.setWidget(7, QFormLayout.ItemRole.FieldRole, self.bgcolour_comboBox)
 
         self.projection_label = QLabel(self.groupBox)
         self.projection_label.setObjectName(u"projection_label")
         self.projection_label.setFont(font3)
 
-        self.formLayout.setWidget(8, QFormLayout.LabelRole, self.projection_label)
+        self.formLayout.setWidget(8, QFormLayout.ItemRole.LabelRole, self.projection_label)
 
         self.projection_comboBox = QComboBox(self.groupBox)
         self.projection_comboBox.setObjectName(u"projection_comboBox")
         sizePolicy.setHeightForWidth(self.projection_comboBox.sizePolicy().hasHeightForWidth())
         self.projection_comboBox.setSizePolicy(sizePolicy)
 
-        self.formLayout.setWidget(8, QFormLayout.FieldRole, self.projection_comboBox)
+        self.formLayout.setWidget(8, QFormLayout.ItemRole.FieldRole, self.projection_comboBox)
 
 
         self.verticalLayout_2.addWidget(self.groupBox)

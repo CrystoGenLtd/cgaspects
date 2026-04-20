@@ -8,13 +8,13 @@ This tutorial walks through the typical end-to-end workflow in CGAspects: import
 
 1. Launch CGAspects (`cgaspects`)
 2. Click **Import XYZ Files** in the left panel, or use **File → Import** (`Ctrl+I`)
-3. Browse to the folder containing your CrystalGrower XYZ output files
+3. Browse to the folder containing your CrystoGen XYZ output files
 4. Click **Open**
 
 CGAspects scans the folder and loads all XYZ files. The 3D viewport updates to show the first crystal frame.
 
 !!! tip
-    If your folder contains a CrystalGrower structure file, lattice parameters are loaded automatically.
+    If your folder contains a CrystoGen structure file, lattice parameters are loaded automatically.
 
 ---
 

@@ -205,7 +205,7 @@ def find_info(path):
             None,
             "Missing Data",
             "No simulation parameter and size files found in the directory.\n"
-            "Please make sure you've selected a valid CrystalGrower output directory.",
+            "Please make sure you've selected a valid CrystoGen output directory.",
         )
 
     return file_info_tuple(
@@ -270,7 +270,7 @@ def summary_compare(summary_csv, aspect_csv=False, aspect_df=""):
     aspect_cols = aspect_df.columns
 
     # This allows backcompatibility with
-    # an older version of CrystalGrower
+    # an older version of CrystoGen
 
     search = str(summary_df.iloc[0, 0])
     search = search.split("_")
@@ -378,7 +378,7 @@ def combine_xyz_cda(CDA_df, XYZ_df):
 
 
 def parse_structure_file(file_path: str | Path) -> Cell | None:
-    """Parse a CrystalGrower structure file to extract lattice parameters.
+    """Parse a CrystoGen structure file to extract lattice parameters.
 
     The file format has a section starting with 'Non primitive data' followed by
     lattice parameters:
@@ -388,7 +388,7 @@ def parse_structure_file(file_path: str | Path) -> Cell | None:
     Parameters
     ----------
     file_path : str or Path
-        Path to the CrystalGrower structure file.
+        Path to the CrystoGen structure file.
 
     Returns
     -------

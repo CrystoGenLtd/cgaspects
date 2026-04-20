@@ -1,6 +1,6 @@
 # CGAspects
 
-**CGAspects** is a scientific GUI application for analysing and visualising crystal growth simulation data produced by [CrystalGrower](https://crystalgrower.org). It provides interactive 3D visualisation of crystal point clouds, quantitative shape analysis, growth rate analysis, and site crystallization analysis.
+**CGAspects** is a scientific GUI application for analysing and visualising crystal growth simulation data produced by [CrystoGen](https://crystogen.org) (formerly CrystalGrower). It provides interactive 3D visualisation of crystal point clouds, quantitative shape analysis, growth rate analysis, and site crystallization analysis.
 
 ---
 
@@ -54,5 +54,5 @@ CGAspects is currently in **alpha** (v0.9.8). Expect active development and occa
 
 ## Source Code & Issues
 
-- Repository: [github.com/CrystalGrowerOrg/cgaspects](https://github.com/CrystalGrowerOrg/cgaspects)
-- Bug reports: [GitHub Issues](https://github.com/CrystalGrowerOrg/cgaspects/issues)
+- Repository: [github.com/crystogenltd/cgaspects](https://github.com/crystogenltd/cgaspects)
+- Bug reports: [GitHub Issues](https://github.com/crystogenltd/cgaspects/issues)

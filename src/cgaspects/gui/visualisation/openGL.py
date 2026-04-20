@@ -1214,7 +1214,7 @@ class VisualisationWidget(QOpenGLWidget):
 
             if xyz.shape[1] <= 6 and color_axis >= 6:
                 logger.warning(
-                    "Old CrystalGrower version! %s option not available for colouring.",
+                    "Old CrystoGen version! %s option not available for colouring.",
                     self.color_by,
                 )
                 color_axis = 3

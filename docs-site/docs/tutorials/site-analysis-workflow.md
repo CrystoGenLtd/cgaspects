@@ -6,7 +6,7 @@ This tutorial shows how to analyse crystallization events at individual lattice 
 
 ## Prerequisites
 
-- A CrystalGrower simulation folder containing:
+- A CrystoGen simulation folder containing:
   - Crystallization event files
   - Population/occupation files
   - Site energy or coordinate data
@@ -20,7 +20,7 @@ This tutorial shows how to analyse crystallization events at individual lattice 
 2. If crystallization event files are detected, the **Calculate Site Analysis** button becomes active
 
 !!! tip
-    If the button is greyed out, the expected event files were not found. Check that the folder contains the CrystalGrower output files (not just the XYZ shape files).
+    If the button is greyed out, the expected event files were not found. Check that the folder contains the CrystoGen output files (not just the XYZ shape files).
 
 ---
 
