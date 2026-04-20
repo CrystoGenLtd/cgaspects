@@ -1,8 +1,8 @@
 [project]
 name = "cgaspects"
-version = "0.9.8.post2"
+version = "0.9.9"
 requires-python = ">=3.10"
-description = "An analysis tool and companion for CrystoGen"
+description = "An analysis tool and companion for CrystoGen (formerly CrystalGrower)"
 
 authors = [
     { name = "Alvin J. Walisinghe", email = "jennerwalisinghe@gmail.com" },
