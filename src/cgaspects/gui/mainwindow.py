@@ -26,13 +26,13 @@ from ..analysis.cluster_analysis import ClusterAnalysis
 from ..analysis.growth_rates import GrowthRate
 from ..analysis.gui_threads import WorkerXYZ
 from ..analysis.site_analysis import SiteAnalysis
+from ..fileio.cg_checkpoint import Checkpoint
 from ..fileio.find_data import (
     find_info,
     locate_xyz_files,
-    parse_molecular_data,
-    parse_structure_file,
 )
-from ..fileio.logging import get_log_file_path, setup_logging
+from ..fileio.structure import Structure
+from ..fileio.log_setup import get_log_file_path, setup_logging
 from ..fileio.pdb_export import write_docking_pdb
 from ..fileio.opendir import open_directory
 from ..fileio.xyz_file import CrystalCloud, DockingData
@@ -150,6 +150,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._prev_color_by: str | None = None
         self._prev_style: str | None = None
         self._docking_file_map: dict[Path, Path] = {}  # normal_xyz -> docking_xyz
+        self._checkpoint_file_map: dict[Path, Path] = {}  # normal_xyz -> checkpoint_txt
+        self._structure: Structure | None = None
 
         self.aboutDialog = None
         self.text_file_viewer = None
@@ -462,6 +464,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         )
         actAtomView.triggered.connect(self.openglwidget.toggle_atom_view)
         self.menuView.addAction(actAtomView)
+
+        actCheckpointView = QAction("Toggle Checkpoint View", self)
+        actCheckpointView.setObjectName("actionToggleCheckpointView")
+        actCheckpointView.setShortcut("Shift+H")
+        actCheckpointView.setToolTip(
+            "Switch between normal and Checkpoint visualiser view (requires checkpoint file)"
+        )
+        actCheckpointView.triggered.connect(self.openglwidget.toggle_checkpoint_view)
+        self.menuView.addAction(actCheckpointView)
 
         menuPointSize = QMenu("Point Size", self)
         actIncrease = QAction("Increase", self)
@@ -908,7 +919,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
         if not gl._mol_cart_templates:
             QMessageBox.warning(
-                self, "Export Docking PDB", "No molecular templates available — load a structure file first."
+                self,
+                "Export Docking PDB",
+                "No molecular templates available — load a structure file first.",
             )
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -1168,6 +1181,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         }
         if self._docking_file_map:
             self.log_message(f"Found {len(self._docking_file_map)} docking file(s)", "info")
+
+        checkpoint_files = natsorted(
+            f for f in Path(folder).rglob("*_checkpoint.txt") if f.stat().st_size > 0
+        )
+        checkpoint_by_stem = {_sim_stem(p): p for p in checkpoint_files}
+        self._checkpoint_file_map = {
+            xyz_path: checkpoint_by_stem[_sim_stem(xyz_path)]
+            for xyz_path in xyz_files
+            if _sim_stem(xyz_path) in checkpoint_by_stem
+        }
+        if self._checkpoint_file_map:
+            self.log_message(f"Found {len(self._checkpoint_file_map)} checkpoint file(s)", "info")
         self.input_folder = folder
         self.output_folder = None
         self.actionResults_Directory.setEnabled(False)
@@ -1289,8 +1314,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.crystal_info.surfaceAreaVolumeRatio = None
             self.crystal_info.surfaceArea = None
             self.crystal_info.volume = None
+            self.crystal_info.pointCount = None
             self.crystalInfoChanged.emit(self.crystal_info)
             return
+
+        style = self.openglwidget.style
+        if style in self.openglwidget._ATOM_STYLES:
+            templates = self.openglwidget._mol_cart_templates or {}
+            mol_types = xyz[:, 0].astype(int)
+            self.crystal_info.pointCount = int(sum(
+                len(templates[mt]["cart"]) for mt in mol_types if mt in templates
+            )) or len(xyz)
+            self.crystal_info.countLabel = "Atoms"
+        else:
+            self.crystal_info.pointCount = len(xyz)
+            self.crystal_info.countLabel = "Points"
+
         worker_xyz = WorkerXYZ(xyz)
         worker_xyz.signals.result.connect(self.insert_info)
         worker_xyz.signals.message.connect(self.update_statusbar)
@@ -1389,8 +1428,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # Auto-load structure file for fractional axes and molecular data if available
         if information.structure_file:
-            cell = parse_structure_file(information.structure_file)
-            if cell is not None:
+            self._structure = Structure.from_file(information.structure_file)
+
+            if self._structure.cell is not None:
+                cell = self._structure.cell
                 self.crystallography = Crystallography(cell)
                 self.actionToggleAxes.setEnabled(True)
                 self.current_axes_type = "fractional"
@@ -1405,12 +1446,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     "info",
                 )
 
-            # Parse molecular templates for the Atom view (Shift+V)
-            mol_templates = parse_molecular_data(information.structure_file)
-            if mol_templates and self.crystallography is not None:
-                self.openglwidget.set_molecular_data(mol_templates, self.crystallography)
+            if self._structure.templates and self.crystallography is not None:
+                self.openglwidget.set_molecular_data(
+                    self._structure.templates, self.crystallography
+                )
                 self.log_message(
-                    f"Loaded {len(mol_templates)} molecule template(s) — "
+                    f"Loaded {len(self._structure.templates)} molecule template(s) — "
                     "press Shift+V to switch to Atom view",
                     "info",
                 )
@@ -1688,6 +1729,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.update_XYZ_info(self.openglwidget.xyz)
 
         self._update_docking_for_current_xyz()
+        self._update_checkpoint_for_current_xyz()
         self.updateVisualizationSettings()
 
         if self.summ_df is not None:
@@ -1699,6 +1741,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         style_widget = self.visualizationSettings.widgets.get("Style")
         if style_widget is not None and style_widget.value in ("Docking", "Docking Atoms"):
             self._load_docking_for_current_xyz()
+
+    def _update_checkpoint_for_current_xyz(self):
+        """Reload checkpoint data for the new XYZ if a Checkpoint style is active."""
+        style_widget = self.visualizationSettings.widgets.get("Style")
+        if style_widget is not None and style_widget.value in self._CHECKPOINT_VIEW_STYLES:
+            self._load_checkpoint_for_current_xyz()
 
     def _load_docking_for_current_xyz(self):
         """Load docking data for the current XYZ into the GL widget (for Docking style)."""
@@ -1717,11 +1765,42 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         except (OSError, ValueError) as exc:
             self.log_message(f"Failed to load docking file: {exc}", "error")
 
+    def _load_checkpoint_for_current_xyz(self):
+        """Load checkpoint data for the current XYZ into the GL widget."""
+        if self.sim_num is None or not self.xyz_files:
+            return
+        current_path = self.xyz_files[self.sim_num]
+        checkpoint_path = self._checkpoint_file_map.get(current_path)
+        if checkpoint_path is None:
+            self.log_message("No checkpoint file for this simulation", "warning")
+            return
+        if self._structure is None:
+            self.log_message(
+                "No structure file found — cannot read n_tiles for checkpoint", "warning"
+            )
+            return
+        try:
+            checkpoint = Checkpoint.from_file(
+                checkpoint_path,
+                self._structure.n_tiles,
+                crysallography=self.crystallography,
+            )
+            self.openglwidget.set_checkpoint(checkpoint)
+            self.log_message(
+                f"Checkpoint loaded: {checkpoint_path.name} ({checkpoint.n_filled:,} filled cells)",
+                "info",
+            )
+        except (OSError, ValueError) as exc:
+            self.log_message(f"Failed to load checkpoint file: {exc}", "error")
+
     def updateVisualizationSettings(self):
         pass
 
-    _REINIT_VIEW_STYLES = frozenset(("Docking", "Docking Atoms", "Unit Cell"))
+    _REINIT_VIEW_STYLES = frozenset(
+        ("Docking", "Docking Atoms", "Unit Cell", "Checkpoint", "Checkpoint Atoms")
+    )
     _DOCKING_VIEW_STYLES = frozenset(("Docking", "Docking Atoms"))
+    _CHECKPOINT_VIEW_STYLES = frozenset(("Checkpoint", "Checkpoint Atoms"))
 
     def handleVisualizationSettingsChange(self):
         settings = self.visualizationSettings.settings()
@@ -1756,13 +1835,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._load_docking_for_current_xyz()
 
         # Recentre camera whenever crossing the normal ↔ reinit-style boundary
-        # (entering Docking/Unit Cell, or returning to normal mode from them).
+        # (entering Docking/Unit Cell/Checkpoint, or returning to normal mode from them).
         # Exception: Docking ↔ Docking Atoms only rescales, rotation is preserved.
         style_changed = new_style != old_style
-        between_docking = old_style in self._DOCKING_VIEW_STYLES and new_style in self._DOCKING_VIEW_STYLES
-        crossing_boundary = style_changed and not between_docking and (
-            (old_style in self._REINIT_VIEW_STYLES) != (new_style in self._REINIT_VIEW_STYLES)
-            or new_style in self._REINIT_VIEW_STYLES
+        between_docking = (
+            old_style in self._DOCKING_VIEW_STYLES and new_style in self._DOCKING_VIEW_STYLES
+        )
+        crossing_boundary = (
+            style_changed
+            and not between_docking
+            and (
+                (old_style in self._REINIT_VIEW_STYLES) != (new_style in self._REINIT_VIEW_STYLES)
+                or new_style in self._REINIT_VIEW_STYLES
+            )
         )
         if crossing_boundary:
             self.openglwidget.recentre_view()
@@ -1784,6 +1869,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             default = "Coordination Shell"
         elif style == "Docking Atoms":
             options = list(_VW._DOCKING_ATOM_COLOR_BY)
+            default = "Atom"
+        elif style == "Checkpoint":
+            options = list(_VW._CHECKPOINT_COLOR_BY)
+            default = "Single Colour"
+        elif style == "Checkpoint Atoms":
+            options = list(_VW._CHECKPOINT_ATOM_COLOR_BY)
             default = "Atom"
         else:
             options = list(_VW._NORMAL_COLOR_BY)
@@ -1823,6 +1914,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionAtomModeSettings.setEnabled(is_mol_style)
         if style in ("Docking", "Docking Atoms"):
             self._load_docking_for_current_xyz()
+        if style in self._CHECKPOINT_VIEW_STYLES:
+            self._load_checkpoint_for_current_xyz()
         style_widget = self.visualizationSettings.widgets.get("Style")
         if style_widget is not None:
             style_widget.comboBox.blockSignals(True)
@@ -1833,6 +1926,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._prev_style = style
             current_settings = self.visualizationSettings.settings()
             self._update_color_by_options_for_style(style, current_settings)
+
         # If switching into a molecular style and the dialog is already open, refresh it
         if is_mol_style and self.atom_mode_settings_dialog.isVisible():
             elements = self.openglwidget.get_visible_elements()
@@ -1936,12 +2030,14 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         )
         # Apply style/colour settings first; camera restore below will overwrite any
         # side-effect camera rescaling from a style switch.
-        self.openglwidget.updateSettings(**{
-            "Style": snapshot.style,
-            "Color By": snapshot.color_by,
-            "Color Map": snapshot.colormap,
-            "Single Color": q_single,
-        })
+        self.openglwidget.updateSettings(
+            **{
+                "Style": snapshot.style,
+                "Color By": snapshot.color_by,
+                "Color Map": snapshot.colormap,
+                "Single Color": q_single,
+            }
+        )
         # Restore camera (overwrites any scale side-effect from updateSettings)
         self.openglwidget.apply_camera_snapshot(snapshot)
         # Apply planes / directions

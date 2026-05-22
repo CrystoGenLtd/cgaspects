@@ -8,3 +8,5 @@ class CrystalInfo(QObject):
     surfaceAreaVolumeRatio = 1.0
     surfaceArea = 0.0
     volume = 0.0
+    pointCount = None
+    countLabel = "Points"

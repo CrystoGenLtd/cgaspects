@@ -11,7 +11,7 @@ import pandas as pd
 from cgaspects.analysis.shape_analysis import CrystalShape
 from cgaspects.utils.cg_net import CGNet
 from cgaspects.utils.data_structures import shape_info_tuple
-from cgaspects.fileio.logging import setup_logging
+from cgaspects.fileio.log_setup import setup_logging
 
 LOG = logging.getLogger("SOL-MAP")
 log_dict = {"basic": "DEBUG", "console": "INFO"}

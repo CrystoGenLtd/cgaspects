@@ -14,6 +14,7 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 from scipy.spatial import ConvexHull
 
+from ...fileio.cg_checkpoint import Checkpoint
 from ...fileio.xyz_file import CrystalCloud
 from ..widgets.overlay_widget import TransparentOverlay
 from .atom_renderer import AtomRenderer
@@ -177,6 +178,11 @@ class VisualisationWidget(QOpenGLWidget):
         self._docking_data = None  # DockingData instance or None
         self._docking_shell_color_overrides: dict[int, tuple[float, float, float]] = {}
 
+        # Checkpoint grid data
+        self._checkpoint: Checkpoint | None = None
+        self._checkpoint_coords = None  # np.ndarray (N, 3) centred, for sphere mode
+        self._checkpoint_center: np.ndarray | None = None
+
     def pass_XYZ(self, xyz):
         if xyz is not None and self._coord_scale != 1.0:
             xyz = xyz.copy().astype(np.float64)
@@ -316,6 +322,8 @@ class VisualisationWidget(QOpenGLWidget):
     _ATOM_COLOR_BY = ("Atom",) + _NORMAL_COLOR_BY
     _DOCKING_COLOR_BY = ("Coordination Shell", "Atom Type")
     _DOCKING_ATOM_COLOR_BY = ("Atom", "Coordination Shell", "Atom Type")
+    _CHECKPOINT_COLOR_BY = ("Single Colour", "Z Layer")
+    _CHECKPOINT_ATOM_COLOR_BY = ("Atom", "Tile")
 
     def _rescale_camera_for_style(self, old_style, new_style):
         """No-op: centroid coordinates are pre-scaled to Cartesian Å in pass_XYZ,
@@ -332,6 +340,9 @@ class VisualisationWidget(QOpenGLWidget):
             if self._docking_data is not None and not self._docking_data.empty:
                 a = self._a_axis()
                 coords = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
+        elif self.style == "Checkpoint":
+            if self._checkpoint_coords is not None and len(self._checkpoint_coords) > 0:
+                coords = self._checkpoint_coords.astype(np.float32)
         elif self.style in ("Atoms", "Unit Cell"):
             if self.xyz is not None:
                 coords = self.xyz[:, 3:6].astype(np.float32)
@@ -1378,6 +1389,16 @@ class VisualisationWidget(QOpenGLWidget):
             self.update()
             return
 
+        if self.style == "Checkpoint":
+            self._update_checkpoint_view()
+            self.update()
+            return
+
+        if self.style == "Checkpoint Atoms":
+            self._update_checkpoint_atom_view()
+            self.update()
+            return
+
         varray = self.updatePointCloudVertices()
         self.point_cloud_renderer.setPoints(varray)
         self.sphere_renderer.setPoints(varray)
@@ -1787,6 +1808,158 @@ class VisualisationWidget(QOpenGLWidget):
         if self.style in ("Docking", "Docking Atoms"):
             self.initGeometry()
         self.update()
+
+    # --------------------------------------------------------------- checkpoint
+    def set_checkpoint(self, checkpoint: Checkpoint):
+        """Store a Checkpoint object and refresh if a Checkpoint style is active."""
+        self._checkpoint = checkpoint
+        if checkpoint is not None:
+            coords = checkpoint.to_cartesian()
+            if len(coords) > 0:
+                self._checkpoint_center = coords.mean(axis=0)
+                self._checkpoint_coords = (coords - self._checkpoint_center).astype(np.float64)
+            else:
+                self._checkpoint_center = np.zeros(3, dtype=np.float64)
+                self._checkpoint_coords = np.zeros((0, 3), dtype=np.float64)
+        else:
+            self._checkpoint_center = None
+            self._checkpoint_coords = None
+        if self.style in ("Checkpoint", "Checkpoint Atoms"):
+            self.initGeometry()
+        self.update()
+
+    def _update_checkpoint_view(self):
+        """Upload checkpoint grid points to the sphere renderer."""
+        if self._checkpoint_coords is None or len(self._checkpoint_coords) == 0:
+            if self.sphere_renderer is not None:
+                self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
+            return
+        coords = self._checkpoint_coords.astype(np.float32)
+        n = len(coords)
+        if self.color_by == "Z Layer":
+            z = coords[:, 2]
+            z_min, z_max = z.min(), z.max()
+            t = (z - z_min) / (z_max - z_min + 1e-9)
+            colors = np.stack([t, np.zeros(n, dtype=np.float32), 1.0 - t], axis=1).astype(
+                np.float32
+            )
+        else:
+            colors = np.tile(np.array([0.2, 0.6, 1.0], dtype=np.float32), (n, 1))
+        selected = np.zeros((n, 1), dtype=np.float32)
+        varray = np.concatenate([coords, colors, selected], axis=1).astype(np.float32)
+        self.sphere_renderer.setPoints(varray)
+        if not self.viewInitialized:
+            self.camera.fitToObject(coords)
+            self.viewInitialized = True
+
+    def _update_checkpoint_atom_view(self):
+        """Build atom/bond instances from checkpoint grid + mol templates and upload to GPU."""
+        if self._checkpoint is None:
+            if self.atom_renderer is not None:
+                self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
+            if self.bond_renderer is not None:
+                self.bond_renderer.setBonds(None)
+            return
+
+        cryst = self._checkpoint.crystallography or self._mol_crystallography
+        if cryst is None or not self._mol_cart_templates:
+            logger.warning("Checkpoint Atoms: no crystallography or mol templates available")
+            return
+
+        use_atom_colors = self.color_by == "Atom"
+        tile_palette = cm.tab10(np.linspace(0, 1, max(self._checkpoint.n_tiles, 1)))[:, :3]
+        center = self._checkpoint_center if self._checkpoint_center is not None else np.zeros(3)
+
+        atom_chunks = []
+        bond_chunks = []
+        bond_r = self._bond_radius
+
+        for t in range(self._checkpoint.n_tiles):
+            mol_type = t + 1
+            tmpl = self._mol_cart_templates.get(mol_type)
+            if tmpl is None:
+                continue
+
+            mask = self._checkpoint.data[..., t]  # (a, b, c)
+            indices = np.argwhere(mask).astype(float)  # (N, 3)
+            if len(indices) == 0:
+                continue
+
+            # (N, 3) centroid positions in Cartesian Å, centred
+            cart_positions = (cryst.frac_to_cart(indices) - center).astype(np.float32)
+            N = len(cart_positions)
+
+            tmpl_cart = tmpl["cart"]  # (M, 3)
+            M = len(tmpl_cart)
+
+            if use_atom_colors:
+                colors, radii = self._resolved_atom_colors_radii(tmpl)
+            else:
+                tile_rgb = tile_palette[t % len(tile_palette)].astype(np.float32)
+                colors = np.tile(tile_rgb, (M, 1)).astype(np.float32)
+                radii = tmpl["radii"].copy()
+
+            # Vectorised: broadcast all N centroids over M atoms at once.
+            # offsets: (N, 3); tmpl_cart: (M, 3) -> all_atom_pos: (N, M, 3)
+            offsets = cart_positions - tmpl["centroid"]          # (N, 3)
+            all_atom_pos = tmpl_cart + offsets[:, None, :]       # (N, M, 3)
+            flat_pos = all_atom_pos.reshape(N * M, 3)            # (N*M, 3)
+
+            colors_tiled = np.tile(colors, (N, 1))               # (N*M, 3)
+            radii_tiled = np.tile(radii, N)                      # (N*M,)
+            sel_col = np.zeros((N * M, 1), dtype=np.float32)
+
+            atom_chunks.append(
+                np.hstack([flat_pos, colors_tiled, sel_col, radii_tiled[:, None]])
+            )
+
+            # One pass per unique bond pair (typically just a handful per mol type)
+            r_col = np.full((N, 1), bond_r, dtype=np.float32)
+            for a1, a2 in tmpl["bonds"]:
+                if a1 >= M or a2 >= M:
+                    continue
+                p1 = all_atom_pos[:, a1, :]                      # (N, 3)
+                p2 = all_atom_pos[:, a2, :]                      # (N, 3)
+                mid = (p1 + p2) * 0.5
+                c1 = np.broadcast_to(colors[a1], (N, 3))
+                c2 = np.broadcast_to(colors[a2], (N, 3))
+                bond_chunks.append(np.hstack([p1, mid, c1, r_col]))
+                bond_chunks.append(np.hstack([mid, p2, c2, r_col]))
+
+        if not atom_chunks:
+            logger.warning("Checkpoint Atoms: no instances generated — check tile/template mapping")
+            return
+
+        atom_arr = np.vstack(atom_chunks).astype(np.float32)
+        bond_arr = np.vstack(bond_chunks).astype(np.float32) if bond_chunks else None
+
+        if not self.viewInitialized:
+            self.camera.fitToObject(atom_arr[:, :3])
+            self.viewInitialized = True
+
+        self.atom_renderer.setPoints(atom_arr)
+        self.bond_renderer.setBonds(bond_arr)
+
+    def toggle_checkpoint_view(self):
+        """Cycle Spheres → Checkpoint → Checkpoint Atoms → Spheres. Shift+H shortcut."""
+        if self._checkpoint is None:
+            QMessageBox.information(
+                self,
+                "No Checkpoint Data",
+                "No checkpoint file was found for this simulation.",
+            )
+            return
+        old_style = self.style
+        if self.style not in ("Checkpoint", "Checkpoint Atoms"):
+            new_style = "Checkpoint"
+        elif self.style == "Checkpoint":
+            new_style = "Checkpoint Atoms" if self._mol_cart_templates else "Spheres"
+        else:
+            new_style = "Spheres"
+        self.style = new_style
+        self.styleChanged.emit(self.style)
+        self._rescale_camera_for_style(old_style, self.style)
+        self.initGeometry()
 
     def _update_docking_atom_view(self):
         """Build atom/bond instances from docking centroids and upload to GPU."""
@@ -2317,6 +2490,11 @@ class VisualisationWidget(QOpenGLWidget):
         elif self.style == "Docking":
             self._draw_spheres(gl, uniforms)
         elif self.style == "Docking Atoms":
+            self._draw_bonds(gl, uniforms)
+            self._draw_atoms(gl, uniforms)
+        elif self.style == "Checkpoint":
+            self._draw_spheres(gl, uniforms)
+        elif self.style == "Checkpoint Atoms":
             self._draw_bonds(gl, uniforms)
             self._draw_atoms(gl, uniforms)
 

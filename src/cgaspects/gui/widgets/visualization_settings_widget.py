@@ -332,6 +332,8 @@ class VisualizationSettingsWidget(QWidget):
                 "Unit Cell",
                 "Docking",
                 "Docking Atoms",
+                "Checkpoint",
+                "Checkpoint Atoms",
             ),
         )
         self.widgets["Style"] = w
