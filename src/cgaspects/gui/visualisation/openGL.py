@@ -29,6 +29,7 @@ from .point_cloud_renderer import SimplePointRenderer
 from .sphere_renderer import SphereRenderer
 from .sphere_selection_renderer import SphereSelectionRenderer
 from .unit_cell_renderer import UnitCellRenderer
+from .visual_data import VisualData
 
 logger = logging.getLogger("CA:OpenGL")
 
@@ -92,15 +93,9 @@ class VisualisationWidget(QOpenGLWidget):
         self._directions_crystallography = None
         self._directions_max_extent = 1.0
 
-        # Coordinate scale: set to a-axis length (Å) once unit cell info is available.
-        # After being set, all xyz[:,3:6] are pre-multiplied by this factor so that
-        # centroid coordinates live in Cartesian Å in both point-cloud and atom modes.
-        self._coord_scale: float = 1.0
-
         # Atom / bond view state
         self._mol_templates = None  # dict[int, MolTemplate] from structure file
         self._mol_crystallography = None  # Crystallography used to convert frac → cart
-        self._mol_cart_templates = {}  # precomputed per-type: (cart_atoms, symbols, bonds)
         self.atom_renderer = None
         self.bond_renderer = None
         self.unit_cell_renderer = None
@@ -125,7 +120,6 @@ class VisualisationWidget(QOpenGLWidget):
         self.mesh_renderer = None
         self.axes_renderer = None
 
-        self.xyz = None
         self.crystal = None
         # self.object = 0
 
@@ -183,11 +177,20 @@ class VisualisationWidget(QOpenGLWidget):
         self._checkpoint_coords = None  # np.ndarray (N, 3) centred, for sphere mode
         self._checkpoint_center: np.ndarray | None = None
 
+        # Unified display data – rebuilt whenever the active data source changes
+        self._visual_data: VisualData | None = None
+
+    @property
+    def xyz(self):
+        """Centroid positions (N, 3) or None – read-only shim for external callers."""
+        return self._visual_data.centroids if self._visual_data else None
+
     def pass_XYZ(self, xyz):
-        if xyz is not None and self._coord_scale != 1.0:
-            xyz = xyz.copy().astype(np.float64)
-            xyz[:, 3:6] *= self._coord_scale
-        self.xyz = xyz
+        self._visual_data = (
+            VisualData.from_xyz(xyz, self._mol_templates, self._mol_crystallography)
+            if xyz is not None
+            else None
+        )
         logger.debug("XYZ coordinates passed on OpenGL widget")
 
     def pass_XYZ_list(self, xyz_path_list):
@@ -212,25 +215,19 @@ class VisualisationWidget(QOpenGLWidget):
         self.update()
 
     def apply_coord_scale(self, crystallography) -> None:
-        """Pre-scale centroid coordinates to Cartesian Å using the a-axis from crystallography.
+        """Scale xyz centroids to Cartesian Å using the a-axis from crystallography.
 
-        Safe to call multiple times: the scale is only applied once (when _coord_scale == 1.0).
-        This covers the lattice-dialog path where set_molecular_data is never called.
+        Used by the lattice-parameters dialog when no structure file is present.
         """
         if crystallography is None or crystallography.cell is None:
             return
-        a = float(crystallography.cell.a)
-        if a < 1e-10 or a == 1.0 or self._coord_scale != 1.0:
-            return
-        self._coord_scale = a
-        if self.xyz is not None:
-            self.xyz = self.xyz.copy().astype(np.float64)
-            self.xyz[:, 3:6] *= a
+        self._mol_crystallography = crystallography
+        if self._visual_data is not None and self._visual_data.source == "xyz" and self._visual_data._raw is not None:
+            self._visual_data = VisualData.from_xyz(
+                self._visual_data._raw, self._mol_templates, crystallography
+            )
             self.viewInitialized = False
             self.initGeometry()
-        logger.info(
-            "Centroid coordinates pre-scaled to Cartesian Å (a=%.4f Å) via crystallography", a
-        )
 
     def set_fractional_axes(self, crystallography):
         """Set the axes to fractional coordinates using the provided crystallography object."""
@@ -256,7 +253,7 @@ class VisualisationWidget(QOpenGLWidget):
     def _apply_directions(self):
         if self.direction_renderer is None:
             return
-        extent = self._cart_max_extent() if self.xyz is not None else self._directions_max_extent
+        extent = self._cart_max_extent() if self._visual_data is not None else self._directions_max_extent
         self.direction_renderer.set_directions(
             self._raw_directions, self._directions_crystallography, extent
         )
@@ -274,30 +271,25 @@ class VisualisationWidget(QOpenGLWidget):
         from dataclasses import replace
 
         visible = [p for p in self._raw_planes if p.visible]
-        if self.xyz is not None:
+        if self._visual_data is not None:
             extent = self._cart_max_extent()
             converted = [replace(p, size=p.size_relative * extent) for p in visible]
         else:
             converted = visible
         self.plane_renderer.set_planes(converted, self._planes_crystallography)
-        if self.xyz is not None:
+        if self._visual_data is not None:
             if self.style in ("Atoms", "Unit Cell"):
                 self._update_atom_view()
             else:
                 self.initGeometry()
         self.update()
 
-    def _a_axis(self):
-        """Return the a-axis length in Å, or 1.0 if unavailable."""
-        if self._mol_crystallography is not None and self._mol_crystallography.cell is not None:
-            return float(self._mol_crystallography.cell.a)
-        return 1.0
 
     def _cart_max_extent(self):
         """Half-range of the crystal in world units (Å after pre-scaling)."""
-        if self.xyz is None:
+        if self._visual_data is None or self._visual_data.n_centroids == 0:
             return self._directions_max_extent
-        coords = self.xyz[:, 3:6].astype(np.float64)
+        coords = self._visual_data.centroids.astype(np.float64)
         extents = coords.max(axis=0) - coords.min(axis=0)
         return float(extents.max()) / 2.0
 
@@ -332,22 +324,11 @@ class VisualisationWidget(QOpenGLWidget):
     def recentre_view(self):
         """Fit the camera to the current geometry.  Used as a menu action (F)
         and called automatically when entering Docking / Unit Cell styles."""
-        coords = None
-        if self.style == "Docking":
-            if self._docking_data is not None and not self._docking_data.empty:
-                coords = self._docking_data.coords.astype(np.float32)
-        elif self.style == "Docking Atoms":
-            if self._docking_data is not None and not self._docking_data.empty:
-                a = self._a_axis()
-                coords = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
-        elif self.style == "Checkpoint":
-            if self._checkpoint_coords is not None and len(self._checkpoint_coords) > 0:
-                coords = self._checkpoint_coords.astype(np.float32)
-        elif self.style in ("Atoms", "Unit Cell"):
-            if self.xyz is not None:
-                coords = self.xyz[:, 3:6].astype(np.float32)
-        elif self.xyz is not None:
-            coords = self.xyz[:, 3:6].astype(np.float32)
+        coords = (
+            self._visual_data.centroids
+            if self._visual_data is not None and self._visual_data.n_centroids > 0
+            else None
+        )
 
         if coords is not None and len(coords) > 0:
             self.camera.fitToObject(coords)
@@ -553,7 +534,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def exportXYZDialog(self):
         """Open dialog to export the current point cloud as an XYZ file."""
-        if self.xyz is None:
+        if self._visual_data is None:
             QMessageBox.warning(
                 self,
                 "No Data",
@@ -826,7 +807,7 @@ class VisualisationWidget(QOpenGLWidget):
                 point_idx, _ = self._find_point_at_screen_pos(event.pos().x(), event.pos().y())
                 if point_idx is not None:
                     self._sphere_sel_start_screen = event.pos()
-                    self._sphere_sel_center_world = self.xyz[point_idx, 3:6].copy()
+                    self._sphere_sel_center_world = self._visual_data.centroids[point_idx].copy()
                     self._sphere_sel_anchor_idx = point_idx
                     self._sphere_sel_radius = 0.0
                     self._sphere_sel_active = False
@@ -1030,13 +1011,12 @@ class VisualisationWidget(QOpenGLWidget):
         Returns:
             tuple: (point_index, distance) or (None, None) if no point found
         """
-        if self.xyz is None or len(self.xyz) == 0:
+        if self._visual_data is None or self._visual_data.n_centroids == 0:
             return None, None
 
         ray_origin, ray_direction = self._screen_to_ray(screen_x, screen_y)
 
-        # Get point positions (columns 3:6 contain x, y, z)
-        points = self.xyz[:, 3:6]
+        points = self._visual_data.centroids
 
         # Calculate distance from each point to the ray
         # Using point-to-line distance formula
@@ -1113,10 +1093,10 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_sphere_selection(self):
         """Recompute which points lie within the current selection sphere."""
-        if self.xyz is None or self._sphere_sel_center_world is None:
+        if self._visual_data is None or self._sphere_sel_center_world is None:
             return
 
-        points = self.xyz[:, 3:6]
+        points = self._visual_data.centroids
         diffs = points - self._sphere_sel_center_world
         distances = np.linalg.norm(diffs, axis=1)
 
@@ -1157,23 +1137,21 @@ class VisualisationWidget(QOpenGLWidget):
         Returns:
             dict: Point data including position, type, number, layer, etc.
         """
-        if self.xyz is None or point_index is None or point_index >= len(self.xyz):
+        if self._visual_data is None or point_index is None or point_index >= self._visual_data.n_centroids:
             return None
 
-        row = self.xyz[point_index]
+        vd = self._visual_data
+        pos = vd.centroids[point_index]
         data = {
-            "position": (row[3], row[4], row[5]),
-            "type": row[0],
-            "number": row[1],
-            "layer": row[2],
+            "position": (float(pos[0]), float(pos[1]), float(pos[2])),
+            "type": int(vd.mol_types[point_index]),
+            "number": int(vd.mol_numbers[point_index]) if vd.mol_numbers is not None else 0,
+            "layer": int(vd.layers[point_index]) if vd.layers is not None else 0,
         }
-
-        # Add optional columns if available
-        if self.xyz.shape[1] > 6:
-            data["site"] = row[6]
-        if self.xyz.shape[1] > 7:
-            data["energy"] = row[7]
-
+        if vd.site_numbers is not None:
+            data["site"] = int(vd.site_numbers[point_index])
+        if vd.energies is not None:
+            data["energy"] = float(vd.energies[point_index])
         return data
 
     def get_selected_points(self):
@@ -1271,19 +1249,75 @@ class VisualisationWidget(QOpenGLWidget):
         Returns:
             np.ndarray: XYZ data with deleted points removed
         """
-        if self.xyz is None:
+        if self._visual_data is None:
             return None
+        vd = self._visual_data
+        n = vd.n_centroids
+        # Reconstruct the (N, 7+) column layout expected by exportXYZ
+        mol_nums = vd.mol_numbers if vd.mol_numbers is not None else np.zeros(n, int)
+        layers = vd.layers if vd.layers is not None else np.zeros(n, int)
+        cols = [
+            vd.mol_types.reshape(-1, 1).astype(float),
+            mol_nums.reshape(-1, 1).astype(float),
+            layers.reshape(-1, 1).astype(float),
+            vd.centroids.astype(float),
+        ]
+        if vd.site_numbers is not None:
+            cols.append(vd.site_numbers.reshape(-1, 1).astype(float))
+            if vd.energies is not None:
+                cols.append(vd.energies.reshape(-1, 1).astype(float))
+        raw = np.hstack(cols)
 
         if not self._deleted_points:
-            return self.xyz.copy()
-
-        # Create mask for non-deleted points
-        mask = np.ones(len(self.xyz), dtype=bool)
+            return raw
+        mask = np.ones(n, dtype=bool)
         for idx in self._deleted_points:
-            if idx < len(mask):
+            if idx < n:
                 mask[idx] = False
+        return raw[mask]
 
-        return self.xyz[mask].copy()
+    def get_display_count(self) -> tuple[int | None, str]:
+        """(count, label) for the crystal-info panel based on the active render mode."""
+        if self._visual_data is None:
+            return None, "Points"
+        return self._visual_data.display_count()
+
+    def _active_slice_planes(self) -> list:
+        """Return resolved (normal, origin, two_sided, thickness) for active slice planes."""
+        planes = []
+        for plane in self._raw_planes:
+            if not plane.slice_enabled:
+                continue
+            normal = np.array(plane.normal, dtype=np.float64)
+            if plane.fractional and self._planes_crystallography is not None:
+                # Plane normals are Miller indices (hkl) — use reciprocal lattice transform.
+                normal = self._planes_crystallography.miller_to_cart_normal(normal)
+            n_len = np.linalg.norm(normal)
+            if n_len < 1e-9:
+                continue
+            normal /= n_len
+            origin = np.array(plane.origin, dtype=np.float64)
+            planes.append((normal, origin, plane.slice_two_sided, plane.slice_thickness))
+        return planes
+
+    def _slice_centroid_mask(self, centroids: np.ndarray) -> np.ndarray | None:
+        """Boolean keep-mask (N,) for *centroids* against all active slice planes.
+
+        Returns None when no slice planes are active so callers can skip the filter
+        entirely without allocating an all-True array.
+        """
+        slice_planes = self._active_slice_planes()
+        if not slice_planes:
+            return None
+        points = centroids.astype(np.float64)
+        mask = np.ones(len(points), dtype=bool)
+        for normal, origin, two_sided, thickness in slice_planes:
+            d = (points - origin) @ normal
+            if two_sided:
+                mask &= np.abs(d) <= thickness / 2.0
+            else:
+                mask &= d >= -thickness
+        return mask
 
     def mouseMoveEvent(self, event):
         dx = event.pos().x() - self.lastMousePosition.x()
@@ -1416,139 +1450,114 @@ class VisualisationWidget(QOpenGLWidget):
 
     def updatePointCloudVertices(self):
         self.overlay.setVisible(False)
-        logger.debug("Loading Vertices")
-        logger.debug(".XYZ shape: %s", self.xyz.shape[0])
-        layers = self.xyz[:, 2]
-        max_layers = int(np.nanmax(layers[layers < 99]))
+        vd = self._visual_data
+        logger.debug("Loading Vertices: %s centroids", vd.n_centroids)
 
-        # Loading the point cloud from file
-        def vis_pc(xyz, color_axis):
-            pcd_points = xyz[:, 3:6]
-            pcd_colors = None
+        col_idx = self.columnLabelToIndex.get(self.color_by, 2)
+        if col_idx < -1:
+            col_idx = 2
 
-            # Atom/docking-specific modes not valid in point-cloud path; fall back to Layer
-            if color_axis < -1:
-                color_axis = 2
-
-            if xyz.shape[1] <= 6 and color_axis >= 6:
-                logger.warning(
-                    "Old CrystalGrower version! %s option not available for colouring.",
-                    self.color_by,
+        # Resolve the 1-D values array for colormap, respecting available attributes
+        if col_idx == -1:
+            # Single colour
+            single_rgb = np.array(
+                [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
+                dtype=np.float32,
+            )
+            colors = vd.colors_uniform(single_rgb)
+            min_val, max_val, legend_rows = 0.0, 0.0, [(None, tuple(single_rgb.tolist()))]
+        else:
+            # Map col_idx to VisualData attribute
+            if col_idx == 0:
+                values = vd.mol_types.astype(np.float32)
+            elif col_idx == 1:
+                values = (
+                    vd.mol_numbers.astype(np.float32)
+                    if vd.mol_numbers is not None
+                    else np.arange(vd.n_centroids, dtype=np.float32)
                 )
-                color_axis = 3
-
-            if color_axis == 3:
-                axis_vis = np.arange(0, xyz.shape[0], dtype=np.float32)
-            else:
-                axis_vis = xyz[:, color_axis]
-
-            if color_axis == 2:
-                min_val = 1
-                max_val = max_layers
-            elif color_axis == -1:
-                # Single color mode - use custom color
-                min_val = 0
-                max_val = 0
-                axis_vis = np.zeros_like(axis_vis)
-                # Convert QColor to RGB values in [0, 1] range
-                single_color_rgb = np.array(
-                    [
-                        self.single_color.redF(),
-                        self.single_color.greenF(),
-                        self.single_color.blueF(),
-                    ],
-                    dtype=np.float32,
+            elif col_idx == 2:
+                if vd.layers is not None:
+                    raw_layers = vd.layers.astype(np.float32)
+                    valid = raw_layers[raw_layers < 99]
+                    max_layers = int(np.nanmax(valid)) if valid.size else 1
+                    values = raw_layers
+                    min_val, max_val = 1.0, float(max_layers)
+                else:
+                    values = np.zeros(vd.n_centroids, dtype=np.float32)
+                    min_val = max_val = 0.0
+            elif col_idx == 3:
+                values = np.arange(vd.n_centroids, dtype=np.float32)
+            elif col_idx == 6:
+                values = (
+                    vd.site_numbers.astype(np.float32)
+                    if vd.site_numbers is not None
+                    else np.zeros(vd.n_centroids, dtype=np.float32)
                 )
+                if vd.site_numbers is None:
+                    logger.warning("Old CrystalGrower version! %s not available.", self.color_by)
+            elif col_idx == 7:
+                values = (
+                    vd.energies.astype(np.float32)
+                    if vd.energies is not None
+                    else np.zeros(vd.n_centroids, dtype=np.float32)
+                )
+                if vd.energies is None:
+                    logger.warning("Old CrystalGrower version! %s not available.", self.color_by)
             else:
-                min_val = np.nanmin(axis_vis)
-                max_val = np.nanmax(axis_vis)
+                values = np.arange(vd.n_centroids, dtype=np.float32)
 
-            # Avoid division by zero in case all values are the same
-            range_val = max_val - min_val if max_val != min_val else 1
+            if col_idx != 2:
+                min_val = float(np.nanmin(values))
+                max_val = float(np.nanmax(values))
+            colors = vd.colors_by_array(
+                values, self.availableColormaps[self.colormap], min_val, max_val
+            )
+            unique_vals = np.unique(values)
+            rng = max_val - min_val if max_val != min_val else 1.0
+            norm_u = (unique_vals - min_val) / rng
+            unique_rgb = self.availableColormaps[self.colormap](norm_u)[:, :3]
+            legend_rows = [(float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)]
 
-            normalized_axis_vis = (axis_vis - min_val) / range_val
+        self._legend_info = {
+            "color_by": self.color_by,
+            "colormap": self.colormap,
+            "min_val": float(min_val),
+            "max_val": float(max_val),
+            "rows": legend_rows,
+        }
+        self.legendChanged.emit(self._legend_info)
 
-            if color_axis == -1:
-                # Use the custom single color for all points
-                pcd_colors = np.tile(single_color_rgb, (xyz.shape[0], 1))
-                legend_rows = [(None, tuple(single_color_rgb.tolist()))]
-            else:
-                pcd_colors = self.availableColormaps[self.colormap](normalized_axis_vis)[:, 0:3]
-                unique_vals = np.unique(axis_vis)
-                norm_unique = (unique_vals - min_val) / range_val
-                unique_rgb = self.availableColormaps[self.colormap](norm_unique)[:, :3]
-                legend_rows = [
-                    (float(v), tuple(c.tolist())) for v, c in zip(unique_vals, unique_rgb)
-                ]
-
-            self._legend_info = {
-                "color_by": self.color_by,
-                "colormap": self.colormap,
-                "min_val": float(min_val),
-                "max_val": float(max_val),
-                "rows": legend_rows,
-            }
-            self.legendChanged.emit(self._legend_info)
-
-            return (pcd_points, pcd_colors)
-
-        points, colors = vis_pc(self.xyz, self.columnLabelToIndex[self.color_by])
+        points = vd.centroids.astype(np.float32)
+        colors = colors.astype(np.float32)
 
         if not self.viewInitialized:
             self.camera.fitToObject(points)
             self.viewInitialized = True
 
-        points = np.asarray(points).astype("float32")
-        colors = np.asarray(colors).astype("float32")
-
-        # Apply site highlighting if any groups are defined
-        if self.highlight_groups and self.xyz.shape[1] > 6:
-            # Column 6 is Site Number (0-indexed)
-            site_numbers = self.xyz[:, 6]
-
-            # First, apply background color override to all sites if specified
+        # Site highlighting
+        if self.highlight_groups and vd.site_numbers is not None:
             if self.background_color_override is not None:
                 colors[:] = self.background_color_override
-
-            # Then apply highlight colors for each group (later groups override earlier ones)
             for site_set, highlight_color in self.highlight_groups:
-                # Create a mask for particles belonging to sites in this group
-                mask = np.isin(site_numbers, list(site_set))
+                mask = np.isin(vd.site_numbers, list(site_set))
                 colors[mask] = highlight_color
 
-        # Create selection flags array (1.0 for selected, 0.0 for not selected)
+        # Selection flags
         selection_flags = np.zeros((len(points), 1), dtype=np.float32)
-        if self._selected_points:
-            for idx in self._selected_points:
-                if idx < len(selection_flags):
-                    selection_flags[idx] = 1.0
+        for idx in self._selected_points:
+            if idx < len(selection_flags):
+                selection_flags[idx] = 1.0
 
-        # Build combined mask: exclude deleted points and apply active slice planes
+        # Combined mask: deleted points + slice planes
         n_pts = len(points)
         combined_mask = np.ones(n_pts, dtype=bool)
-
-        # Deleted-points mask
         for idx in self._deleted_points:
             if idx < n_pts:
                 combined_mask[idx] = False
-
-        # Slice-plane masks (applied in translated coordinate space)
-        for plane in self._raw_planes:
-            if not plane.slice_enabled:
-                continue
-            normal = np.array(plane.normal, dtype=np.float64)
-            if plane.fractional and self._planes_crystallography is not None:
-                normal = self._planes_crystallography.miller_to_cart_normal(normal)
-            n_len = np.linalg.norm(normal)
-            if n_len < 1e-10:
-                continue
-            normal /= n_len
-            origin = np.array(plane.origin, dtype=np.float64)
-            d = (points - origin.astype(np.float32)) @ normal.astype(np.float32)
-            if plane.slice_two_sided:
-                combined_mask &= np.abs(d) <= plane.slice_thickness / 2.0
-            else:
-                combined_mask &= d >= -plane.slice_thickness
+        slice_mask = self._slice_centroid_mask(points)
+        if slice_mask is not None:
+            combined_mask &= slice_mask
 
         if not np.all(combined_mask):
             points = points[combined_mask]
@@ -1556,18 +1565,11 @@ class VisualisationWidget(QOpenGLWidget):
             selection_flags = selection_flags[combined_mask]
 
         try:
-            # Concatenate: position (3) + color (3) + selection (1) = 7 floats
-            attributes = np.concatenate((points, colors, selection_flags), axis=1)
-
-            return attributes
+            return np.concatenate((points, colors, selection_flags), axis=1)
         except ValueError as exc:
             logger.error(
-                "%s\n XYZ %s POINTS %s COLORS %s TYPE %s",
-                exc,
-                self.xyz.shape,
-                points.shape,
-                colors.shape,
-                self.color_by,
+                "%s\n CENTROIDS %s COLORS %s TYPE %s",
+                exc, points.shape, colors.shape, self.color_by,
             )
             return
 
@@ -1587,12 +1589,12 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _emit_atom_legend(self):
         """Build and emit a legend for the current Atoms/Unit Cell view."""
-        if not self._mol_cart_templates:
+        if not (self._visual_data and self._visual_data.templates):
             return
         if self.color_by == "Atom":
             # One row per unique element symbol, using resolved colors
             seen: dict[str, tuple] = {}
-            for tmpl in self._mol_cart_templates.values():
+            for tmpl in self._visual_data.templates.values():
                 colors, _ = self._resolved_atom_colors_radii(tmpl)
                 for sym, rgb in zip(tmpl["symbols"], colors):
                     if sym not in seen:
@@ -1607,8 +1609,9 @@ class VisualisationWidget(QOpenGLWidget):
                 "mode": "atom",  # signals legend dialog to use symbol labels
             }
         else:
-            # Colormap-based: build legend from xyz data
-            if self.xyz is None:
+            # Colormap-based: build legend from visual data
+            vd = self._visual_data
+            if vd is None:
                 return
             col_idx = self.columnLabelToIndex.get(self.color_by, 2)
             if col_idx < -1:
@@ -1633,11 +1636,25 @@ class VisualisationWidget(QOpenGLWidget):
                 }
             else:
                 if col_idx == 3:
-                    axis_vis = np.arange(self.xyz.shape[0], dtype=np.float32)
+                    axis_vis = np.arange(vd.n_centroids, dtype=np.float32)
+                elif col_idx == 0:
+                    axis_vis = vd.mol_types.astype(np.float32)
+                elif col_idx == 1:
+                    axis_vis = vd.mol_numbers.astype(np.float32) if vd.mol_numbers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                elif col_idx == 2:
+                    axis_vis = vd.layers.astype(np.float32) if vd.layers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                elif col_idx == 6:
+                    axis_vis = vd.site_numbers.astype(np.float32) if vd.site_numbers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                elif col_idx == 7:
+                    axis_vis = vd.energies.astype(np.float32) if vd.energies is not None else np.zeros(vd.n_centroids, dtype=np.float32)
                 else:
-                    axis_vis = self.xyz[:, col_idx].astype(np.float32)
-                layers = self.xyz[:, 2]
-                max_layers = int(np.nanmax(layers[layers < 99]))
+                    axis_vis = np.arange(vd.n_centroids, dtype=np.float32)
+                if vd.layers is not None:
+                    raw_layers = vd.layers.astype(float)
+                    valid_layers = raw_layers[raw_layers < 99]
+                    max_layers = int(np.nanmax(valid_layers)) if valid_layers.size else 1
+                else:
+                    max_layers = 1
                 min_val = 1.0 if col_idx == 2 else float(np.nanmin(axis_vis))
                 max_val = float(max_layers) if col_idx == 2 else float(np.nanmax(axis_vis))
                 range_val = max_val - min_val if max_val != min_val else 1.0
@@ -1690,10 +1707,10 @@ class VisualisationWidget(QOpenGLWidget):
                 "rows": rows,
                 "mode": "colormap",
             }
-        elif self.color_by == "Atom" and self._mol_cart_templates:
+        elif self.color_by == "Atom" and self._visual_data and self._visual_data.templates:
             # Atom-element coloring in Docking Atoms mode
             seen: dict[str, tuple] = {}
-            for tmpl in self._mol_cart_templates.values():
+            for tmpl in self._visual_data.templates.values():
                 colors, _ = self._resolved_atom_colors_radii(tmpl)
                 for sym, rgb in zip(tmpl["symbols"], colors):
                     if sym not in seen:
@@ -1723,43 +1740,58 @@ class VisualisationWidget(QOpenGLWidget):
         else:
             return self._NORMAL_COLOR_BY, "Layer"
 
-    def _centroid_colormap_colors(self, xyz: np.ndarray) -> np.ndarray:
-        """Return (N, 3) float32 colours for each xyz centroid row based on color_by.
+    def _centroid_colormap_colors(self) -> np.ndarray:
+        """(N, 3) float32 colours for each centroid in the current VisualData, based on color_by.
 
-        Used in Atoms/Unit Cell mode when color_by != "Atom".
+        Used in Atoms/Unit Cell/Docking Atoms/Checkpoint Atoms modes when color_by != "Atom".
         """
+        vd = self._visual_data
         col_idx = self.columnLabelToIndex.get(self.color_by, 2)
-        # Fall back to Layer for special modes not handled here
         if col_idx < -1:
             col_idx = 2
-
-        layers = xyz[:, 2]
-        max_layers = int(np.nanmax(layers[layers < 99]))
 
         if col_idx == -1:
             rgb = np.array(
                 [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
                 dtype=np.float32,
             )
-            return np.tile(rgb, (xyz.shape[0], 1))
+            return vd.colors_uniform(rgb)
 
-        if xyz.shape[1] <= 6 and col_idx >= 6:
-            col_idx = 3  # Atom/Molecule Number fallback
-
-        if col_idx == 3:
-            axis_vis = np.arange(xyz.shape[0], dtype=np.float32)
+        if col_idx == 0:
+            values = vd.mol_types.astype(np.float32)
+        elif col_idx == 1:
+            values = (
+                vd.mol_numbers.astype(np.float32)
+                if vd.mol_numbers is not None
+                else np.arange(vd.n_centroids, dtype=np.float32)
+            )
+        elif col_idx == 2:
+            if vd.layers is not None:
+                raw_layers = vd.layers.astype(np.float32)
+                valid = raw_layers[raw_layers < 99]
+                max_layers = int(np.nanmax(valid)) if valid.size else 1
+                return vd.colors_by_array(
+                    raw_layers, self.availableColormaps[self.colormap], 1.0, float(max_layers)
+                )
+            values = np.zeros(vd.n_centroids, dtype=np.float32)
+        elif col_idx == 3:
+            values = np.arange(vd.n_centroids, dtype=np.float32)
+        elif col_idx == 6:
+            values = (
+                vd.site_numbers.astype(np.float32)
+                if vd.site_numbers is not None
+                else np.arange(vd.n_centroids, dtype=np.float32)
+            )
+        elif col_idx == 7:
+            values = (
+                vd.energies.astype(np.float32)
+                if vd.energies is not None
+                else np.arange(vd.n_centroids, dtype=np.float32)
+            )
         else:
-            axis_vis = xyz[:, col_idx].astype(np.float32)
+            values = np.arange(vd.n_centroids, dtype=np.float32)
 
-        if col_idx == 2:
-            min_val, max_val = 1.0, float(max_layers)
-        else:
-            min_val = float(np.nanmin(axis_vis))
-            max_val = float(np.nanmax(axis_vis))
-
-        range_val = max_val - min_val if max_val != min_val else 1.0
-        normalized = (axis_vis - min_val) / range_val
-        return self.availableColormaps[self.colormap](normalized)[:, :3].astype(np.float32)
+        return vd.colors_by_array(values, self.availableColormaps[self.colormap])
 
     def _docking_centroid_colors(self) -> np.ndarray:
         """Return (N, 3) float32 colours for docking centroids based on color_by."""
@@ -1781,30 +1813,36 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_docking_sphere_view(self):
         """Upload docking data to the sphere renderer for the Docking style."""
-        if self._docking_data is None or self._docking_data.empty:
-            # Clear the sphere renderer so nothing is drawn
+        vd = self._visual_data
+        if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
             return
-        coords = self._docking_data.coords.astype(np.float32)
-        colors = self._docking_centroid_colors()
-        n = len(coords)
-        selected = np.zeros((n, 1), dtype=np.float32)
-        varray = np.concatenate([coords, colors, selected], axis=1).astype(np.float32)
+        if self.color_by == "Atom Type":
+            colors = vd.colors_by_array(
+                vd.mol_types.astype(np.float32), self.availableColormaps[self.colormap]
+            )
+        else:
+            colors = vd.colors_by_shell(
+                self._docking_data.SHELL_COLORS, self._docking_shell_color_overrides
+            )
+        varray = vd.sphere_vertices(colors)
         self.sphere_renderer.setPoints(varray)
         if not self.viewInitialized:
-            self.camera.fitToObject(coords)
+            self.camera.fitToObject(vd.centroids)
             self.viewInitialized = True
         self._emit_docking_legend()
 
     # ------------------------------------------------------------------ docking
     def set_docking_data(self, docking_data):
         """Store docking data and refresh the view if a docking style is active."""
-        if docking_data is not None and not docking_data.empty:
-            # Centre coords at the world origin so that camera target (0,0,0)
-            # is always the object centre — orbit and zoom then work correctly.
-            docking_data.raw[:, 3:6] -= docking_data.raw[:, 3:6].mean(axis=0)
         self._docking_data = docking_data
+        if docking_data is not None and not docking_data.empty:
+            self._visual_data = VisualData.from_docking(
+                docking_data, self._mol_templates, self._mol_crystallography
+            )
+        else:
+            self._visual_data = None
         if self.style in ("Docking", "Docking Atoms"):
             self.initGeometry()
         self.update()
@@ -1814,124 +1852,75 @@ class VisualisationWidget(QOpenGLWidget):
         """Store a Checkpoint object and refresh if a Checkpoint style is active."""
         self._checkpoint = checkpoint
         if checkpoint is not None:
-            coords = checkpoint.to_cartesian()
-            if len(coords) > 0:
-                self._checkpoint_center = coords.mean(axis=0)
-                self._checkpoint_coords = (coords - self._checkpoint_center).astype(np.float64)
-            else:
+            cryst = checkpoint.crystallography or self._mol_crystallography
+            if cryst is not None:
+                self._visual_data = VisualData.from_checkpoint(
+                    checkpoint, cryst, self._mol_templates
+                )
+                # Keep legacy coords for any code still referencing them
+                self._checkpoint_coords = self._visual_data.centroids
                 self._checkpoint_center = np.zeros(3, dtype=np.float64)
+            else:
                 self._checkpoint_coords = np.zeros((0, 3), dtype=np.float64)
+                self._checkpoint_center = np.zeros(3, dtype=np.float64)
         else:
-            self._checkpoint_center = None
             self._checkpoint_coords = None
+            self._checkpoint_center = None
+            self._visual_data = None
         if self.style in ("Checkpoint", "Checkpoint Atoms"):
             self.initGeometry()
         self.update()
 
     def _update_checkpoint_view(self):
         """Upload checkpoint grid points to the sphere renderer."""
-        if self._checkpoint_coords is None or len(self._checkpoint_coords) == 0:
+        vd = self._visual_data
+        if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
             return
-        coords = self._checkpoint_coords.astype(np.float32)
-        n = len(coords)
-        if self.color_by == "Z Layer":
-            z = coords[:, 2]
-            z_min, z_max = z.min(), z.max()
-            t = (z - z_min) / (z_max - z_min + 1e-9)
-            colors = np.stack([t, np.zeros(n, dtype=np.float32), 1.0 - t], axis=1).astype(
-                np.float32
-            )
-        else:
-            colors = np.tile(np.array([0.2, 0.6, 1.0], dtype=np.float32), (n, 1))
-        selected = np.zeros((n, 1), dtype=np.float32)
-        varray = np.concatenate([coords, colors, selected], axis=1).astype(np.float32)
+        colors = vd.colors_by_z() if self.color_by == "Z Layer" else vd.colors_uniform([0.2, 0.6, 1.0])
+        varray = vd.sphere_vertices(colors)
+        mask = self._slice_centroid_mask(vd.centroids)
+        if mask is not None:
+            varray = varray[mask]
         self.sphere_renderer.setPoints(varray)
         if not self.viewInitialized:
-            self.camera.fitToObject(coords)
+            self.camera.fitToObject(vd.centroids)
             self.viewInitialized = True
 
     def _update_checkpoint_atom_view(self):
         """Build atom/bond instances from checkpoint grid + mol templates and upload to GPU."""
-        if self._checkpoint is None:
+        vd = self._visual_data
+        if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
                 self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
             if self.bond_renderer is not None:
                 self.bond_renderer.setBonds(None)
             return
-
-        cryst = self._checkpoint.crystallography or self._mol_crystallography
-        if cryst is None or not self._mol_cart_templates:
-            logger.warning("Checkpoint Atoms: no crystallography or mol templates available")
+        if not vd.templates:
+            logger.warning("Checkpoint Atoms: no mol templates available")
             return
 
         use_atom_colors = self.color_by == "Atom"
-        tile_palette = cm.tab10(np.linspace(0, 1, max(self._checkpoint.n_tiles, 1)))[:, :3]
-        center = self._checkpoint_center if self._checkpoint_center is not None else np.zeros(3)
+        if use_atom_colors:
+            centroid_colors = None
+        else:
+            n_tiles = self._checkpoint.n_tiles if self._checkpoint else 1
+            tile_palette = cm.tab10(np.linspace(0, 1, max(n_tiles, 1)))[:, :3].astype(np.float32)
+            centroid_colors = vd.colors_by_tile(tile_palette)
 
-        atom_chunks = []
-        bond_chunks = []
-        bond_r = self._bond_radius
+        atom_arr, bond_arr = vd.atom_vertices(
+            centroid_colors=centroid_colors,
+            use_atom_colors=use_atom_colors,
+            color_overrides=self._atom_color_overrides or None,
+            radius_overrides=self._atom_radius_overrides or None,
+            bond_radius=self._bond_radius,
+            slice_planes=self._active_slice_planes() or None,
+        )
 
-        for t in range(self._checkpoint.n_tiles):
-            mol_type = t + 1
-            tmpl = self._mol_cart_templates.get(mol_type)
-            if tmpl is None:
-                continue
-
-            mask = self._checkpoint.data[..., t]  # (a, b, c)
-            indices = np.argwhere(mask).astype(float)  # (N, 3)
-            if len(indices) == 0:
-                continue
-
-            # (N, 3) centroid positions in Cartesian Å, centred
-            cart_positions = (cryst.frac_to_cart(indices) - center).astype(np.float32)
-            N = len(cart_positions)
-
-            tmpl_cart = tmpl["cart"]  # (M, 3)
-            M = len(tmpl_cart)
-
-            if use_atom_colors:
-                colors, radii = self._resolved_atom_colors_radii(tmpl)
-            else:
-                tile_rgb = tile_palette[t % len(tile_palette)].astype(np.float32)
-                colors = np.tile(tile_rgb, (M, 1)).astype(np.float32)
-                radii = tmpl["radii"].copy()
-
-            # Vectorised: broadcast all N centroids over M atoms at once.
-            # offsets: (N, 3); tmpl_cart: (M, 3) -> all_atom_pos: (N, M, 3)
-            offsets = cart_positions - tmpl["centroid"]          # (N, 3)
-            all_atom_pos = tmpl_cart + offsets[:, None, :]       # (N, M, 3)
-            flat_pos = all_atom_pos.reshape(N * M, 3)            # (N*M, 3)
-
-            colors_tiled = np.tile(colors, (N, 1))               # (N*M, 3)
-            radii_tiled = np.tile(radii, N)                      # (N*M,)
-            sel_col = np.zeros((N * M, 1), dtype=np.float32)
-
-            atom_chunks.append(
-                np.hstack([flat_pos, colors_tiled, sel_col, radii_tiled[:, None]])
-            )
-
-            # One pass per unique bond pair (typically just a handful per mol type)
-            r_col = np.full((N, 1), bond_r, dtype=np.float32)
-            for a1, a2 in tmpl["bonds"]:
-                if a1 >= M or a2 >= M:
-                    continue
-                p1 = all_atom_pos[:, a1, :]                      # (N, 3)
-                p2 = all_atom_pos[:, a2, :]                      # (N, 3)
-                mid = (p1 + p2) * 0.5
-                c1 = np.broadcast_to(colors[a1], (N, 3))
-                c2 = np.broadcast_to(colors[a2], (N, 3))
-                bond_chunks.append(np.hstack([p1, mid, c1, r_col]))
-                bond_chunks.append(np.hstack([mid, p2, c2, r_col]))
-
-        if not atom_chunks:
+        if len(atom_arr) == 0:
             logger.warning("Checkpoint Atoms: no instances generated — check tile/template mapping")
             return
-
-        atom_arr = np.vstack(atom_chunks).astype(np.float32)
-        bond_arr = np.vstack(bond_chunks).astype(np.float32) if bond_chunks else None
 
         if not self.viewInitialized:
             self.camera.fitToObject(atom_arr[:, :3])
@@ -1953,7 +1942,7 @@ class VisualisationWidget(QOpenGLWidget):
         if self.style not in ("Checkpoint", "Checkpoint Atoms"):
             new_style = "Checkpoint"
         elif self.style == "Checkpoint":
-            new_style = "Checkpoint Atoms" if self._mol_cart_templates else "Spheres"
+            new_style = "Checkpoint Atoms" if (self._visual_data and self._visual_data.templates) else "Spheres"
         else:
             new_style = "Spheres"
         self.style = new_style
@@ -1963,64 +1952,40 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_docking_atom_view(self):
         """Build atom/bond instances from docking centroids and upload to GPU."""
-        if self._docking_data is None or self._docking_data.empty:
+        vd = self._visual_data
+        if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
                 self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
             if self.bond_renderer is not None:
                 self.bond_renderer.setBonds(None)
             return
-        if self._mol_crystallography is None or not self._mol_cart_templates:
+        if not vd.templates:
             logger.warning("Docking Atoms requested but no molecular data available")
             return
 
-        a = self._a_axis()
-        mol_types = self._docking_data.mol_types
-        # Docking coords are in XYZ units (same space as crystal); scale to Cartesian Å
-        cart_positions = (self._docking_data.coords.astype(np.float64) * a).astype(np.float32)
-        shells = self._docking_data.shells
-
-        atom_instances = []
-        bond_instances = []
-        bond_r = self._bond_radius
-
-        # Pre-compute per-centroid colors for non-Atom modes
         use_atom_colors = self.color_by == "Atom"
-        centroid_colors = None if use_atom_colors else self._docking_centroid_colors()
+        if use_atom_colors:
+            centroid_colors = None
+        elif self.color_by == "Atom Type":
+            centroid_colors = vd.colors_by_array(
+                vd.mol_types.astype(np.float32), self.availableColormaps[self.colormap]
+            )
+        else:
+            centroid_colors = vd.colors_by_shell(
+                self._docking_data.SHELL_COLORS, self._docking_shell_color_overrides
+            )
 
-        for i, (mol_type, centroid_pos, shell) in enumerate(zip(mol_types, cart_positions, shells)):
-            tmpl = self._mol_cart_templates.get(mol_type)
-            if tmpl is None:
-                continue
+        atom_arr, bond_arr = vd.atom_vertices(
+            centroid_colors=centroid_colors,
+            use_atom_colors=use_atom_colors,
+            color_overrides=self._atom_color_overrides or None,
+            radius_overrides=self._atom_radius_overrides or None,
+            bond_radius=self._bond_radius,
+        )
 
-            if use_atom_colors:
-                colors, radii = self._resolved_atom_colors_radii(tmpl)
-            else:
-                centroid_color = centroid_colors[i]  # (3,)
-                colors = np.tile(centroid_color, (len(tmpl["cart"]), 1))
-                radii = tmpl["radii"].copy()
-
-            offset = centroid_pos - tmpl["centroid"]
-            atom_positions = tmpl["cart"] + offset
-
-            sel_col = np.zeros((len(atom_positions), 1), dtype=np.float32)
-            block = np.hstack([atom_positions, colors, sel_col, radii[:, None]])
-            atom_instances.append(block)
-
-            for a1, a2 in tmpl["bonds"]:
-                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
-                    continue
-                p1 = atom_positions[a1]
-                p2 = atom_positions[a2]
-                mid = (p1 + p2) * 0.5
-                bond_instances.append(np.concatenate([p1, mid, colors[a1], [bond_r]]))
-                bond_instances.append(np.concatenate([mid, p2, colors[a2], [bond_r]]))
-
-        if not atom_instances:
+        if len(atom_arr) == 0:
             logger.warning("No docking atom instances generated")
             return
-
-        atom_arr = np.vstack(atom_instances).astype(np.float32)
-        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
 
         if not self.viewInitialized:
             self.camera.fitToObject(atom_arr[:, :3])
@@ -2130,63 +2095,35 @@ class VisualisationWidget(QOpenGLWidget):
     # ------------------------------------------------------------------
 
     def set_molecular_data(self, mol_templates, crystallography):
-        """Store molecule templates and the crystallography object for frac→cart conversion.
-
-        Parameters
-        ----------
-        mol_templates : dict[int, MolTemplate]
-            Keyed by molecule type (column 0 in the XYZ data).
-        crystallography : Crystallography
-            Used to convert fractional coordinates to Cartesian.
-        """
+        """Store molecule templates and rebuild VisualData with correct scaling and templates."""
         self._mol_templates = mol_templates
         self._mol_crystallography = crystallography
-        self._mol_cart_templates = {}
 
-        # Pre-scale centroid coordinates to Cartesian Å now that we have the unit cell.
-        # This is done once: if _coord_scale is already set, the incoming XYZ are already
-        # in Å and no further rescaling is needed.
-        a = self._a_axis()
-        scale_applied = False
-        if a > 1e-10 and a != 1.0 and self._coord_scale == 1.0:
-            self._coord_scale = a
-            if self.xyz is not None:
-                self.xyz = self.xyz.copy().astype(np.float64)
-                self.xyz[:, 3:6] *= a
-                scale_applied = True
-            logger.info("Centroid coordinates pre-scaled to Cartesian Å (a=%.4f Å)", a)
-
-        if mol_templates and crystallography:
-            self._precompute_mol_templates()
         if crystallography is not None and self.unit_cell_renderer is not None:
             self.unit_cell_renderer.set_cell(crystallography)
 
-        # Refresh the viewport so the first display uses scaled coordinates.
-        # Reset viewInitialized so fitToObject runs again with the correctly scaled coords.
-        if scale_applied:
-            self.viewInitialized = False
-            self.initGeometry()
+        if self._visual_data is None:
+            return
 
-    def _precompute_mol_templates(self):
-        """Convert template fractional coords to Cartesian and compute centroids."""
-        from ...utils.periodic_table import get_atom_color, get_atom_radius
+        match self._visual_data.source:
+            case "xyz" if self._visual_data._raw is not None:
+                self._visual_data = VisualData.from_xyz(
+                    self._visual_data._raw, mol_templates, crystallography
+                )
+            case "docking" if self._docking_data is not None:
+                self._visual_data = VisualData.from_docking(
+                    self._docking_data, mol_templates, crystallography
+                )
+            case "checkpoint" if self._checkpoint is not None:
+                cryst = self._checkpoint.crystallography or crystallography
+                self._visual_data = VisualData.from_checkpoint(
+                    self._checkpoint, cryst, mol_templates
+                )
+            case _:
+                return
 
-        for mol_type, tmpl in self._mol_templates.items():
-            if not tmpl.atoms:
-                continue
-            frac = np.array([a.frac for a in tmpl.atoms], dtype=np.float64)
-            cart = self._mol_crystallography.frac_to_cart(frac).astype(np.float32)
-            centroid = cart.mean(axis=0)
-            colors = np.array([get_atom_color(a.symbol) for a in tmpl.atoms], dtype=np.float32)
-            radii = np.array([get_atom_radius(a.symbol) for a in tmpl.atoms], dtype=np.float32)
-            self._mol_cart_templates[mol_type] = {
-                "cart": cart,  # (N_atoms, 3)
-                "centroid": centroid,  # (3,)
-                "colors": colors,  # (N_atoms, 3)
-                "radii": radii,  # (N_atoms,)
-                "bonds": tmpl.bonds,  # list[(i, j)] 0-based
-                "symbols": [a.symbol for a in tmpl.atoms],  # list[str]
-            }
+        self.viewInitialized = False
+        self.initGeometry()
 
     def _resolved_atom_colors_radii(self, tmpl: dict) -> tuple[np.ndarray, np.ndarray]:
         """Return (colors, radii) arrays for a template, with any user overrides applied."""
@@ -2202,105 +2139,33 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_atom_view(self):
         """Compute atom and bond instances from current centroids and upload to GPU."""
-        if self._mol_crystallography is None or not self._mol_cart_templates:
+        vd = self._visual_data
+        if vd is None or vd.n_centroids == 0:
+            if self.atom_renderer is not None:
+                self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
+            if self.bond_renderer is not None:
+                self.bond_renderer.setBonds(None)
+            return
+        if not vd.templates:
             logger.warning("Atom view requested but no molecular data available")
             return
-        if self.xyz is None:
-            return
 
-        atom_instances = []  # each row: [x,y,z, r,g,b, selected, vdw_radius]
-        bond_instances = []  # each row: [sx,sy,sz, ex,ey,ez, r,g,b, cyl_radius]
-
-        bond_r = self._bond_radius  # Ångströms, set directly by dialog
-
-        mol_types = self.xyz[:, 0].astype(int)
-        # Coordinates are pre-scaled to Cartesian Å by pass_XYZ / set_molecular_data.
-        cart_positions = self.xyz[:, 3:6].astype(np.float32)
-
-        # Pre-compute per-centroid colormap colours for non-Atom modes
         use_atom_colors = self.color_by == "Atom"
-        centroid_colors = None if use_atom_colors else self._centroid_colormap_colors(self.xyz)
+        centroid_colors = None if use_atom_colors else self._centroid_colormap_colors()
 
-        # Precompute active slice planes in Cartesian Å space.
-        slice_planes = []
-        for plane in self._raw_planes:
-            if not plane.slice_enabled:
-                continue
-            normal = np.array(plane.normal, dtype=np.float64)
-            if plane.fractional and self._planes_crystallography is not None:
-                normal = self._planes_crystallography.frac_to_cart(normal[None])[0]
-            n_len = np.linalg.norm(normal)
-            if n_len < 1e-9:
-                continue
-            normal /= n_len
-            origin = np.array(plane.origin, dtype=np.float64)  # already in Å
-            slice_planes.append((normal, origin, plane.slice_two_sided, plane.slice_thickness))
+        atom_arr, bond_arr = vd.atom_vertices(
+            centroid_colors=centroid_colors,
+            use_atom_colors=use_atom_colors,
+            color_overrides=self._atom_color_overrides or None,
+            radius_overrides=self._atom_radius_overrides or None,
+            bond_radius=self._bond_radius,
+            selected_indices=self._selected_points or None,
+            slice_planes=self._active_slice_planes() or None,
+        )
 
-        for i, (mol_type, centroid_pos) in enumerate(zip(mol_types, cart_positions)):
-            tmpl = self._mol_cart_templates.get(mol_type)
-            if tmpl is None:
-                continue
-
-            # Apply slice planes: filter by molecule centroid position.
-            if slice_planes:
-                skip = False
-                pos_f64 = centroid_pos.astype(np.float64)
-                for normal, origin, two_sided, thickness in slice_planes:
-                    d = np.dot(pos_f64 - origin, normal)
-                    if two_sided:
-                        if abs(d) > thickness / 2.0:
-                            skip = True
-                            break
-                    else:
-                        if d < -thickness:
-                            skip = True
-                            break
-                if skip:
-                    continue
-
-            if use_atom_colors:
-                colors, radii = self._resolved_atom_colors_radii(tmpl)
-            else:
-                centroid_color = centroid_colors[i]  # (3,)
-                colors = np.tile(centroid_color, (len(tmpl["cart"]), 1))
-                radii = tmpl["radii"].copy()
-
-            # Shift template atoms so their centroid sits on centroid_pos (both in Cartesian)
-            offset = centroid_pos - tmpl["centroid"]
-            atom_positions = tmpl["cart"] + offset  # (N_atoms, 3)
-
-            sel = 1.0 if i in self._selected_points else 0.0
-            sel_col = np.full((len(atom_positions), 1), sel, dtype=np.float32)
-
-            # [x,y,z, r,g,b, selected, radius]
-            block = np.hstack(
-                [
-                    atom_positions,  # (N,3)
-                    colors,  # (N,3)
-                    sel_col,  # (N,1)
-                    radii[:, None],  # (N,1)
-                ]
-            )
-            atom_instances.append(block)
-
-            # Bonds: two half-cylinders per bond
-            for a1, a2 in tmpl["bonds"]:
-                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
-                    continue
-                p1 = atom_positions[a1]
-                p2 = atom_positions[a2]
-                mid = (p1 + p2) * 0.5
-                c1 = colors[a1]
-                c2 = colors[a2]
-                bond_instances.append(np.concatenate([p1, mid, c1, [bond_r]]))
-                bond_instances.append(np.concatenate([mid, p2, c2, [bond_r]]))
-
-        if not atom_instances:
+        if len(atom_arr) == 0:
             logger.warning("No atom instances generated — check molecule type mapping")
             return
-
-        atom_arr = np.vstack(atom_instances).astype(np.float32)
-        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
 
         if not self.viewInitialized:
             self.camera.fitToObject(atom_arr[:, :3])
@@ -2312,7 +2177,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_unit_cell_view(self):
         """Render the template molecules at their unit-cell positions (no crystal replication)."""
-        if not self._mol_cart_templates:
+        if not (self._visual_data and self._visual_data.templates):
             logger.warning("Unit cell view requested but no molecular data available")
             return
 
@@ -2320,7 +2185,7 @@ class VisualisationWidget(QOpenGLWidget):
         bond_instances = []
         bond_r = self._bond_radius
 
-        for tmpl in self._mol_cart_templates.values():
+        for tmpl in self._visual_data.templates.values():
             colors, radii = self._resolved_atom_colors_radii(tmpl)
             atom_positions = tmpl["cart"]  # already in Cartesian, no offset
 
@@ -2402,8 +2267,10 @@ class VisualisationWidget(QOpenGLWidget):
 
     def get_visible_elements(self) -> list[str]:
         """Return sorted list of unique element symbols in the currently loaded templates."""
+        if not (self._visual_data and self._visual_data.templates):
+            return []
         symbols: set[str] = set()
-        for tmpl in self._mol_cart_templates.values():
+        for tmpl in self._visual_data.templates.values():
             symbols.update(tmpl.get("symbols", []))
         return sorted(symbols)
 
@@ -2413,7 +2280,9 @@ class VisualisationWidget(QOpenGLWidget):
         Each pair is stored in sorted order so ('C','H') not ('H','C').
         """
         counts: dict[tuple[str, str], int] = {}
-        for tmpl in self._mol_cart_templates.values():
+        if not (self._visual_data and self._visual_data.templates):
+            return counts
+        for tmpl in self._visual_data.templates.values():
             syms = tmpl.get("symbols", [])
             for a1, a2 in tmpl.get("bonds", []):
                 if a1 < len(syms) and a2 < len(syms):
@@ -2445,6 +2314,9 @@ class VisualisationWidget(QOpenGLWidget):
         self.style = "Atoms" if self.style != "Atoms" else "Spheres"
         self.styleChanged.emit(self.style)
         self._rescale_camera_for_style(old_style, self.style)
+        opts, default = self._color_by_options_for_style(self.style)
+        if self.color_by not in opts:
+            self.color_by = default
         self.initGeometry()
 
     def draw(self, gl):

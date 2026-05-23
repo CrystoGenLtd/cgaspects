@@ -84,14 +84,14 @@ def emit_error_on_exception(run_method):
 
 
 class WorkerXYZ(CancellableRunnable):
-    def __init__(self, xyz):
+    def __init__(self, centroids):
         super().__init__()
-        self.xyz = xyz
+        self.centroids = centroids
         self.analyser = ShapeAnalyser()
 
     @Slot()
     def run(self):
-        shape_info = self.analyser.shape_info(self.xyz[:, 3:6])
+        shape_info = self.analyser.shape_info(self.centroids)
         if self.is_cancelled:
             self.signals.cancelled.emit()
             self.signals.finished.emit()

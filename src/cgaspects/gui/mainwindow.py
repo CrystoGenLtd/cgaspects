@@ -1307,7 +1307,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return self.crystal
 
     def update_XYZ_info(self, xyz):
-        if xyz is None or xyz.size == 0 or xyz.ndim < 2 or xyz.shape[1] < 6:
+        if xyz is None or xyz.ndim < 2 or xyz.shape[0] == 0 or xyz.shape[1] < 3:
             self.crystal_info.aspectRatio1 = None
             self.crystal_info.aspectRatio2 = None
             self.crystal_info.shapeClass = "N/A"
@@ -1318,16 +1318,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.crystalInfoChanged.emit(self.crystal_info)
             return
 
+        vd = self.openglwidget._visual_data
         style = self.openglwidget.style
-        if style in self.openglwidget._ATOM_STYLES:
-            templates = self.openglwidget._mol_cart_templates or {}
-            mol_types = xyz[:, 0].astype(int)
-            self.crystal_info.pointCount = int(sum(
-                len(templates[mt]["cart"]) for mt in mol_types if mt in templates
-            )) or len(xyz)
+        if style in self.openglwidget._ATOM_STYLES and vd is not None and vd.templates:
+            self.crystal_info.pointCount = vd.n_atoms or vd.n_centroids
             self.crystal_info.countLabel = "Atoms"
         else:
-            self.crystal_info.pointCount = len(xyz)
+            self.crystal_info.pointCount = xyz.shape[0]
             self.crystal_info.countLabel = "Points"
 
         worker_xyz = WorkerXYZ(xyz)
@@ -1926,6 +1923,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._prev_style = style
             current_settings = self.visualizationSettings.settings()
             self._update_color_by_options_for_style(style, current_settings)
+
+        # Update crystal info count when switching between atom and sphere/point modes
+        vd = self.openglwidget._visual_data
+        if vd is not None and vd.n_centroids > 0:
+            if style in self.openglwidget._ATOM_STYLES and vd.templates:
+                self.crystal_info.pointCount = vd.n_atoms or vd.n_centroids
+                self.crystal_info.countLabel = "Atoms"
+            else:
+                self.crystal_info.pointCount = vd.n_centroids
+                self.crystal_info.countLabel = "Points"
+            self.crystalInfoChanged.emit(self.crystal_info)
 
         # If switching into a molecular style and the dialog is already open, refresh it
         if is_mol_style and self.atom_mode_settings_dialog.isVisible():
