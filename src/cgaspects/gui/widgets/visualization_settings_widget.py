@@ -277,8 +277,8 @@ class VisualizationSettingsWidget(QWidget):
         layout.setSpacing(5)
         self.widgets = {}
 
-        w = LabelledDoubleSlider("Point Size", vrange=(0.5, 20.0), steps=20, parent=self)
-        w.setValue(6.0)
+        w = LabelledDoubleSlider("Point Size", vrange=(0.5, 30.0), steps=30, parent=self)
+        w.setValue(20.0)
 
         self.widgets["Point Size"] = w
         w.valueChanged.connect(self.settingsChanged)
@@ -329,7 +329,6 @@ class VisualizationSettingsWidget(QWidget):
                 "Points",
                 "Convex Hull",
                 "Atoms",
-                "Unit Cell",
                 "Docking",
                 "Docking Atoms",
                 "Checkpoint",
@@ -337,10 +336,6 @@ class VisualizationSettingsWidget(QWidget):
             ),
         )
         self.widgets["Style"] = w
-        w.valueChanged.connect(self.settingsChanged)
-
-        w = LabelledCheckBox("Show Mesh Edges", False)
-        self.widgets["Show Mesh Edges"] = w
         w.valueChanged.connect(self.settingsChanged)
 
         w = LabelledDoubleSlider("Frame Rate", vrange=(0.5, 50), steps=50, parent=self)

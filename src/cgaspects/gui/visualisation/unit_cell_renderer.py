@@ -158,6 +158,22 @@ class UnitCellRenderer:
 
     # ------------------------------------------------------------------
 
+    def set_lines(self, vertices: np.ndarray) -> None:
+        """Upload arbitrary coloured line segments.
+
+        Parameters
+        ----------
+        vertices : float32 array, shape (N*2, 6) or length N*12 flattened
+            Each consecutive pair of rows defines one segment:
+            [x, y, z, r, g, b] for start vertex, then the same for end vertex.
+        """
+        self._vertices = np.asarray(vertices, dtype=np.float32).flatten()
+        self.vbo.bind()
+        self.vao.bind()
+        self.vbo.allocate(self._vertices.tobytes(), self._vertices.nbytes)
+        self.vao.release()
+        self.vbo.release()
+
     def set_cell(self, crystallography):
         """Upload the 12 unit-cell edges derived from *crystallography*.
 

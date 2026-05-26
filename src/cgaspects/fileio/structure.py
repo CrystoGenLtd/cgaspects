@@ -4,7 +4,8 @@ import logging
 
 import numpy as np
 
-from ..gui.utils.crystallography import Cell
+from ..gui.utils.crystallography import Cell, Crystallography
+from ..utils.periodic_table import get_cov_radius
 
 logger = logging.getLogger("CGA:Structure")
 
@@ -29,6 +30,7 @@ class Structure:
 
     filepath: Path
     cell: Cell | None
+    cryst: Crystallography | None
     templates: dict[int, MolTemplate] = field(default_factory=dict)
 
     @classmethod
@@ -37,40 +39,31 @@ class Structure:
         file_path = Path(file_path)
         if not file_path.exists():
             logger.warning("Structure file not found: %s", file_path)
-            return cls(filepath=file_path, cell=None)
+            return cls(filepath=file_path, cell=None, cryst=None)
 
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
         except OSError as e:
             logger.error("Error reading structure file %s: %s", file_path, e)
-            return cls(filepath=file_path, cell=None)
+            return cls(filepath=file_path, cell=None, cryst=None)
 
         non_prim_idx = next((i for i, ln in enumerate(lines) if "Non primitive data" in ln), None)
 
         cell = _parse_cell(lines, non_prim_idx, file_path.name)
+        cryst = Crystallography(cell) if cell is not None else None
         templates = _parse_templates(lines, non_prim_idx, file_path.name)
 
-        return cls(filepath=file_path, cell=cell, templates=templates)
+        if cryst is not None:
+            for tmpl in templates.values():
+                if not tmpl.bonds:
+                    tmpl.bonds = _infer_bonds(tmpl.atoms, cryst)
+
+        return cls(filepath=file_path, cell=cell, cryst=cryst, templates=templates)
 
     @property
     def n_tiles(self):
         return len(self.templates)
-
-
-def _parse_tiles_number(lines: list[str]) -> int:
-    """Return the number of tile types — the second non-blank line of the file."""
-    non_blank_count = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        non_blank_count += 1
-        if non_blank_count == 2:
-            try:
-                return int(line.strip())
-            except ValueError:
-                return 0
-    return 0
 
 
 def _parse_cell(lines: list[str], non_prim_idx: int | None, filename: str = "") -> Cell | None:
@@ -157,6 +150,21 @@ def _parse_atoms(lines: list[str], i: int, n_atoms: int) -> tuple[list[MolAtom],
             )
         i += 1
     return atoms, i
+
+
+def _infer_bonds(atoms: list[MolAtom], cryst: Crystallography) -> list[tuple[int, int]]:
+    """Infer intramolecular bonds via covalent-radius cutoff: dist < (r_A + r_B) * 1.3."""
+    if not atoms:
+        return []
+    cart = cryst.frac_to_cart(np.array([a.frac for a in atoms]))
+    radii = np.array([get_cov_radius(a.symbol) for a in atoms])
+    bonds: list[tuple[int, int]] = []
+    for i in range(len(atoms)):
+        for j in range(i + 1, len(atoms)):
+            if np.linalg.norm(cart[i] - cart[j]) < (radii[i] + radii[j]) * 1.3:
+                bonds.append((i, j))
+    logger.debug("Inferred %d bonds for %d atoms", len(bonds), len(atoms))
+    return bonds
 
 
 def _parse_bonds(lines: list[str], i: int, n_bonds: int) -> tuple[list[tuple[int, int]], int]:

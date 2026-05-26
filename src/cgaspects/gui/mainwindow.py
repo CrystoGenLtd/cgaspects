@@ -48,6 +48,7 @@ from .dialogs.lattice_dialog import LatticeParametersDialog
 from .dialogs.planes_dialog import PlanesDialog
 from .dialogs.settings import SettingsDialog
 from .dialogs.site_highlight_dialog import SiteHighlightDialog
+from .dialogs.unit_cell_viewer_dialog import UnitCellViewerDialog
 from .load_ui import Ui_MainWindow
 from .shortcuts_manager import ShortcutsManager
 from .utils.crystallography import Crystallography
@@ -218,6 +219,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.atom_mode_settings_dialog.settingsChanged.connect(self._handle_atom_mode_settings)
         self.openglwidget.styleChanged.connect(self._on_style_changed)
 
+        # Create unit cell viewer dialog (Tools menu)
+        self.unit_cell_viewer_dialog = UnitCellViewerDialog(parent=self)
+
         # Create site highlighting dialog
         self.site_highlight_dialog = SiteHighlightDialog(parent=self)
         self.site_highlight_dialog.highlightsChanged.connect(self.handle_highlights_changed)
@@ -379,6 +383,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionShowLegend.triggered.connect(self.show_colour_legend)
         self.menuView.addAction(self.actionShowLegend)
 
+        # Add Show Mesh Edges toggle to View menu (only enabled in Convex Hull mode)
+        self.actionShowMeshEdges = QAction("Show Mesh Edges", self)
+        self.actionShowMeshEdges.setObjectName("actionShowMeshEdges")
+        self.actionShowMeshEdges.setEnabled(False)
+        self.actionShowMeshEdges.setToolTip(
+            "Toggle wireframe edges on the convex hull mesh (Convex Hull mode only)"
+        )
+        self.actionShowMeshEdges.triggered.connect(self.openglwidget.toggle_mesh_edges)
+        self.menuView.addAction(self.actionShowMeshEdges)
+
         # ── Viewport shortcuts (configurable via ShortcutsManager) ────────────
         from PySide6.QtWidgets import QMenu
 
@@ -487,6 +501,21 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         menuPointSize.addAction(actDecrease)
         self.menuView.addMenu(menuPointSize)
 
+        menuBondRadius = QMenu("Bond Radius", self)
+        menuBondRadius.setEnabled(False)
+        self.menuBondRadius = menuBondRadius
+        actIncreaseBond = QAction("Increase", self)
+        actIncreaseBond.setObjectName("actionIncreaseBondRadius")
+        actIncreaseBond.setShortcut("Ctrl+Shift+=")
+        actIncreaseBond.triggered.connect(self.openglwidget.increase_bond_radius)
+        menuBondRadius.addAction(actIncreaseBond)
+        actDecreaseBond = QAction("Decrease", self)
+        actDecreaseBond.setObjectName("actionDecreaseBondRadius")
+        actDecreaseBond.setShortcut("Ctrl+Shift+-")
+        actDecreaseBond.triggered.connect(self.openglwidget.decrease_bond_radius)
+        menuBondRadius.addAction(actDecreaseBond)
+        self.menuView.addMenu(menuBondRadius)
+
         # Create Crystallography menu
 
         self.menuCrystallography = QMenu("Crystallography", self)
@@ -517,6 +546,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionAtomModeSettings.setEnabled(False)  # enabled only in Atom mode
         self.actionAtomModeSettings.triggered.connect(self.show_atom_mode_settings)
         self.menuCrystallography.addAction(self.actionAtomModeSettings)
+
+        self.menuCrystallography.addSeparator()
+
+        self.actionUnitCellViewer = QAction("Unit Cell Viewer", self)
+        self.actionUnitCellViewer.setToolTip(
+            "View the unit cell, molecule templates, and crystal net connections"
+        )
+        self.actionUnitCellViewer.triggered.connect(self.show_unit_cell_viewer)
+        self.menuCrystallography.addAction(self.actionUnitCellViewer)
 
         # Tools menu
         self.menuTools = QMenu("Tools", self)
@@ -669,6 +707,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._keyboard_shortcuts_dialog.raise_()
         self._keyboard_shortcuts_dialog.activateWindow()
 
+    def show_unit_cell_viewer(self):
+        """Open the Unit Cell / Net Viewer dialog (Tools menu)."""
+        self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
+        self.unit_cell_viewer_dialog.set_structure(self._structure, self.crystallography)
+        self.unit_cell_viewer_dialog.show()
+        self.unit_cell_viewer_dialog.raise_()
+
     def show_thread_monitor(self):
         from .dialogs.thread_monitor_dialog import ThreadMonitorDialog
 
@@ -712,6 +757,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 # Update crystallography dialogs
                 self.directions_dialog.set_crystallography(self.crystallography)
                 self.planes_dialog.set_crystallography(self.crystallography)
+                self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
 
                 self.log_message(
                     f"Axes converted to fractional coordinates using lattice parameters: "
@@ -1221,6 +1267,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if n_xyz == 0:
             self.log_message(f"{n_xyz} XYZ files found to set to self!", "warning")
         if n_xyz > 0:
+            self.set_batch_type()
             self.init_opengl()
 
             crystal_found = False
@@ -1239,7 +1286,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.openglwidget.showNoDataOverlay()
 
             self.aspect_ratio_pushButton.setEnabled(True)
-            self.set_batch_type()
             self.variablesTabWidget.setCurrentIndex(0)
             self.actionImport_Summary_File.setEnabled(True)
 
@@ -1437,6 +1483,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 # Update crystallography dialogs
                 self.directions_dialog.set_crystallography(self.crystallography)
                 self.planes_dialog.set_crystallography(self.crystallography)
+                self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
 
                 self.log_message(
                     f"Auto-loaded lattice parameters: a={cell.a:.2f} b={cell.b:.2f} c={cell.c:.2f}",
@@ -1447,6 +1494,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.openglwidget.set_molecular_data(
                     self._structure.templates, self.crystallography
                 )
+                self.unit_cell_viewer_dialog.set_structure(self._structure, self.crystallography)
                 self.log_message(
                     f"Loaded {len(self._structure.templates)} molecule template(s) — "
                     "press Shift+V to switch to Atom view",
@@ -1909,6 +1957,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Keep the Style combo, Color By combo, and Atom Mode Settings menu in sync with the active style."""
         is_mol_style = style in ("Atoms", "Unit Cell")
         self.actionAtomModeSettings.setEnabled(is_mol_style)
+
+        is_convex_hull = style == "Convex Hull"
+        self.actionShowMeshEdges.setEnabled(is_convex_hull)
+        if not is_convex_hull and self.openglwidget.show_mesh_edges:
+            self.openglwidget.show_mesh_edges = False
+            self.openglwidget.update()
+
+        is_atom_style = style in ("Atoms", "Docking Atoms", "Checkpoint Atoms")
+        self.menuBondRadius.setEnabled(is_atom_style)
         if style in ("Docking", "Docking Atoms"):
             self._load_docking_for_current_xyz()
         if style in self._CHECKPOINT_VIEW_STYLES:

@@ -17,8 +17,8 @@ class VisualData:
     rather than instantiating directly.
     """
 
-    centroids: np.ndarray       # (N, 3) float32 – Cartesian Å, centred
-    mol_types: np.ndarray       # (N,) int
+    centroids: np.ndarray  # (N, 3) float32 – Cartesian Å, centred
+    mol_types: np.ndarray  # (N,) int
 
     source: Literal["xyz", "docking", "checkpoint"] = "xyz"
 
@@ -95,6 +95,7 @@ class VisualData:
                 "bonds": tmpl.bonds,
                 "symbols": [a.symbol for a in tmpl.atoms],
             }
+
         return result
 
     # ------------------------------------------------------------------ counts
@@ -109,9 +110,7 @@ class VisualData:
         if not self.templates:
             return None
         count = sum(
-            len(self.templates[mt]["cart"])
-            for mt in self.mol_types
-            if mt in self.templates
+            len(self.templates[mt]["cart"]) for mt in self.mol_types if mt in self.templates
         )
         return count or None
 
@@ -235,9 +234,7 @@ class VisualData:
 
     def colors_uniform(self, rgb) -> np.ndarray:
         """(N, 3) float32 – solid colour for every centroid."""
-        return np.tile(
-            np.asarray(rgb, dtype=np.float32), (self.n_centroids, 1)
-        )
+        return np.tile(np.asarray(rgb, dtype=np.float32), (self.n_centroids, 1))
 
     def colors_by_z(self) -> np.ndarray:
         """(N, 3) float32 – blue-to-red gradient along Z (checkpoint layer view)."""
@@ -317,52 +314,88 @@ class VisualData:
         if not self.templates:
             return np.zeros((0, 8), dtype=np.float32), None
 
+        # Build slice keep-mask once (True = keep centroid).
+        if slice_planes:
+            slice_keep = np.array(
+                [not _centroid_clipped(c.astype(np.float64), slice_planes) for c in self.centroids],
+                dtype=bool,
+            )
+        else:
+            slice_keep = None
+
+        global_indices = np.arange(self.n_centroids)
         atom_chunks: list[np.ndarray] = []
         bond_chunks: list[np.ndarray] = []
 
-        for i, (mol_type, centroid) in enumerate(zip(self.mol_types, self.centroids)):
-            tmpl = self.templates.get(mol_type)
-            if tmpl is None:
+        for mol_type, tmpl in self.templates.items():
+            type_mask = self.mol_types == mol_type
+            keep = type_mask & slice_keep if slice_keep is not None else type_mask
+            if not keep.any():
                 continue
 
-            if slice_planes and _centroid_clipped(centroid.astype(np.float64), slice_planes):
-                continue
+            K = int(keep.sum())
+            A = len(tmpl["cart"])
+            type_global_idx = global_indices[keep]
+            centroids_k = self.centroids[keep]  # (K, 3)
+            offsets = centroids_k - tmpl["centroid"]  # (K, 3)
+            # atom positions: (K, A, 3) → (K*A, 3)
+            atom_pos_3d = tmpl["cart"][np.newaxis, :, :] + offsets[:, np.newaxis, :]
+            atom_pos_3d = atom_pos_3d.astype(np.float32)  # (K, A, 3)
+            atom_pos = atom_pos_3d.reshape(K * A, 3)  # (K*A, 3)
 
             if use_atom_colors:
-                colors, radii = _resolve_overrides(tmpl, color_overrides, radius_overrides)
+                base_colors, radii_arr = _resolve_overrides(tmpl, color_overrides, radius_overrides)
+                # broadcast template colors across all K molecules
+                colors_3d = (
+                    np.broadcast_to(base_colors[np.newaxis, :, :], (K, A, 3))
+                    .copy()
+                    .astype(np.float32)
+                )
             else:
-                colors = np.tile(
-                    centroid_colors[i], (len(tmpl["cart"]), 1)
-                ).astype(np.float32)
-                radii = tmpl["radii"].copy()
+                cc = centroid_colors[keep]  # (K, 3)
+                colors_3d = (
+                    np.broadcast_to(cc[:, np.newaxis, :], (K, A, 3)).copy().astype(np.float32)
+                )
+                radii_arr = tmpl["radii"].copy()
                 if radius_overrides:
                     for j, sym in enumerate(tmpl["symbols"]):
                         if sym in radius_overrides:
-                            radii[j] = radius_overrides[sym]
+                            radii_arr[j] = radius_overrides[sym]
 
-            offset = centroid - tmpl["centroid"]
-            atom_pos = (tmpl["cart"] + offset).astype(np.float32)
-            sel = 1.0 if selected_indices and i in selected_indices else 0.0
-            sel_col = np.full((len(atom_pos), 1), sel, dtype=np.float32)
-            atom_chunks.append(np.hstack([atom_pos, colors, sel_col, radii[:, None]]))
+            radii_arr = np.asarray(radii_arr, dtype=np.float32)
+            colors_flat = colors_3d.reshape(K * A, 3)  # (K*A, 3)
+            radii_ka = np.tile(radii_arr, K).reshape(K * A, 1)  # (K*A, 1)
+
+            if selected_indices:
+                sel_k = np.isin(type_global_idx, list(selected_indices)).astype(np.float32)
+            else:
+                sel_k = np.zeros(K, dtype=np.float32)
+            sel_ka = np.repeat(sel_k, A).reshape(K * A, 1)  # (K*A, 1)
+
+            atom_chunks.append(np.hstack([atom_pos, colors_flat, sel_ka, radii_ka]))
 
             for a1, a2 in tmpl["bonds"]:
-                if a1 >= len(atom_pos) or a2 >= len(atom_pos):
+                if a1 >= A or a2 >= A:
                     continue
-                p1, p2 = atom_pos[a1], atom_pos[a2]
-                mid = (p1 + p2) * 0.5
-                bond_chunks.append(np.concatenate([p1, mid, colors[a1], [bond_radius]]))
-                bond_chunks.append(np.concatenate([mid, p2, colors[a2], [bond_radius]]))
+                p1 = atom_pos_3d[:, a1, :]  # (K, 3)
+                p2 = atom_pos_3d[:, a2, :]  # (K, 3)
+                mid = (p1 + p2) * 0.5  # (K, 3)
+                c1 = colors_3d[:, a1, :]  # (K, 3)
+                c2 = colors_3d[:, a2, :]  # (K, 3)
+                br = np.full((K, 1), bond_radius, dtype=np.float32)
+                bond_chunks.append(np.hstack([p1, mid, c1, br]))
+                bond_chunks.append(np.hstack([mid, p2, c2, br]))
 
         if not atom_chunks:
             return np.zeros((0, 8), dtype=np.float32), None
 
         atom_arr = np.vstack(atom_chunks).astype(np.float32)
-        bond_arr = np.array(bond_chunks, dtype=np.float32) if bond_chunks else None
+        bond_arr = np.vstack(bond_chunks).astype(np.float32) if bond_chunks else None
         return atom_arr, bond_arr
 
 
 # ------------------------------------------------------------------ module helpers
+
 
 def _centroid_clipped(pos: np.ndarray, slice_planes: list) -> bool:
     """Return True if the centroid position should be excluded by any slice plane."""

@@ -37,17 +37,12 @@ class SphereRenderer(QOpenGLExtraFunctions):
           // Scale up selected points slightly for glow effect
           float scale = u_pointSize * 0.2 * (1.0 + selected * 0.15);
 
-          // to enable ellipsoids later keep this here for now
-          mat4 transform = mat4(
-            vec4(scale, 0, 0, 0),
-            vec4(0, scale, 0, 0),
-            vec4(0, 0, scale, 0),
-            vec4(position, 1.0));
-          mat4 normalTransform = inverse(transpose(transform));
-          vec4 posTransformed = transform * vec4(vertexPosition, 1);
+          // transform is uniform-scale + translate; its inverse-transpose reduces to
+          // (1/scale)*I3 — normalisation cancels the scale, leaving just vertexPosition.
+          vec3 pos = position + scale * vertexPosition;
 
-          v_normal = normalize(mat3(u_viewMat) * mat3(u_modelMat) * mat3(normalTransform) * vertexPosition);
-          v_position = posTransformed.xyz;
+          v_normal = normalize(mat3(u_viewMat) * mat3(u_modelMat) * vertexPosition);
+          v_position = pos;
           v_color = vec4(color, 1.0f);
           gl_Position = u_modelViewProjectionMat * vec4(v_position, 1.0);
         }

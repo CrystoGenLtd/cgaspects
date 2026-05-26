@@ -28,7 +28,6 @@ from .plane_renderer import PlaneRenderer
 from .point_cloud_renderer import SimplePointRenderer
 from .sphere_renderer import SphereRenderer
 from .sphere_selection_renderer import SphereSelectionRenderer
-from .unit_cell_renderer import UnitCellRenderer
 from .visual_data import VisualData
 
 logger = logging.getLogger("CA:OpenGL")
@@ -98,12 +97,11 @@ class VisualisationWidget(QOpenGLWidget):
         self._mol_crystallography = None  # Crystallography used to convert frac → cart
         self.atom_renderer = None
         self.bond_renderer = None
-        self.unit_cell_renderer = None
 
         # Per-element overrides (set via Atom Mode Settings dialog)
         self._atom_color_overrides: dict[str, tuple[float, float, float]] = {}
         self._atom_radius_overrides: dict[str, float] = {}  # absolute VdW radius in Å
-        self._bond_radius: float = 0.20  # bond cylinder radius in Å
+        self._bond_radius: float = 0.40  # bond cylinder radius in Å
 
         # Sphere selection state (Shift + Left click + drag)
         self._sphere_sel_center_world = None  # np.array [x, y, z] — set on press
@@ -129,7 +127,7 @@ class VisualisationWidget(QOpenGLWidget):
         self._legend_info = None
 
         self.viewInitialized = False
-        self.point_size = 6.0
+        self.point_size = 20.0
         self.point_type = "Point"
         self.backgroundColor = QColor(Qt.white)
 
@@ -170,12 +168,14 @@ class VisualisationWidget(QOpenGLWidget):
 
         # Docking site data
         self._docking_data = None  # DockingData instance or None
+        self._docking_visual_data: VisualData | None = None  # separate from _visual_data
         self._docking_shell_color_overrides: dict[int, tuple[float, float, float]] = {}
 
         # Checkpoint grid data
         self._checkpoint: Checkpoint | None = None
         self._checkpoint_coords = None  # np.ndarray (N, 3) centred, for sphere mode
         self._checkpoint_center: np.ndarray | None = None
+        self._checkpoint_visual_data: VisualData | None = None  # separate from _visual_data
 
         # Unified display data – rebuilt whenever the active data source changes
         self._visual_data: VisualData | None = None
@@ -222,7 +222,11 @@ class VisualisationWidget(QOpenGLWidget):
         if crystallography is None or crystallography.cell is None:
             return
         self._mol_crystallography = crystallography
-        if self._visual_data is not None and self._visual_data.source == "xyz" and self._visual_data._raw is not None:
+        if (
+            self._visual_data is not None
+            and self._visual_data.source == "xyz"
+            and self._visual_data._raw is not None
+        ):
             self._visual_data = VisualData.from_xyz(
                 self._visual_data._raw, self._mol_templates, crystallography
             )
@@ -253,7 +257,11 @@ class VisualisationWidget(QOpenGLWidget):
     def _apply_directions(self):
         if self.direction_renderer is None:
             return
-        extent = self._cart_max_extent() if self._visual_data is not None else self._directions_max_extent
+        extent = (
+            self._cart_max_extent()
+            if self._visual_data is not None
+            else self._directions_max_extent
+        )
         self.direction_renderer.set_directions(
             self._raw_directions, self._directions_crystallography, extent
         )
@@ -278,12 +286,11 @@ class VisualisationWidget(QOpenGLWidget):
             converted = visible
         self.plane_renderer.set_planes(converted, self._planes_crystallography)
         if self._visual_data is not None:
-            if self.style in ("Atoms", "Unit Cell"):
+            if self.style == "Atoms":
                 self._update_atom_view()
             else:
                 self.initGeometry()
         self.update()
-
 
     def _cart_max_extent(self):
         """Half-range of the crystal in world units (Å after pre-scaling)."""
@@ -297,7 +304,7 @@ class VisualisationWidget(QOpenGLWidget):
         """Half-range of the crystal in world units (same as _cart_max_extent after pre-scaling)."""
         return self._cart_max_extent()
 
-    _ATOM_STYLES = frozenset(("Atoms", "Unit Cell", "Docking Atoms"))
+    _ATOM_STYLES = frozenset(("Atoms", "Docking Atoms"))
     _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull", "Docking"))
 
     # (shell_id, display_name) pairs — use _shell_name() / _shell_id() helpers
@@ -323,7 +330,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def recentre_view(self):
         """Fit the camera to the current geometry.  Used as a menu action (F)
-        and called automatically when entering Docking / Unit Cell styles."""
+        and called automatically when entering Docking style."""
         coords = (
             self._visual_data.centroids
             if self._visual_data is not None and self._visual_data.n_centroids > 0
@@ -761,7 +768,7 @@ class VisualisationWidget(QOpenGLWidget):
             self.single_color = kwargs.get("Single Color", self.single_color)
             needs_reinit = True
 
-        if "Point Size" in kwargs:
+        if present_and_changed("Point Size", self.point_size):
             self.point_size = float(kwargs["Point Size"])
 
         if "Axes Thickness" in kwargs and self.axes_renderer is not None:
@@ -817,6 +824,18 @@ class VisualisationWidget(QOpenGLWidget):
         """Toggle between camera orbit mode and object rotation mode."""
         self.interaction_mode = "object" if self.interaction_mode == "camera" else "camera"
         self.update()
+
+    def toggle_mesh_edges(self):
+        self.show_mesh_edges = not self.show_mesh_edges
+        self.update()
+
+    def increase_bond_radius(self):
+        self._bond_radius = min(round(self._bond_radius + 0.05, 3), 2.0)
+        self.initGeometry()
+
+    def decrease_bond_radius(self):
+        self._bond_radius = max(round(self._bond_radius - 0.05, 3), 0.02)
+        self.initGeometry()
 
     def keyPressEvent(self, event):
         dx, dy = 0, 0
@@ -957,7 +976,7 @@ class VisualisationWidget(QOpenGLWidget):
         self.camera.storeOrientation()
 
     def increase_point_size(self):
-        self.point_size = min(self.point_size + 1.0, 20.0)
+        self.point_size = min(self.point_size + 1.0, 30.0)
         self.pointSizeChanged.emit(int(self.point_size))
         self.update()
 
@@ -1137,7 +1156,11 @@ class VisualisationWidget(QOpenGLWidget):
         Returns:
             dict: Point data including position, type, number, layer, etc.
         """
-        if self._visual_data is None or point_index is None or point_index >= self._visual_data.n_centroids:
+        if (
+            self._visual_data is None
+            or point_index is None
+            or point_index >= self._visual_data.n_centroids
+        ):
             return None
 
         vd = self._visual_data
@@ -1406,13 +1429,6 @@ class VisualisationWidget(QOpenGLWidget):
             self.update()
             return
 
-        if self.style == "Unit Cell":
-            self._update_unit_cell_view()
-            self._apply_planes()
-            self._apply_directions()
-            self.update()
-            return
-
         if self.style == "Docking":
             self._update_docking_sphere_view()
             self.update()
@@ -1569,7 +1585,10 @@ class VisualisationWidget(QOpenGLWidget):
         except ValueError as exc:
             logger.error(
                 "%s\n CENTROIDS %s COLORS %s TYPE %s",
-                exc, points.shape, colors.shape, self.color_by,
+                exc,
+                points.shape,
+                colors.shape,
+                self.color_by,
             )
             return
 
@@ -1640,13 +1659,29 @@ class VisualisationWidget(QOpenGLWidget):
                 elif col_idx == 0:
                     axis_vis = vd.mol_types.astype(np.float32)
                 elif col_idx == 1:
-                    axis_vis = vd.mol_numbers.astype(np.float32) if vd.mol_numbers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                    axis_vis = (
+                        vd.mol_numbers.astype(np.float32)
+                        if vd.mol_numbers is not None
+                        else np.zeros(vd.n_centroids, dtype=np.float32)
+                    )
                 elif col_idx == 2:
-                    axis_vis = vd.layers.astype(np.float32) if vd.layers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                    axis_vis = (
+                        vd.layers.astype(np.float32)
+                        if vd.layers is not None
+                        else np.zeros(vd.n_centroids, dtype=np.float32)
+                    )
                 elif col_idx == 6:
-                    axis_vis = vd.site_numbers.astype(np.float32) if vd.site_numbers is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                    axis_vis = (
+                        vd.site_numbers.astype(np.float32)
+                        if vd.site_numbers is not None
+                        else np.zeros(vd.n_centroids, dtype=np.float32)
+                    )
                 elif col_idx == 7:
-                    axis_vis = vd.energies.astype(np.float32) if vd.energies is not None else np.zeros(vd.n_centroids, dtype=np.float32)
+                    axis_vis = (
+                        vd.energies.astype(np.float32)
+                        if vd.energies is not None
+                        else np.zeros(vd.n_centroids, dtype=np.float32)
+                    )
                 else:
                     axis_vis = np.arange(vd.n_centroids, dtype=np.float32)
                 if vd.layers is not None:
@@ -1707,10 +1742,14 @@ class VisualisationWidget(QOpenGLWidget):
                 "rows": rows,
                 "mode": "colormap",
             }
-        elif self.color_by == "Atom" and self._visual_data and self._visual_data.templates:
+        elif (
+            self.color_by == "Atom"
+            and self._docking_visual_data
+            and self._docking_visual_data.templates
+        ):
             # Atom-element coloring in Docking Atoms mode
             seen: dict[str, tuple] = {}
-            for tmpl in self._visual_data.templates.values():
+            for tmpl in self._docking_visual_data.templates.values():
                 colors, _ = self._resolved_atom_colors_radii(tmpl)
                 for sym, rgb in zip(tmpl["symbols"], colors):
                     if sym not in seen:
@@ -1731,12 +1770,16 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _color_by_options_for_style(self, style: str) -> tuple[tuple, str]:
         """Return (options_tuple, default_option) for the given render style."""
-        if style in ("Atoms", "Unit Cell"):
+        if style == "Atoms":
             return self._ATOM_COLOR_BY, "Atom"
         elif style == "Docking":
             return self._DOCKING_COLOR_BY, "Coordination Shell"
         elif style == "Docking Atoms":
             return self._DOCKING_ATOM_COLOR_BY, "Atom"
+        elif style == "Checkpoint":
+            return self._CHECKPOINT_COLOR_BY, "Single Colour"
+        elif style == "Checkpoint Atoms":
+            return self._CHECKPOINT_ATOM_COLOR_BY, "Atom"
         else:
             return self._NORMAL_COLOR_BY, "Layer"
 
@@ -1813,7 +1856,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_docking_sphere_view(self):
         """Upload docking data to the sphere renderer for the Docking style."""
-        vd = self._visual_data
+        vd = self._docking_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
@@ -1838,11 +1881,11 @@ class VisualisationWidget(QOpenGLWidget):
         """Store docking data and refresh the view if a docking style is active."""
         self._docking_data = docking_data
         if docking_data is not None and not docking_data.empty:
-            self._visual_data = VisualData.from_docking(
+            self._docking_visual_data = VisualData.from_docking(
                 docking_data, self._mol_templates, self._mol_crystallography
             )
         else:
-            self._visual_data = None
+            self._docking_visual_data = None
         if self.style in ("Docking", "Docking Atoms"):
             self.initGeometry()
         self.update()
@@ -1854,31 +1897,33 @@ class VisualisationWidget(QOpenGLWidget):
         if checkpoint is not None:
             cryst = checkpoint.crystallography or self._mol_crystallography
             if cryst is not None:
-                self._visual_data = VisualData.from_checkpoint(
+                self._checkpoint_visual_data = VisualData.from_checkpoint(
                     checkpoint, cryst, self._mol_templates
                 )
-                # Keep legacy coords for any code still referencing them
-                self._checkpoint_coords = self._visual_data.centroids
+                self._checkpoint_coords = self._checkpoint_visual_data.centroids
                 self._checkpoint_center = np.zeros(3, dtype=np.float64)
             else:
+                self._checkpoint_visual_data = None
                 self._checkpoint_coords = np.zeros((0, 3), dtype=np.float64)
                 self._checkpoint_center = np.zeros(3, dtype=np.float64)
         else:
+            self._checkpoint_visual_data = None
             self._checkpoint_coords = None
             self._checkpoint_center = None
-            self._visual_data = None
         if self.style in ("Checkpoint", "Checkpoint Atoms"):
             self.initGeometry()
         self.update()
 
     def _update_checkpoint_view(self):
         """Upload checkpoint grid points to the sphere renderer."""
-        vd = self._visual_data
+        vd = self._checkpoint_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
             return
-        colors = vd.colors_by_z() if self.color_by == "Z Layer" else vd.colors_uniform([0.2, 0.6, 1.0])
+        colors = (
+            vd.colors_by_z() if self.color_by == "Z Layer" else vd.colors_uniform([0.2, 0.6, 1.0])
+        )
         varray = vd.sphere_vertices(colors)
         mask = self._slice_centroid_mask(vd.centroids)
         if mask is not None:
@@ -1890,7 +1935,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_checkpoint_atom_view(self):
         """Build atom/bond instances from checkpoint grid + mol templates and upload to GPU."""
-        vd = self._visual_data
+        vd = self._checkpoint_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
                 self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
@@ -1942,17 +1987,24 @@ class VisualisationWidget(QOpenGLWidget):
         if self.style not in ("Checkpoint", "Checkpoint Atoms"):
             new_style = "Checkpoint"
         elif self.style == "Checkpoint":
-            new_style = "Checkpoint Atoms" if (self._visual_data and self._visual_data.templates) else "Spheres"
+            new_style = (
+                "Checkpoint Atoms"
+                if (self._checkpoint_visual_data and self._checkpoint_visual_data.templates)
+                else "Spheres"
+            )
         else:
             new_style = "Spheres"
         self.style = new_style
         self.styleChanged.emit(self.style)
         self._rescale_camera_for_style(old_style, self.style)
+        opts, default = self._color_by_options_for_style(self.style)
+        if self.color_by not in opts:
+            self.color_by = default
         self.initGeometry()
 
     def _update_docking_atom_view(self):
         """Build atom/bond instances from docking centroids and upload to GPU."""
-        vd = self._visual_data
+        vd = self._docking_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
                 self.atom_renderer.setPoints(np.zeros((0, 8), dtype=np.float32))
@@ -2018,7 +2070,6 @@ class VisualisationWidget(QOpenGLWidget):
         self.plane_renderer = PlaneRenderer()
         self.atom_renderer = AtomRenderer(gl)
         self.bond_renderer = BondRenderer(gl)
-        self.unit_cell_renderer = UnitCellRenderer(gl)
         gl.glEnable(GL_DEPTH_TEST)
         gl.glClearColor(color.redF(), color.greenF(), color.blueF(), 1)
 
@@ -2082,14 +2133,6 @@ class VisualisationWidget(QOpenGLWidget):
         self.bond_renderer.draw(gl)
         self.bond_renderer.release()
 
-    def _draw_unit_cell(self, gl, uniforms):
-        if self.unit_cell_renderer is None or self.unit_cell_renderer.numberOfVertices() <= 0:
-            return
-        self.unit_cell_renderer.bind()
-        self.unit_cell_renderer.setUniforms(**uniforms)
-        self.unit_cell_renderer.draw(gl)
-        self.unit_cell_renderer.release()
-
     # ------------------------------------------------------------------
     # Atom / molecule view
     # ------------------------------------------------------------------
@@ -2099,28 +2142,33 @@ class VisualisationWidget(QOpenGLWidget):
         self._mol_templates = mol_templates
         self._mol_crystallography = crystallography
 
-        if crystallography is not None and self.unit_cell_renderer is not None:
-            self.unit_cell_renderer.set_cell(crystallography)
+        rebuilt = False
 
-        if self._visual_data is None:
+        if self._checkpoint is not None:
+            cryst = self._checkpoint.crystallography or crystallography
+            self._checkpoint_visual_data = VisualData.from_checkpoint(
+                self._checkpoint, cryst, mol_templates
+            )
+            rebuilt = True
+
+        if self._docking_data is not None and not self._docking_data.empty:
+            self._docking_visual_data = VisualData.from_docking(
+                self._docking_data, mol_templates, crystallography
+            )
+            rebuilt = True
+
+        if (
+            self._visual_data is not None
+            and self._visual_data.source == "xyz"
+            and self._visual_data._raw is not None
+        ):
+            self._visual_data = VisualData.from_xyz(
+                self._visual_data._raw, mol_templates, crystallography
+            )
+            rebuilt = True
+
+        if not rebuilt:
             return
-
-        match self._visual_data.source:
-            case "xyz" if self._visual_data._raw is not None:
-                self._visual_data = VisualData.from_xyz(
-                    self._visual_data._raw, mol_templates, crystallography
-                )
-            case "docking" if self._docking_data is not None:
-                self._visual_data = VisualData.from_docking(
-                    self._docking_data, mol_templates, crystallography
-                )
-            case "checkpoint" if self._checkpoint is not None:
-                cryst = self._checkpoint.crystallography or crystallography
-                self._visual_data = VisualData.from_checkpoint(
-                    self._checkpoint, cryst, mol_templates
-                )
-            case _:
-                return
 
         self.viewInitialized = False
         self.initGeometry()
@@ -2175,54 +2223,6 @@ class VisualisationWidget(QOpenGLWidget):
         self.bond_renderer.setBonds(bond_arr)
         self._emit_atom_legend()
 
-    def _update_unit_cell_view(self):
-        """Render the template molecules at their unit-cell positions (no crystal replication)."""
-        if not (self._visual_data and self._visual_data.templates):
-            logger.warning("Unit cell view requested but no molecular data available")
-            return
-
-        atom_instances = []
-        bond_instances = []
-        bond_r = self._bond_radius
-
-        for tmpl in self._visual_data.templates.values():
-            colors, radii = self._resolved_atom_colors_radii(tmpl)
-            atom_positions = tmpl["cart"]  # already in Cartesian, no offset
-
-            sel_col = np.zeros((len(atom_positions), 1), dtype=np.float32)
-            block = np.hstack(
-                [
-                    atom_positions,
-                    colors,
-                    sel_col,
-                    radii[:, None],
-                ]
-            )
-            atom_instances.append(block)
-
-            for a1, a2 in tmpl["bonds"]:
-                if a1 >= len(atom_positions) or a2 >= len(atom_positions):
-                    continue
-                p1 = atom_positions[a1]
-                p2 = atom_positions[a2]
-                mid = (p1 + p2) * 0.5
-                bond_instances.append(np.concatenate([p1, mid, colors[a1], [bond_r]]))
-                bond_instances.append(np.concatenate([mid, p2, colors[a2], [bond_r]]))
-
-        if not atom_instances:
-            return
-
-        atom_arr = np.vstack(atom_instances).astype(np.float32)
-        bond_arr = np.array(bond_instances, dtype=np.float32) if bond_instances else None
-
-        if not self.viewInitialized:
-            self.camera.fitToObject(atom_arr[:, :3])
-            self.viewInitialized = True
-
-        self.atom_renderer.setPoints(atom_arr)
-        self.bond_renderer.setBonds(bond_arr)
-        self._emit_atom_legend()
-
     def set_atom_overrides(
         self,
         color_overrides: dict[str, tuple[float, float, float]],
@@ -2236,9 +2236,6 @@ class VisualisationWidget(QOpenGLWidget):
         if self.style == "Atoms":
             self._update_atom_view()
             self.update()
-        elif self.style == "Unit Cell":
-            self._update_unit_cell_view()
-            self.update()
 
     def set_legend_element_color(self, symbol: str, color: tuple[float, float, float] | None):
         """Override or reset the colour for an element symbol, then redraw."""
@@ -2246,7 +2243,7 @@ class VisualisationWidget(QOpenGLWidget):
             self._atom_color_overrides.pop(symbol, None)
         else:
             self._atom_color_overrides[symbol] = color
-        if self.style in ("Atoms", "Unit Cell", "Docking Atoms"):
+        if self.style in ("Atoms", "Docking Atoms"):
             self.initGeometry()
 
     def set_legend_shell_color(self, shell_id: int, color: tuple[float, float, float] | None):
@@ -2262,7 +2259,7 @@ class VisualisationWidget(QOpenGLWidget):
         """Clear all legend-driven colour overrides (element and shell) and redraw."""
         self._atom_color_overrides.clear()
         self._docking_shell_color_overrides.clear()
-        if self.style in ("Atoms", "Unit Cell", "Docking", "Docking Atoms"):
+        if self.style in ("Atoms", "Docking", "Docking Atoms"):
             self.initGeometry()
 
     def get_visible_elements(self) -> list[str]:
@@ -2355,10 +2352,6 @@ class VisualisationWidget(QOpenGLWidget):
         elif self.style == "Atoms":
             self._draw_bonds(gl, uniforms)
             self._draw_atoms(gl, uniforms)
-        elif self.style == "Unit Cell":
-            self._draw_bonds(gl, uniforms)
-            self._draw_atoms(gl, uniforms)
-            self._draw_unit_cell(gl, uniforms)
         elif self.style == "Docking":
             self._draw_spheres(gl, uniforms)
         elif self.style == "Docking Atoms":
