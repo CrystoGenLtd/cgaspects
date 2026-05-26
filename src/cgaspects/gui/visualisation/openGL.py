@@ -166,6 +166,9 @@ class VisualisationWidget(QOpenGLWidget):
         self.highlight_groups = []  # List of (site_set, color) tuples
         self.background_color_override = None  # Background color for non-highlighted sites
 
+        # Direct per-particle colour override — bypasses both normal coloring and highlight_groups
+        self._colour_override: np.ndarray | None = None
+
         # Docking site data
         self._docking_data = None  # DockingData instance or None
         self._docking_visual_data: VisualData | None = None  # separate from _visual_data
@@ -386,6 +389,24 @@ class VisualisationWidget(QOpenGLWidget):
         self.highlight_groups.clear()
         self.background_color_override = None
         logger.info("Cleared all highlighted sites")
+        self.initGeometry()
+        self.update()
+
+    def set_colour_override(self, colours: np.ndarray | None):
+        """Apply a pre-computed per-particle colour array (N×3 float32, range 0–1).
+
+        Clears highlight_groups so the two override paths stay mutually exclusive.
+        Pass None to remove the override.
+        """
+        self._colour_override = colours
+        if colours is not None:
+            self.highlight_groups.clear()
+            self.background_color_override = None
+        self.initGeometry()
+        self.update()
+
+    def clear_colour_override(self):
+        self._colour_override = None
         self.initGeometry()
         self.update()
 
@@ -1558,6 +1579,19 @@ class VisualisationWidget(QOpenGLWidget):
             for site_set, highlight_color in self.highlight_groups:
                 mask = np.isin(vd.site_numbers, list(site_set))
                 colors[mask] = highlight_color
+
+        # Direct colour override (coordination number, cluster colours, etc.)
+        if self._colour_override is not None:
+            if self._colour_override.shape == colors.shape:
+                colors = self._colour_override
+            else:
+                # Frame mismatch — positional indexing is unreliable, show all grey
+                logger.warning(
+                    "Colour override length %d != point cloud length %d — "
+                    "showing grey (frame mismatch). Use 'Show Analysis Data' to diagnose.",
+                    len(self._colour_override), len(colors),
+                )
+                colors = np.full(colors.shape, 0.5, dtype=np.float32)
 
         # Selection flags
         selection_flags = np.zeros((len(points), 1), dtype=np.float32)

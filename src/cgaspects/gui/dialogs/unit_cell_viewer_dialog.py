@@ -29,7 +29,6 @@ from PySide6.QtGui import QBrush, QColor, QFont, QMatrix4x4, QPainter, QVector2D
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QButtonGroup,
     QCheckBox,
     QDialog,
     QDoubleSpinBox,
@@ -40,7 +39,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QRadioButton,
     QSizePolicy,
     QTreeWidget,
     QTreeWidgetItem,
@@ -113,8 +111,8 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._templates: dict | None = None  # mol_type → precomputed template dict
         self._net_molecules: List[Molecule] | None = None
 
-        # View mode: "unit_cell" or "net"
-        self._view_mode: str = "unit_cell"
+        # Mol types to fan connection lines from (empty = no connections shown)
+        self._conn_source_types: set = set()
 
         # Scene centre used to offset all geometry so rotation is at centre of mass
         self._scene_centre: np.ndarray = np.zeros(3, dtype=np.float32)
@@ -188,8 +186,8 @@ class UnitCellViewerWidget(QOpenGLWidget):
 
         uniforms = self._build_uniforms()
 
-        # Cell box — only in unit cell mode
-        if self._view_mode == "unit_cell" and self._cell_renderer.numberOfVertices() > 0:
+        # Cell box
+        if self._cell_renderer.numberOfVertices() > 0:
             self._cell_renderer.bind()
             self._cell_renderer.setUniforms(**uniforms)
             self._cell_renderer.draw(gl)
@@ -208,8 +206,8 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 self._bond_renderer.draw(gl)
                 self._bond_renderer.release()
 
-        # Net connections — only in net mode
-        if self._show_connections and self._view_mode == "net" and self._conn_renderer.numberOfVertices() > 0:
+        # Interaction connections
+        if self._show_connections and self._conn_renderer.numberOfVertices() > 0:
             self._conn_renderer.bind()
             self._conn_renderer.setUniforms(**uniforms)
             self._conn_renderer.draw(gl)
@@ -249,12 +247,11 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._mark_dirty()
         self.itemTreeChanged.emit()
 
-    def set_view_mode(self, mode: str):
-        """Switch between 'unit_cell' and 'net' display modes."""
-        self._view_mode = mode
+    def set_conn_source_types(self, mol_types: set):
+        """Set which mol types fan out connection lines; triggers geometry rebuild."""
+        self._conn_source_types = set(mol_types)
         self._view_fitted = False
         self._mark_dirty()
-        self.itemTreeChanged.emit()
 
     def set_show_molecules(self, enabled: bool):
         self._show_molecules = enabled
@@ -332,13 +329,6 @@ class UnitCellViewerWidget(QOpenGLWidget):
 
     def _upload_geometry(self):
         """Rebuild and upload all GPU geometry from current data."""
-        if self._view_mode == "net" and self._net_molecules and self._templates and self._crystallography:
-            self._upload_net_geometry()
-        else:
-            self._upload_unit_cell_geometry()
-
-    def _upload_unit_cell_geometry(self):
-        """Unit cell mode: cell box + molecule templates centred at cell centre."""
         if self._crystallography is None:
             return
 
@@ -347,24 +337,45 @@ class UnitCellViewerWidget(QOpenGLWidget):
         ).astype(np.float32)
         self._scene_centre = scene_centre
 
-        cell_lines = self._build_cell_lines(scene_centre)
-        self._cell_renderer.set_lines(cell_lines)
+        self._cell_renderer.set_lines(self._build_cell_lines(scene_centre))
 
         atom_blocks = []
         bond_blocks = []
+        conn_vertices = []
         self._atom_label_data = []
         self._mol_label_data = []
+
+        # Pre-compute which mol types / connection instances are highlighted by a
+        # selected connection, so we can highlight both endpoint molecules.
+        selected_src_types: set = set()
+        selected_tgt_conn_idxs: set = set()
+        if self._net_molecules and self._conn_source_types:
+            ci = 0
+            for mol in self._net_molecules:
+                src_type = _parse_mol_type(mol.label)
+                for _intr in mol.interactions:
+                    if ("conn", ci) in self._selected_ids and src_type in self._conn_source_types:
+                        if src_type is not None:
+                            selected_src_types.add(src_type)
+                        selected_tgt_conn_idxs.add(ci)
+                    ci += 1
+
+        # Track (mol_type, tx, ty, tz) instances already drawn to avoid Z-fighting
+        # from duplicate molecules at overlapping positions.
+        drawn_instances: set = set()
+
+        # --- Unit cell molecules ---
         if self._templates:
             for mol_type, tmpl in self._templates.items():
                 if ("mol", mol_type) in self._hidden_ids:
                     continue
+                drawn_instances.add((mol_type, 0, 0, 0))
 
                 n = len(tmpl["cart"])
                 pos = tmpl["cart"] - scene_centre
                 colors = tmpl["colors"]
                 radii = tmpl["radii"]
 
-                # Per-atom hidden / selected masks
                 atom_hidden = np.array(
                     [("atom", mol_type, i) in self._hidden_ids for i in range(n)], dtype=bool
                 )
@@ -372,7 +383,10 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 if not visible.any():
                     continue
 
-                mol_sel = ("mol", mol_type) in self._selected_ids
+                mol_sel = (
+                    ("mol", mol_type) in self._selected_ids
+                    or mol_type in selected_src_types
+                )
                 sel = np.array(
                     [[1.0 if (mol_sel or ("atom", mol_type, i) in self._selected_ids) else 0.0]
                      for i in range(n)],
@@ -380,11 +394,10 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 )
 
                 vis_pos = pos[visible]
-                vis_sel = sel[visible]
                 vis_radii = radii[visible]
                 vis_colors = colors[visible]
                 atom_blocks.append(np.hstack([
-                    vis_pos, vis_colors, vis_sel,
+                    vis_pos, vis_colors, sel[visible],
                     (vis_radii * self._atom_radius_scale)[:, None],
                 ]))
 
@@ -400,6 +413,72 @@ class UnitCellViewerWidget(QOpenGLWidget):
                         self._atom_label_data.append((pos[i].copy(), sym))
                 self._mol_label_data.append(((tmpl["centroid"] - scene_centre).copy(), f"M{mol_type}"))
 
+        # --- Connection neighbours and lines ---
+        if self._net_molecules and self._conn_source_types and self._templates:
+            unique_r = sorted(
+                {intr.r for mol in self._net_molecules for intr in mol.interactions}
+            )
+            r_color = {r: _SHELL_COLORS[i % len(_SHELL_COLORS)] for i, r in enumerate(unique_r)}
+
+            conn_idx = 0
+            for mol in self._net_molecules:
+                src_type = _parse_mol_type(mol.label)
+                src_tmpl = self._templates.get(src_type) if src_type is not None else None
+
+                if src_type not in self._conn_source_types or src_tmpl is None:
+                    conn_idx += len(mol.interactions)
+                    continue
+
+                src_centroid = src_tmpl["centroid"] - scene_centre
+
+                for intr in mol.interactions:
+                    cid = ("conn", conn_idx)
+                    conn_idx += 1
+
+                    if cid in self._hidden_ids:
+                        continue
+
+                    tgt_type = _parse_mol_type(intr.mol_type)
+                    tgt_tmpl = self._templates.get(tgt_type) if tgt_type is not None else None
+                    if tgt_tmpl is None:
+                        continue
+                    trans = _parse_translation(intr.molecule_info)
+                    if trans is None:
+                        continue
+
+                    trans_cart = self._crystallography.frac_to_cart(
+                        np.array(trans, dtype=np.float64)
+                    ).astype(np.float32)
+
+                    tgt_pos = tgt_tmpl["cart"] + trans_cart - scene_centre
+                    tgt_centroid = tgt_tmpl["centroid"] + trans_cart - scene_centre
+                    tgt_colors = tgt_tmpl["colors"]
+                    tgt_radii = tgt_tmpl["radii"]
+                    nt = len(tgt_pos)
+
+                    # Draw the neighbour molecule unless it coincides with an already-drawn instance
+                    instance_key = (tgt_type, *trans)
+                    if instance_key not in drawn_instances:
+                        drawn_instances.add(instance_key)
+                        tgt_sel = cid[1] in selected_tgt_conn_idxs
+                        sel = np.full((nt, 1), 1.0 if tgt_sel else 0.0, dtype=np.float32)
+                        atom_blocks.append(np.hstack([
+                            tgt_pos, tgt_colors, sel,
+                            (tgt_radii * self._atom_radius_scale)[:, None],
+                        ]))
+                        for a1, a2 in tgt_tmpl["bonds"]:
+                            if a1 < nt and a2 < nt:
+                                p1, p2 = tgt_pos[a1], tgt_pos[a2]
+                                mid = (p1 + p2) * 0.5
+                                bond_blocks.append(np.concatenate([p1, mid, tgt_colors[a1], [self._bond_radius]]))
+                                bond_blocks.append(np.concatenate([mid, p2, tgt_colors[a2], [self._bond_radius]]))
+
+                    color = r_color[intr.r]
+                    if cid in self._selected_ids:
+                        color = np.clip(color * 1.8, 0.0, 1.0)
+                    conn_vertices.append(np.concatenate([src_centroid, color]))
+                    conn_vertices.append(np.concatenate([tgt_centroid, color]))
+
         if atom_blocks:
             atom_arr = np.vstack(atom_blocks).astype(np.float32)
             self._atom_renderer.setPoints(atom_arr)
@@ -414,127 +493,10 @@ class UnitCellViewerWidget(QOpenGLWidget):
         if bond_blocks:
             self._bond_renderer.setBonds(np.array(bond_blocks, dtype=np.float32))
 
-    def _upload_net_geometry(self):
-        """Net mode: source molecule(s) + all neighbours at translated positions + connection lines."""
-        src_centroids = []
-        for mol in self._net_molecules:
-            src_type = _parse_mol_type(mol.label)
-            if src_type is not None and src_type in self._templates:
-                src_centroids.append(self._templates[src_type]["centroid"])
-
-        if src_centroids:
-            scene_centre = np.mean(src_centroids, axis=0).astype(np.float32)
-        else:
-            scene_centre = self._crystallography.frac_to_cart(
-                np.array([0.5, 0.5, 0.5], dtype=np.float64)
-            ).astype(np.float32)
-        self._scene_centre = scene_centre
-
-        unique_r = sorted(
-            {intr.r for mol in self._net_molecules for intr in mol.interactions}
+        self._conn_renderer.set_lines(
+            np.array(conn_vertices, dtype=np.float32).flatten() if conn_vertices
+            else np.array([], dtype=np.float32)
         )
-        r_color = {r: _SHELL_COLORS[i % len(_SHELL_COLORS)] for i, r in enumerate(unique_r)}
-
-        atom_blocks = []
-        bond_blocks = []
-        conn_vertices = []
-        self._atom_label_data = []
-        self._mol_label_data = []
-
-        conn_idx = 0
-        for mol in self._net_molecules:
-            src_type = _parse_mol_type(mol.label)
-            src_tmpl = self._templates.get(src_type) if src_type is not None else None
-            if src_tmpl is None:
-                conn_idx += len(mol.interactions)
-                continue
-
-            src_pos = src_tmpl["cart"] - scene_centre
-            src_centroid = src_tmpl["centroid"] - scene_centre
-            src_colors = src_tmpl["colors"]
-            src_radii = src_tmpl["radii"]
-
-            if ("mol", src_type) not in self._hidden_ids:
-                mol_sel = ("mol", src_type) in self._selected_ids
-                n = len(src_pos)
-                sel = np.array(
-                    [[1.0 if (mol_sel or ("atom", src_type, i) in self._selected_ids) else 0.0]
-                     for i in range(n)],
-                    dtype=np.float32,
-                )
-                atom_blocks.append(np.hstack([src_pos, src_colors, sel, (src_radii * self._atom_radius_scale)[:, None]]))
-                for a1, a2 in src_tmpl["bonds"]:
-                    if a1 < n and a2 < n:
-                        p1, p2 = src_pos[a1], src_pos[a2]
-                        mid = (p1 + p2) * 0.5
-                        bond_blocks.append(np.concatenate([p1, mid, src_colors[a1], [self._bond_radius]]))
-                        bond_blocks.append(np.concatenate([mid, p2, src_colors[a2], [self._bond_radius]]))
-                for i, sym in enumerate(src_tmpl["symbols"]):
-                    self._atom_label_data.append((src_pos[i].copy(), sym))
-                self._mol_label_data.append((src_centroid.copy(), f"M{src_type}"))
-
-            for intr in mol.interactions:
-                cid = ("conn", conn_idx)
-                conn_idx += 1
-
-                tgt_type = _parse_mol_type(intr.mol_type)
-                tgt_tmpl = self._templates.get(tgt_type) if tgt_type is not None else None
-                if tgt_tmpl is None:
-                    continue
-                trans = _parse_translation(intr.molecule_info)
-                if trans is None:
-                    continue
-
-                trans_cart = self._crystallography.frac_to_cart(
-                    np.array(trans, dtype=np.float64)
-                ).astype(np.float32)
-
-                tgt_pos = tgt_tmpl["cart"] + trans_cart - scene_centre
-                tgt_centroid = tgt_tmpl["centroid"] + trans_cart - scene_centre
-                tgt_colors = tgt_tmpl["colors"]
-                tgt_radii = tgt_tmpl["radii"]
-
-                if ("mol", tgt_type) not in self._hidden_ids and cid not in self._hidden_ids:
-                    mol_sel = ("mol", tgt_type) in self._selected_ids
-                    nt = len(tgt_pos)
-                    sel = np.array(
-                        [[1.0 if (mol_sel or ("atom", tgt_type, i) in self._selected_ids) else 0.0]
-                         for i in range(nt)],
-                        dtype=np.float32,
-                    )
-                    atom_blocks.append(np.hstack([tgt_pos, tgt_colors, sel, (tgt_radii * self._atom_radius_scale)[:, None]]))
-                    for a1, a2 in tgt_tmpl["bonds"]:
-                        if a1 < nt and a2 < nt:
-                            p1, p2 = tgt_pos[a1], tgt_pos[a2]
-                            mid = (p1 + p2) * 0.5
-                            bond_blocks.append(np.concatenate([p1, mid, tgt_colors[a1], [self._bond_radius]]))
-                            bond_blocks.append(np.concatenate([mid, p2, tgt_colors[a2], [self._bond_radius]]))
-                    for i, sym in enumerate(tgt_tmpl["symbols"]):
-                        self._atom_label_data.append((tgt_pos[i].copy(), sym))
-                    self._mol_label_data.append((tgt_centroid.copy(), f"M{tgt_type}"))
-
-                if cid not in self._hidden_ids:
-                    color = r_color[intr.r]
-                    # Brighten connection colour if selected
-                    if cid in self._selected_ids:
-                        color = np.clip(color * 1.8, 0.0, 1.0)
-                    conn_vertices.append(np.concatenate([src_centroid, color]))
-                    conn_vertices.append(np.concatenate([tgt_centroid, color]))
-
-        if atom_blocks:
-            atom_arr = np.vstack(atom_blocks).astype(np.float32)
-            self._atom_renderer.setPoints(atom_arr)
-            if not self._view_fitted:
-                self._camera.fitToObject(atom_arr[:, :3])
-                self._view_fitted = True
-
-        if bond_blocks:
-            self._bond_renderer.setBonds(np.array(bond_blocks, dtype=np.float32))
-
-        if conn_vertices:
-            self._conn_renderer.set_lines(
-                np.array(conn_vertices, dtype=np.float32).flatten()
-            )
 
     def _build_cell_lines(self, offset: np.ndarray) -> np.ndarray:
         """Build unit cell edge vertex array offset so that cell centre is at origin."""
@@ -670,15 +632,12 @@ class UnitCellViewerDialog(QDialog):
         self._clear_net_btn.setEnabled(False)
         self._clear_net_btn.clicked.connect(self._on_clear_net)
 
-        # --- View mode radio buttons ---
-        self._mode_group = QButtonGroup(self)
-        self._unit_cell_rb = QRadioButton("Unit Cell")
-        self._net_rb = QRadioButton("Net / Connections")
-        self._unit_cell_rb.setChecked(True)
-        self._net_rb.setEnabled(False)
-        self._mode_group.addButton(self._unit_cell_rb)
-        self._mode_group.addButton(self._net_rb)
-        self._unit_cell_rb.toggled.connect(self._on_mode_changed)
+        # Checkboxes for selecting which unit-cell molecules to fan connections from;
+        # populated dynamically after a net file is loaded.
+        self._source_checkboxes: dict = {}  # mol_type → QCheckBox
+        self._sources_group = QGroupBox("Show Connections From")
+        self._sources_layout = QVBoxLayout(self._sources_group)
+        self._sources_group.setVisible(False)
 
         # --- Display toggles ---
         self._show_mol_cb = QCheckBox("Show Molecules")
@@ -703,11 +662,7 @@ class UnitCellViewerDialog(QDialog):
         net_layout.addWidget(self._net_label)
         net_layout.addWidget(self._import_btn)
         net_layout.addWidget(self._clear_net_btn)
-
-        mode_group = QGroupBox("View Mode")
-        mode_layout = QVBoxLayout(mode_group)
-        mode_layout.addWidget(self._unit_cell_rb)
-        mode_layout.addWidget(self._net_rb)
+        net_layout.addWidget(self._sources_group)
 
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout(display_group)
@@ -764,7 +719,6 @@ class UnitCellViewerDialog(QDialog):
 
         ctrl_layout = QVBoxLayout()
         ctrl_layout.addWidget(net_group)
-        ctrl_layout.addWidget(mode_group)
         ctrl_layout.addWidget(display_group)
         ctrl_layout.addWidget(sel_group)
         ctrl_layout.addWidget(appearance_group)
@@ -825,33 +779,50 @@ class UnitCellViewerDialog(QDialog):
 
         self._viewer.set_net_molecules(net.molecules)
         self._net_label.setText(Path(path).name)
-        self._net_rb.setEnabled(True)
-        self._show_conn_cb.setEnabled(True)
         self._clear_net_btn.setEnabled(True)
+        self._show_conn_cb.setEnabled(True)
         n_mol = len(net.molecules)
         n_int = sum(m.n_interactions for m in net.molecules)
         self._status_label.setText(
             f"Net: {n_mol} molecule type(s), {n_int} interactions."
         )
+        self._populate_source_checkboxes(net.molecules)
 
     def _on_clear_net(self):
         self._viewer.set_net_molecules(None)
-        # Switch back to unit cell mode before disabling the net radio button
-        self._unit_cell_rb.setChecked(True)
-        self._viewer.set_view_mode("unit_cell")
+        self._viewer.set_conn_source_types(set())
         self._net_label.setText("No net file loaded")
-        self._net_rb.setEnabled(False)
         self._show_conn_cb.setEnabled(False)
         self._clear_net_btn.setEnabled(False)
         self._status_label.setText("Net cleared.")
+        self._clear_source_checkboxes()
 
-    def _on_mode_changed(self):
-        if self._unit_cell_rb.isChecked():
-            self._viewer.set_view_mode("unit_cell")
-            self._show_conn_cb.setEnabled(False)
-        else:
-            self._viewer.set_view_mode("net")
-            self._show_conn_cb.setEnabled(True)
+    def _populate_source_checkboxes(self, molecules):
+        """Build one checkbox per unique source molecule type from the net."""
+        self._clear_source_checkboxes()
+        seen = set()
+        for mol in molecules:
+            mol_type = _parse_mol_type(mol.label)
+            if mol_type is None or mol_type in seen:
+                continue
+            seen.add(mol_type)
+            cb = QCheckBox(f"M{mol_type}  ({mol.label})")
+            cb.setChecked(False)
+            cb.toggled.connect(self._on_source_changed)
+            self._source_checkboxes[mol_type] = cb
+            self._sources_layout.addWidget(cb)
+        self._sources_group.setVisible(bool(seen))
+
+    def _clear_source_checkboxes(self):
+        for cb in self._source_checkboxes.values():
+            self._sources_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._source_checkboxes.clear()
+        self._sources_group.setVisible(False)
+
+    def _on_source_changed(self):
+        checked = {mt for mt, cb in self._source_checkboxes.items() if cb.isChecked()}
+        self._viewer.set_conn_source_types(checked)
 
     # ------------------------------------------------------------------
     # Selection panel
@@ -876,7 +847,7 @@ class UnitCellViewerDialog(QDialog):
             mol_root.setExpanded(True)
 
         net_mols = self._viewer._net_molecules
-        if net_mols and self._viewer._view_mode == "net":
+        if net_mols:
             conn_root = QTreeWidgetItem(self._sel_tree, ["Connections"])
             conn_root.setFlags(conn_root.flags() & ~Qt.ItemIsSelectable)
             idx = 0

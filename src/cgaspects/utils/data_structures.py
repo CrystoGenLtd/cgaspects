@@ -18,12 +18,36 @@ ar_selection_tuple = namedtuple(
 
 shape_info_tuple = namedtuple(
     "shape_info",
-    "x, y, z, pc1, pc2, pc3, aspect1, aspect2, sa, vol, sa_vol, shape",
+    [
+        "x",
+        "y",
+        "z",
+        "pc1",
+        "pc2",
+        "pc3",
+        "aspect1",
+        "aspect2",
+        "sa",
+        "vol",
+        "sa_vol",
+        "shape",
+    ],
 )
 
 file_info_tuple = namedtuple(
     "file_info",
-    "supersats, size_files, directions, growth_mod, folders, summary_file, crystallisation_files, population_files, count_files, structure_file",
+    [
+        "supersats",
+        "size_files",
+        "directions",
+        "growth_mod",
+        "folders",
+        "summary_file",
+        "crystallisation_files",
+        "population_files",
+        "count_files",
+        "structure_file",
+    ],
 )
 
 plot_obj_tuple = namedtuple(
@@ -33,6 +57,6 @@ plot_obj_tuple = namedtuple(
 
 cluster_options_tuple = namedtuple(
     "ClusterOptions",
-    ["algorithm", "eps", "min_samples", "frame_index", "scale", "downsample", "ratios_only"],
-    defaults=[False],
+    ["eps", "min_samples", "frame_index", "scale", "downsample", "ratios_only", "colour_mode", "colour_cmap", "files_to_analyse"],
+    defaults=[False, "none", "plasma", None],
 )

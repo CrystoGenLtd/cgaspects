@@ -1,34 +1,48 @@
+from pathlib import Path
+
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
+    QRadioButton,
     QSpinBox,
     QVBoxLayout,
-    QComboBox,
 )
 
 from ...utils.data_structures import cluster_options_tuple
 
+_COLORMAPS = ["plasma", "viridis", "inferno", "coolwarm", "RdYlGn"]
+
 
 class ClusterAnalysisDialog(QDialog):
+    runRequested = Signal(object)           # emits cluster_options_tuple
+    applyColourRequested = Signal(str, str) # (mode, cmap_name)
+    showDataRequested = Signal()            # request debug data display
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cluster Analysis Options")
+        self.setModal(False)
+        self.setWindowTitle("Cluster Analysis")
+
+        self._all_paths: list[Path] = []
+        self._current_path: Path | None = None
 
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # Beta warning
         warning_label = QLabel(
-            "<b>\u26a0\ufe0f Beta Feature</b><br>"
-            "Cluster analysis is intended for simulations with internal sites (not just surface particles). "
-            "Clustering can be slow and may cause the application to become unresponsive "
-            "when there are many points."
+            "<b>⚠️ Beta Feature</b><br>"
+            "Cluster analysis is intended for simulations with internal sites (not just surface "
+            "particles). Clustering can be slow and may cause the application to become "
+            "unresponsive when there are many points."
         )
         warning_label.setWordWrap(True)
         warning_label.setStyleSheet(
@@ -37,61 +51,84 @@ class ClusterAnalysisDialog(QDialog):
         )
         layout.addWidget(warning_label)
 
-        # Mode selection
+        layout.addSpacing(6)
+
+        # --- Analysis status (updated after each run) ---
+        self._status_label = QLabel("No analysis run yet.")
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet(
+            "QLabel { color: #555; font-style: italic; padding: 2px 0; }"
+        )
+        layout.addWidget(self._status_label)
+
+        layout.addSpacing(6)
+
+        # --- File scope ---
+        scope_group = QGroupBox("Files to analyse")
+        scope_layout = QVBoxLayout()
+        self._scope_buttons = QButtonGroup(self)
+        self._scope_current = QRadioButton("Current file only (default)")
+        self._scope_all = QRadioButton("All files in folder")
+        self._scope_current.setChecked(True)
+        self._scope_buttons.addButton(self._scope_current, 0)
+        self._scope_buttons.addButton(self._scope_all, 1)
+        scope_layout.addWidget(self._scope_current)
+        scope_layout.addWidget(self._scope_all)
+        self._scope_file_label = QLabel()
+        self._scope_file_label.setWordWrap(True)
+        self._scope_file_label.setStyleSheet("QLabel { color: #444; font-size: 11px; }")
+        scope_layout.addWidget(self._scope_file_label)
+        scope_group.setLayout(scope_layout)
+        layout.addWidget(scope_group)
+
+        layout.addSpacing(4)
+
         self.ratios_only_checkbox = QCheckBox("Ratios only (skip clustering)")
         self.ratios_only_checkbox.setToolTip(
             "Only compute particle-type count ratios without running a clustering algorithm."
         )
-        self.ratios_only_checkbox.toggled.connect(self._on_ratios_only_toggled)
+        self.ratios_only_checkbox.setContentsMargins(0, 4, 0, 4)
         layout.addWidget(self.ratios_only_checkbox)
+        layout.addSpacing(6)
 
-        # Algorithm selection
-        algo_group = QGroupBox("Clustering Algorithm")
-        algo_layout = QHBoxLayout()
-        self.algo_combo = QComboBox()
-        self.algo_combo.addItems(["DBSCAN", "OPTICS"])
-        self.algo_combo.currentTextChanged.connect(self._on_algo_changed)
-        algo_layout.addWidget(QLabel("Algorithm:"))
-        algo_layout.addWidget(self.algo_combo)
-        algo_layout.addStretch()
-        algo_group.setLayout(algo_layout)
-        layout.addWidget(algo_group)
-        self._algo_group = algo_group
-
-        # Parameters
-        params_group = QGroupBox("Parameters")
+        # --- KDTree parameters ---
+        params_group = QGroupBox("KDTree Connectivity Parameters")
         params_layout = QFormLayout()
 
-        self.eps_label = QLabel("ε (neighbourhood radius):")
         self.eps_spin = QDoubleSpinBox()
         self.eps_spin.setRange(0.1, 100.0)
         self.eps_spin.setSingleStep(0.5)
         self.eps_spin.setValue(3.0)
         self.eps_spin.setDecimals(1)
         self.eps_spin.setToolTip(
-            "DBSCAN: neighbourhood radius. OPTICS: max neighbourhood radius (0 = unlimited)."
+            "Maximum distance between two points to be considered neighbours. "
+            "When 'Standardise coordinates' is enabled this is in standard-deviation units."
         )
-        params_layout.addRow(self.eps_label, self.eps_spin)
+        params_layout.addRow("Neighbour radius (ε):", self.eps_spin)
 
         self.min_samples_spin = QSpinBox()
-        self.min_samples_spin.setRange(2, 200)
+        self.min_samples_spin.setRange(1, 200)
         self.min_samples_spin.setValue(5)
         self.min_samples_spin.setToolTip(
-            "Minimum number of samples in a neighbourhood for a point to be a core point."
+            "Minimum number of points for a connected component to be kept as a cluster. "
+            "Smaller components are labelled as noise (−1)."
         )
-        params_layout.addRow("Min samples:", self.min_samples_spin)
+        params_layout.addRow("Minimum cluster size:", self.min_samples_spin)
 
         self.frame_spin = QSpinBox()
         self.frame_spin.setRange(-1, 9999)
         self.frame_spin.setValue(-1)
         self.frame_spin.setToolTip(
-            "Frame index to analyse per XYZ file. -1 = last frame, 0 = first frame."
+            "Frame index to analyse per XYZ file. -1 = last frame, 0 = first frame.\n"
+            "⚠ If the analysed frame differs from the displayed frame, point counts may\n"
+            "mismatch and the colour override will be silently skipped."
         )
         params_layout.addRow("Frame index (−1 = last):", self.frame_spin)
 
         self.scale_checkbox = QCheckBox("Standardise coordinates (StandardScaler)")
         self.scale_checkbox.setToolTip(
-            "Normalise coordinates to zero mean and unit variance before clustering."
+            "Normalise coordinates to zero mean and unit variance before clustering. "
+            "Changes the units of ε."
         )
         params_layout.addRow("", self.scale_checkbox)
 
@@ -102,7 +139,7 @@ class ClusterAnalysisDialog(QDialog):
         self.downsample_spin.setDecimals(2)
         self.downsample_spin.setToolTip(
             "Fraction of particles to keep before clustering (1.0 = no downsampling). "
-            "Useful for speeding up analysis on very large XYZ files."
+            "Coordination numbers are always computed on the full particle set."
         )
         params_layout.addRow("Downsample fraction:", self.downsample_spin)
 
@@ -110,30 +147,141 @@ class ClusterAnalysisDialog(QDialog):
         layout.addWidget(params_group)
         self._params_group = params_group
 
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
+        run_row = QHBoxLayout()
+        run_row.addStretch()
+        self._run_btn = QPushButton("Run Analysis")
+        run_row.addWidget(self._run_btn)
+        layout.addLayout(run_row)
 
-    def _on_algo_changed(self, algo):
-        if algo == "OPTICS":
-            self.eps_label.setText("Max ε (neighbourhood cap, 0 = none):")
+        layout.addSpacing(6)
+
+        # --- Colour after analysis ---
+        vis_group = QGroupBox("Colour after analysis")
+        vis_layout = QFormLayout()
+
+        self._colour_buttons = QButtonGroup(self)
+        self._colour_none = QRadioButton("None")
+        self._colour_cluster = QRadioButton("Cluster membership")
+        self._colour_coord = QRadioButton("Coordination number")
+        self._colour_none.setChecked(True)
+        self._colour_buttons.addButton(self._colour_none, 0)
+        self._colour_buttons.addButton(self._colour_cluster, 1)
+        self._colour_buttons.addButton(self._colour_coord, 2)
+        vis_layout.addRow("", self._colour_none)
+        vis_layout.addRow("", self._colour_cluster)
+        vis_layout.addRow("", self._colour_coord)
+
+        self._cmap_combo = QComboBox()
+        self._cmap_combo.addItems(_COLORMAPS)
+        self._cmap_combo.setToolTip("Colormap for coordination-number colouring.")
+        self._cmap_combo.setEnabled(False)
+        vis_layout.addRow("Colormap:", self._cmap_combo)
+
+        vis_group.setLayout(vis_layout)
+        layout.addWidget(vis_group)
+        self._vis_group = vis_group
+
+        btn_row = QHBoxLayout()
+        self._apply_btn = QPushButton("Apply Colour")
+        self._show_data_btn = QPushButton("Show Analysis Data")
+        self._show_data_btn.setToolTip(
+            "Show coordination numbers and cluster labels for the current file — "
+            "useful for diagnosing why colour override is not appearing."
+        )
+        self._close_btn = QPushButton("Close")
+        btn_row.addWidget(self._apply_btn)
+        btn_row.addWidget(self._show_data_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._close_btn)
+        layout.addLayout(btn_row)
+
+        # Connections
+        self.ratios_only_checkbox.toggled.connect(self._on_ratios_only_toggled)
+        self._colour_coord.toggled.connect(self._cmap_combo.setEnabled)
+        self._run_btn.clicked.connect(self._on_run)
+        self._apply_btn.clicked.connect(self._on_apply)
+        self._show_data_btn.clicked.connect(self.showDataRequested)
+        self._close_btn.clicked.connect(self.hide)
+        self._scope_current.toggled.connect(self._update_scope_label)
+
+    # ------------------------------------------------------------------
+    # Public API for mainwindow to populate context
+
+    def set_file_context(self, current_path: Path | None, all_paths: list[Path]):
+        """Call before show() so the dialog knows available files."""
+        self._current_path = current_path
+        self._all_paths = list(all_paths)
+        self._update_scope_label()
+
+    def update_analysis_status(self, labels_cache: dict, coord_cache: dict, all_paths: list[Path]):
+        """Refresh the status label to show how many files have cached results."""
+        n_total = len(all_paths)
+        n_labels = sum(1 for p in all_paths if str(p) in labels_cache)
+        n_coord = sum(1 for p in all_paths if str(p) in coord_cache)
+
+        if n_labels == 0 and n_coord == 0:
+            self._status_label.setText("No analysis run yet.")
+            self._status_label.setStyleSheet("QLabel { color: #555; font-style: italic; padding: 2px 0; }")
         else:
-            self.eps_label.setText("ε (neighbourhood radius):")
+            parts = []
+            if n_labels:
+                parts.append(f"cluster labels: {n_labels}/{n_total}")
+            if n_coord:
+                parts.append(f"coord numbers: {n_coord}/{n_total}")
+            text = "Cached — " + ", ".join(parts) + " files."
+            self._status_label.setText(text)
+            self._status_label.setStyleSheet(
+                "QLabel { color: #1a6b1a; font-style: normal; padding: 2px 0; }"
+            )
+
+    # ------------------------------------------------------------------
+
+    def _update_scope_label(self):
+        if self._scope_current.isChecked() and self._current_path is not None:
+            self._scope_file_label.setText(f"→ {self._current_path.name}")
+        elif self._all_paths:
+            self._scope_file_label.setText(f"→ {len(self._all_paths)} files")
+        else:
+            self._scope_file_label.setText("")
 
     def _on_ratios_only_toggled(self, checked: bool):
-        self._algo_group.setEnabled(not checked)
         self._params_group.setEnabled(not checked)
-        # Frame index is still relevant when ratios_only
         self.frame_spin.setEnabled(True)
+        self._vis_group.setEnabled(not checked)
 
-    def get_options(self) -> cluster_options_tuple:
+    def _on_run(self):
+        self.runRequested.emit(self._build_options())
+
+    def _on_apply(self):
+        if self._colour_cluster.isChecked():
+            mode = "cluster"
+        elif self._colour_coord.isChecked():
+            mode = "coord"
+        else:
+            mode = "none"
+        self.applyColourRequested.emit(mode, self._cmap_combo.currentText())
+
+    def _build_options(self) -> cluster_options_tuple:
+        if self._colour_cluster.isChecked():
+            colour_mode = "cluster"
+        elif self._colour_coord.isChecked():
+            colour_mode = "coord"
+        else:
+            colour_mode = "none"
+
+        if self._scope_current.isChecked() and self._current_path is not None:
+            files_to_analyse = [self._current_path]
+        else:
+            files_to_analyse = None  # means "all"
+
         return cluster_options_tuple(
-            algorithm=self.algo_combo.currentText(),
             eps=self.eps_spin.value(),
             min_samples=self.min_samples_spin.value(),
             frame_index=self.frame_spin.value(),
             scale=self.scale_checkbox.isChecked(),
             downsample=self.downsample_spin.value(),
             ratios_only=self.ratios_only_checkbox.isChecked(),
+            colour_mode=colour_mode,
+            colour_cmap=self._cmap_combo.currentText(),
+            files_to_analyse=files_to_analyse,
         )

@@ -13,12 +13,16 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QSignalBlocker, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, Qt
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGridLayout,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QTextBrowser,
+    QVBoxLayout,
 )
 
 from ..analysis.aspect_ratios import AspectRatio
@@ -125,6 +129,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.worker_signals = GUIWorkerSignals()
         self.aspectratio = AspectRatio(signals=self.worker_signals)
         self.clusteranalysis = ClusterAnalysis(signals=self.worker_signals)
+        self.clusteranalysis.dialog.applyColourRequested.connect(self._handle_apply_cluster_colour)
+        self.clusteranalysis.dialog.showDataRequested.connect(self._show_cluster_analysis_data)
+        self._active_colour_mode: str = "none"
+        self._active_colour_cmap: str = "plasma"
         self.growthrate = GrowthRate(signals=self.worker_signals)
         self.siteanalysis = SiteAnalysis(signals=self.worker_signals)
         self.worker_signals.location.connect(self.set_output_folder)
@@ -148,7 +156,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.plotting_dialog = None
 
         self.cluster_labels_cache: dict = {}
-        self._prev_color_by: str | None = None
+        self.coord_cache: dict = {}
+
         self._prev_style: str | None = None
         self._docking_file_map: dict[Path, Path] = {}  # normal_xyz -> docking_xyz
         self._checkpoint_file_map: dict[Path, Path] = {}  # normal_xyz -> checkpoint_txt
@@ -846,7 +855,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Highlight a specific site in the 3D visualization (from plot click)."""
         if hasattr(self, "openglwidget") and self.openglwidget is not None:
             # Check if a crystal is loaded before trying to highlight
-            if self.openglwidget.xyz is None:
+            if self.openglwidget._visual_data is None:
                 logger.debug(
                     f"Cannot highlight site {site_number} - no crystal loaded in visualizer"
                 )
@@ -854,13 +863,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             # Highlight just this one site
             self.openglwidget.highlight_sites([(site_number, None)])
             logger.info(f"Highlighted site {site_number} in visualization")
-
-    def _add_cluster_colour_option(self):
-        """Add 'Cluster Membership' to the Color By combobox if not already present."""
-        w = self.visualizationSettings.widgets["Color By"]
-        if "Cluster Membership" not in w.options:
-            w.options = list(w.options) + ["Cluster Membership"]
-            w.comboBox.addItem("Cluster Membership")
 
     def _apply_cluster_colours(self):
         """Colour the current simulation's particles by cluster label."""
@@ -887,6 +889,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 rgba = tab10(lbl % 10)
                 colour = list(rgba[:3])
             groups.append((indices, colour))
+        self.openglwidget.clear_colour_override()
         self.openglwidget.highlight_sites(groups)
         logger.info("Applied cluster colours for %s (%d clusters)", xyz_path, len(unique_labels))
 
@@ -1006,6 +1009,119 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.site_highlight_dialog.show()
         self.site_highlight_dialog.raise_()
 
+    def _handle_apply_cluster_colour(self, mode: str, cmap: str):
+        self._active_colour_mode = mode
+        self._active_colour_cmap = cmap
+        if mode == "cluster":
+            self._apply_cluster_colours()
+        elif mode == "coord":
+            self._apply_coord_colours(cmap)
+        else:
+            self.openglwidget.clear_highlighted_sites()
+            self.openglwidget.clear_colour_override()
+
+    def _apply_coord_colours(self, cmap_name: str = "plasma"):
+        if not self.coord_cache or self.sim_num is None:
+            return
+        if self.sim_num >= len(self.xyz_files):
+            return
+        xyz_path = str(self.xyz_files[self.sim_num])
+        coord_numbers = self.coord_cache.get(xyz_path)
+        if coord_numbers is None or len(coord_numbers) == 0:
+            logger.warning("No coordination numbers cached for %s", xyz_path)
+            return
+        from matplotlib import colormaps as _cms
+        lo, hi = int(coord_numbers.min()), int(coord_numbers.max())
+        t = (
+            np.zeros(len(coord_numbers), dtype=np.float32)
+            if hi == lo
+            else (coord_numbers - lo).astype(np.float32) / (hi - lo)
+        )
+        colours = _cms[cmap_name](t)[:, :3].astype(np.float32)
+        self.openglwidget.set_colour_override(colours)
+        logger.info("Coord-number colours applied for %s (range [%d, %d])", xyz_path, lo, hi)
+
+    def _show_cluster_analysis_data(self):
+        """Show a popup with coord/cluster debug data for the current file."""
+        if self.sim_num is None or self.sim_num >= len(self.xyz_files):
+            QMessageBox.information(self, "Analysis Data", "No simulation loaded.")
+            return
+
+        xyz_path = str(self.xyz_files[self.sim_num])
+        filename = self.xyz_files[self.sim_num].name
+        lines = [f"<b>File:</b> {filename}", f"<b>Full path:</b> {xyz_path}", ""]
+
+        # Rendered point count
+        rendered_n = None
+        _vd = self.openglwidget._visual_data
+        if _vd is not None:
+            rendered_n = _vd.n_centroids
+            lines.append(f"<b>Rendered points (frame 0):</b> {rendered_n:,}")
+        else:
+            lines.append("<b>Rendered points:</b> (no data loaded)")
+
+        lines.append("")
+
+        # Coordination numbers
+        coord_numbers = self.coord_cache.get(xyz_path)
+        if coord_numbers is None or len(coord_numbers) == 0:
+            lines.append("<b>Coordination numbers:</b> ❌ not in cache")
+            lines.append(
+                "<i>Run analysis with 'Current file only' to populate the cache for this file.</i>"
+            )
+        else:
+            n_cached = len(coord_numbers)
+            match = rendered_n is not None and n_cached == rendered_n
+            match_str = "✅ matches rendered" if match else f"⚠️ MISMATCH — cached={n_cached:,}, rendered={rendered_n:,} (colour override will be skipped!)"
+            lines.append(f"<b>Coord numbers cached:</b> {n_cached:,} points — {match_str}")
+            lo, hi = int(coord_numbers.min()), int(coord_numbers.max())
+            mean = float(coord_numbers.mean())
+            std = float(coord_numbers.std())
+            lines.append(f"  min={lo}, max={hi}, mean={mean:.2f}, std={std:.2f}")
+
+            # Value distribution
+            unique, counts = np.unique(coord_numbers, return_counts=True)
+            lines.append("  <b>Distribution:</b>")
+            for val, cnt in zip(unique, counts):
+                bar = "█" * min(40, round(40 * cnt / n_cached))
+                lines.append(f"    coord={val:3d}: {cnt:6,}  {bar}  ({100*cnt/n_cached:.1f}%)")
+
+        lines.append("")
+
+        # Cluster labels
+        labels = self.cluster_labels_cache.get(xyz_path)
+        if labels is None or len(labels) == 0:
+            lines.append("<b>Cluster labels:</b> ❌ not in cache")
+        else:
+            n_cached = len(labels)
+            match = rendered_n is not None and n_cached == rendered_n
+            match_str = "✅ matches rendered" if match else f"⚠️ MISMATCH — cached={n_cached:,}, rendered={rendered_n:,}"
+            lines.append(f"<b>Cluster labels cached:</b> {n_cached:,} points — {match_str}")
+            n_noise = int((labels == -1).sum())
+            unique_cl = np.unique(labels[labels >= 0])
+            lines.append(f"  Clusters: {len(unique_cl)}, noise points: {n_noise:,} ({100*n_noise/n_cached:.1f}%)")
+            if len(unique_cl) > 0:
+                sizes = np.array([(labels == c).sum() for c in unique_cl])
+                lines.append(f"  Cluster sizes — min={sizes.min()}, max={sizes.max()}, mean={sizes.mean():.1f}")
+                if len(unique_cl) <= 20:
+                    lines.append("  <b>Per-cluster counts:</b>")
+                    for cl_id, sz in zip(unique_cl, sizes):
+                        lines.append(f"    cluster {cl_id}: {sz:,} points")
+
+        html = "<pre style='font-family:monospace'>" + "<br>".join(lines) + "</pre>"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Analysis Data — {filename}")
+        dlg.resize(600, 500)
+        v = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        browser.setHtml(html)
+        v.addWidget(browser)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.accept)
+        v.addWidget(btns)
+        dlg.exec()
+
     def show_axes_settings_dialog(self):
         """Show the axes settings dialog."""
         self.axes_settings_dialog.show()
@@ -1023,10 +1139,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _get_point_cloud_max_extent(self):
         """Compute the max extent (half-range) of the point cloud."""
-        xyz = self.openglwidget.xyz
-        if xyz is not None and len(xyz) > 0:
-            points = xyz[:, 3:6]
-            extents = points.max(axis=0) - points.min(axis=0)
+        vd = self.openglwidget._visual_data
+        if vd is not None and vd.n_centroids > 0:
+            extents = vd.centroids.max(axis=0) - vd.centroids.min(axis=0)
             return float(extents.max()) / 2.0
         return None
 
@@ -1092,7 +1207,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         xyz = self.openglwidget.xyz
         if xyz is None:
             return
-        coords = xyz[list(selected_indices), 3:6]  # columns 3,4,5 are x,y,z
+        coords = xyz[list(selected_indices)]
         centroid = coords.mean(axis=0)
         _, _, Vt = np.linalg.svd(coords - centroid)
         normal = Vt[-1]  # eigenvector for smallest singular value = plane normal
@@ -1119,7 +1234,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if n_len < 1e-10:
             return
         normal /= n_len
-        proj = xyz[:, 3:6] @ normal
+        proj = xyz @ normal
         d_min, d_max = float(proj.min()), float(proj.max())
         current_d = float(np.dot(normal, np.array(plane.origin, dtype=np.float64)))
         self.planes_dialog.configure_move_slider(d_min, d_max, current_d)
@@ -1352,8 +1467,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             return self.crystal
 
-    def update_XYZ_info(self, xyz):
-        if xyz is None or xyz.ndim < 2 or xyz.shape[0] == 0 or xyz.shape[1] < 3:
+    def update_XYZ_info(self):
+        vd = self.openglwidget._visual_data
+        if vd is None or vd.n_centroids == 0:
             self.crystal_info.aspectRatio1 = None
             self.crystal_info.aspectRatio2 = None
             self.crystal_info.shapeClass = "N/A"
@@ -1364,16 +1480,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.crystalInfoChanged.emit(self.crystal_info)
             return
 
-        vd = self.openglwidget._visual_data
         style = self.openglwidget.style
-        if style in self.openglwidget._ATOM_STYLES and vd is not None and vd.templates:
+        if style in self.openglwidget._ATOM_STYLES and vd.templates:
             self.crystal_info.pointCount = vd.n_atoms or vd.n_centroids
             self.crystal_info.countLabel = "Atoms"
         else:
-            self.crystal_info.pointCount = xyz.shape[0]
+            self.crystal_info.pointCount = vd.n_centroids
             self.crystal_info.countLabel = "Points"
 
-        worker_xyz = WorkerXYZ(xyz)
+        worker_xyz = WorkerXYZ(vd.centroids)
         worker_xyz.signals.result.connect(self.insert_info)
         worker_xyz.signals.message.connect(self.update_statusbar)
         self.threadpool.start(worker_xyz)
@@ -1566,6 +1681,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.siteanalysis.calculate_site_analysis()
 
     def calculate_clusters(self):
+        if self.sim_num is not None and 0 <= self.sim_num < len(self.xyz_files):
+            self.clusteranalysis.set_current_file(self.xyz_files[self.sim_num])
+        else:
+            self.clusteranalysis.set_current_file(None)
         self.clusteranalysis.calculate_clusters()
 
     def setShowPlottingButtons(self, state=True):
@@ -1614,6 +1733,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def set_results(self, value):
         logger.debug(f"set_results called with value: {value}")
+
+        # Always sync cluster caches first (needed before auto-apply colour below)
+        if self.clusteranalysis.labels_cache:
+            self.cluster_labels_cache = dict(self.clusteranalysis.labels_cache)
+            self.coord_cache = dict(self.clusteranalysis.coord_cache)
+            logger.info("Cluster labels cache updated (%d files)", len(self.cluster_labels_cache))
+
+        # Single-file cluster analysis: caches updated, auto-apply colour, no plot
+        if value.csv is None:
+            opts = self.clusteranalysis.options
+            if opts and opts.colour_mode != "none":
+                self._handle_apply_cluster_colour(opts.colour_mode, opts.colour_cmap)
+            return
+
         self.plot_lineEdit.setText(str(value.csv))
         self.log_message(f"Accepting incoming result to GUI {value}", "debug")
         if value.selected:
@@ -1623,14 +1756,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.output_folder = value.folder
             self.log_message(f"Output folder updated: [{self.output_folder}]", "debug")
 
-        # Sync cluster labels if cluster analysis just completed
-        if self.clusteranalysis.labels_cache:
-            self.cluster_labels_cache = dict(self.clusteranalysis.labels_cache)
-            self._add_cluster_colour_option()
-            logger.info("Cluster labels cache updated (%d files)", len(self.cluster_labels_cache))
-
         logger.debug("About to call replotting_called()")
-        # Automatically show plot dialog after results are set
         self.replotting_called()
         logger.debug("Returned from replotting_called()")
 
@@ -1746,8 +1872,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def setCurrentXYZIndex(self, value):
         self.sim_num = value
         self.openglwidget.get_XYZ_from_list(value=value)
-        if self.visualizationSettings.widgets["Color By"].value == "Cluster Membership":
+        if self._active_colour_mode == "cluster" and self.cluster_labels_cache:
             self._apply_cluster_colours()
+        elif self._active_colour_mode == "coord" and self.coord_cache:
+            self._apply_coord_colours(self._active_colour_cmap)
         self.crystal = self.openglwidget.crystal
         self.movie_controls_frame.hide()
 
@@ -1771,7 +1899,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         with QSignalBlocker(self.xyz_spinBox):
             self.xyz_spinBox.setValue(value)
 
-        self.update_XYZ_info(self.openglwidget.xyz)
+        self.update_XYZ_info()
 
         self._update_docking_for_current_xyz()
         self._update_checkpoint_for_current_xyz()
@@ -1858,19 +1986,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._update_color_by_options_for_style(new_style, settings)
             settings = self.visualizationSettings.settings()  # re-read updated color_by
 
-        color_by = settings.get("Color By")
-        prev = self._prev_color_by
-        self._prev_color_by = color_by
+        self._prev_color_by = settings.get("Color By")
 
-        if color_by == "Cluster Membership":
-            safe = dict(settings)
-            safe["Color By"] = "Layer"
-            self.openglwidget.updateSettings(**safe)
-            self._apply_cluster_colours()
-        else:
-            if prev == "Cluster Membership":
-                self.openglwidget.clear_highlighted_sites()
-            self.openglwidget.updateSettings(**settings)
+        self.openglwidget.updateSettings(**settings)
 
         # Keep "Atom Mode Settings" menu item in sync with current style
         self.actionAtomModeSettings.setEnabled(new_style in ("Atoms", "Unit Cell"))
@@ -2031,7 +2149,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def update_frame(self, frame):
         self.frame = frame
         self.openglwidget.pass_XYZ(self.crystal.get_raw_frame_coords(frame))
-        self.update_XYZ_info(self.openglwidget.xyz)
+        self.update_XYZ_info()
         try:
             self.openglwidget.initGeometry()
         except AttributeError:

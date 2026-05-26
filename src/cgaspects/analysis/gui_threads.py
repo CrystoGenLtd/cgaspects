@@ -540,19 +540,20 @@ class WorkerClusters(CancellableRunnable):
         self.signals.message.emit(f"Starting cluster analysis on {len(self.xyz_files)} files…")
 
         try:
-            csv_path, labels_cache = run_cluster_analysis(
+            csv_path, labels_cache, coord_cache = run_cluster_analysis(
                 xyz_files=self.xyz_files,
                 information=self.information,
                 options=self.options,
                 output_folder=self.output_folder,
                 signals=self.signals,
             )
-            if csv_path is None:
-                pass  # cancelled signal already emitted from inside run_cluster_analysis
+            single_file_mode = getattr(self.options, "files_to_analyse", None) is not None
+            if csv_path is None and not single_file_mode:
+                pass  # cancelled — signal already emitted from inside run_cluster_analysis
             else:
-                self.signals.result.emit((csv_path, labels_cache))
+                self.signals.result.emit((csv_path, labels_cache, coord_cache))
         except Exception as e:
             logger.error("WorkerClusters failed: %s", e)
-            self.signals.result.emit((None, {}))
+            self.signals.result.emit((None, {}, {}))
         finally:
             self.signals.finished.emit()
