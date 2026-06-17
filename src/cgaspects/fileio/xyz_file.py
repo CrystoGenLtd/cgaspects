@@ -330,6 +330,58 @@ class CrystalCloud:
 
         return cls(filepath=filepath, frames=frames, xyz=xyz)
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_file: "str | Path",
+        n_tiles: int,
+        crystallography,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> "CrystalCloud":
+        """Build a CrystalCloud from a CrystalGrower checkpoint file.
+
+        Occupied grid cells are converted to Cartesian Å via *crystallography*,
+        centred, and stored as a single Frame so the rest of the visualisation
+        pipeline can treat this like any other crystal.
+
+        Parameters
+        ----------
+        checkpoint_file:
+            Path to the ``*_checkpoint.txt`` file.
+        n_tiles:
+            Number of tile types in the simulation (required by the checkpoint
+            parser to allocate the occupancy grid).
+        crystallography:
+            :class:`~cgaspects.gui.utils.crystallography.Crystallography`
+            instance used to convert fractional grid indices to Cartesian Å.
+        progress_callback:
+            Optional ``(current, total)`` callback forwarded to the checkpoint
+            parser.
+        """
+        from .cg_checkpoint import Checkpoint
+
+        checkpoint = Checkpoint.from_file(
+            checkpoint_file,
+            n_tiles,
+            crysallography=crystallography,
+            progress_callback=progress_callback,
+        )
+
+        coords = checkpoint.to_cartesian().astype(np.float32)
+        if coords.size:
+            coords -= coords.mean(axis=0)
+
+        # Pack into the (N, 7) layout expected by VisualData.from_xyz:
+        # col 0 = mol_type, cols 3:6 = xyz, rest zeros.
+        n = len(coords)
+        raw = np.zeros((n, 7), dtype=np.float32)
+        raw[:, 0] = 1
+        raw[:, 3:6] = coords
+
+        frames = Frames([Frame(raw=raw, comment="checkpoint")])
+        xyz = cls.normalise_verts(coords.copy()) if coords.size else coords
+        return cls(filepath=Path(checkpoint_file), frames=frames, xyz=xyz)
+
     def get_raw_frame_coords(self, frame_idx: int = 0) -> Optional[np.ndarray]:
         """Get coordinates for a specific frame."""
         return self.frames.get_raw_coords(frame_idx)

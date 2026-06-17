@@ -28,11 +28,12 @@ from PySide6.QtWidgets import (
 from ..analysis.aspect_ratios import AspectRatio
 from ..analysis.cluster_analysis import ClusterAnalysis
 from ..analysis.growth_rates import GrowthRate
-from ..analysis.gui_threads import WorkerXYZ
+from ..analysis.gui_threads import WorkerCheckpoint, WorkerXYZ
 from ..analysis.site_analysis import SiteAnalysis
 from ..fileio.cg_checkpoint import Checkpoint
 from ..fileio.find_data import (
     find_info,
+    locate_checkpoint_files,
     locate_xyz_files,
 )
 from ..fileio.structure import Structure
@@ -501,12 +502,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         actIncrease = QAction("Increase", self)
         actIncrease.setObjectName("actionIncreasePointSize")
         actIncrease.setShortcut("Ctrl+=")
-        actIncrease.triggered.connect(self.openglwidget.increase_point_size)
+        ps_widget = self.visualizationSettings.widgets["Point Size"]
+        actIncrease.triggered.connect(
+            lambda: ps_widget.setValue(ps_widget.value + ps_widget.step)
+        )
         menuPointSize.addAction(actIncrease)
         actDecrease = QAction("Decrease", self)
         actDecrease.setObjectName("actionDecreasePointSize")
         actDecrease.setShortcut("Ctrl+-")
-        actDecrease.triggered.connect(self.openglwidget.decrease_point_size)
+        actDecrease.triggered.connect(
+            lambda: ps_widget.setValue(ps_widget.value - ps_widget.step)
+        )
         menuPointSize.addAction(actDecrease)
         self.menuView.addMenu(menuPointSize)
 
@@ -1319,11 +1325,25 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return False
 
         self.log_message("Reading Images...", "info")
-        xyz_files, docking_xyz_files = locate_xyz_files(folder)
+        result = locate_xyz_files(folder)
 
-        # Check for valid data, folder reinitialised as a Path object
-        if xyz_files is None:
-            return False
+        if result is None:
+            # No XYZ files — try checkpoint files as a point-cloud fallback
+            checkpoint_fallback = locate_checkpoint_files(folder)
+            if not checkpoint_fallback:
+                self.log_message(
+                    "No XYZ or checkpoint files found in the selected folder.", "warning"
+                )
+                return False
+            self.log_message(
+                f"No XYZ files found. Falling back to {len(checkpoint_fallback)} "
+                "checkpoint file(s) as point clouds.",
+                "warning",
+            )
+            xyz_files = checkpoint_fallback
+            docking_xyz_files = []
+        else:
+            xyz_files, docking_xyz_files = result
 
         self.xyz_files = xyz_files
 
@@ -1384,6 +1404,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if n_xyz > 0:
             self.set_batch_type()
             self.init_opengl()
+
+            # Checkpoint-only folders: load the point cloud asynchronously so
+            # the UI stays responsive during the (potentially slow) parse.
+            if Path(str(self.xyz_files[0])).stem.endswith("_checkpoint"):
+                if self._structure is None or self.crystallography is None:
+                    self.log_message(
+                        "Load a structure file to visualise checkpoint data as a point cloud.",
+                        "warning",
+                    )
+                    self.openglwidget.showNoDataOverlay()
+                else:
+                    self._dispatch_checkpoint_as_crystal(0)
+                self.aspect_ratio_pushButton.setEnabled(True)
+                self.variablesTabWidget.setCurrentIndex(0)
+                self.actionImport_Summary_File.setEnabled(True)
+                return
 
             crystal_found = False
             try:
@@ -1462,7 +1498,23 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             def prog(val, tot):
                 self.update_progressbar(100.0 * val / tot)
 
-            self.crystal = CrystalCloud.from_file(full_file_path, progress_callback=prog)
+            if Path(str(full_file_path)).stem.endswith("_checkpoint"):
+                if self._structure is None or self.crystallography is None:
+                    self.log_message(
+                        "Checkpoint point cloud requires a structure file — "
+                        "load one via the Structure menu.",
+                        "warning",
+                    )
+                    self.crystal = CrystalCloud(filepath=Path(str(full_file_path)))
+                else:
+                    self.crystal = CrystalCloud.from_checkpoint(
+                        full_file_path,
+                        self._structure.n_tiles,
+                        self.crystallography,
+                    )
+            else:
+                self.crystal = CrystalCloud.from_file(full_file_path, progress_callback=prog)
+
             self.clear_progressbar()
 
             return self.crystal
@@ -1876,7 +1928,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._apply_cluster_colours()
         elif self._active_colour_mode == "coord" and self.coord_cache:
             self._apply_coord_colours(self._active_colour_cmap)
-        self.crystal = self.openglwidget.crystal
+        if self.openglwidget.crystal is not None:
+            self.crystal = self.openglwidget.crystal
         self.movie_controls_frame.hide()
 
         if self.crystal is not None and self.crystal.empty:
@@ -1939,7 +1992,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.log_message(f"Failed to load docking file: {exc}", "error")
 
     def _load_checkpoint_for_current_xyz(self):
-        """Load checkpoint data for the current XYZ into the GL widget."""
+        """Dispatch a background worker to load the checkpoint for the current simulation."""
         if self.sim_num is None or not self.xyz_files:
             return
         current_path = self.xyz_files[self.sim_num]
@@ -1952,19 +2005,67 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 "No structure file found — cannot read n_tiles for checkpoint", "warning"
             )
             return
-        try:
-            checkpoint = Checkpoint.from_file(
-                checkpoint_path,
-                self._structure.n_tiles,
-                crysallography=self.crystallography,
-            )
-            self.openglwidget.set_checkpoint(checkpoint)
-            self.log_message(
-                f"Checkpoint loaded: {checkpoint_path.name} ({checkpoint.n_filled:,} filled cells)",
-                "info",
-            )
-        except (OSError, ValueError) as exc:
-            self.log_message(f"Failed to load checkpoint file: {exc}", "error")
+        worker = WorkerCheckpoint(
+            checkpoint_path,
+            self._structure.n_tiles,
+            self.crystallography,
+        )
+        worker.signals.result.connect(self._on_checkpoint_loaded_for_view)
+        worker.signals.error.connect(
+            lambda err: self.log_message(f"Failed to load checkpoint: {err[1]}", "error")
+        )
+        self.set_progressbar()
+        worker.signals.finished.connect(self.clear_progressbar)
+        self.threadpool.start(worker)
+
+    def _on_checkpoint_loaded_for_view(self, checkpoint):
+        """Receive a loaded Checkpoint and push it to the GL widget (grid/view mode)."""
+        self.openglwidget.set_checkpoint(checkpoint)
+        self.log_message(
+            f"Checkpoint loaded: {checkpoint.filepath.name} ({checkpoint.n_filled:,} filled cells)",
+            "info",
+        )
+
+    def _dispatch_checkpoint_as_crystal(self, index):
+        """Start a worker to load checkpoint file *index* as a point-cloud CrystalCloud."""
+        checkpoint_path = self.xyz_files[index]
+        worker = WorkerCheckpoint(
+            checkpoint_path,
+            self._structure.n_tiles,
+            self.crystallography,
+        )
+        worker.signals.result.connect(self._on_checkpoint_loaded_as_crystal)
+        worker.signals.error.connect(
+            lambda err: self.log_message(f"Checkpoint point-cloud error: {err[1]}", "error")
+        )
+        self.set_progressbar()
+        worker.signals.finished.connect(self.clear_progressbar)
+        self.threadpool.start(worker)
+
+    def _on_checkpoint_loaded_as_crystal(self, checkpoint):
+        """Convert a loaded Checkpoint to a CrystalCloud and initialise the visualiser."""
+        import numpy as np
+        from ..fileio.xyz_file import CrystalCloud, Frames, Frame
+
+        coords = checkpoint.to_cartesian().astype(np.float32)
+        if coords.size:
+            coords -= coords.mean(axis=0)
+
+        # VisualData.from_xyz expects (N, 7) with mol_type in col 0 and xyz in cols 3:6.
+        n = len(coords)
+        raw = np.zeros((n, 7), dtype=np.float32)
+        raw[:, 0] = 1           # mol_type
+        raw[:, 3:6] = coords
+
+        frames = Frames([Frame(raw=raw, comment="checkpoint")])
+        xyz = CrystalCloud.normalise_verts(coords.copy()) if coords.size else coords
+        self.crystal = CrystalCloud(filepath=checkpoint.filepath, frames=frames, xyz=xyz)
+
+        if not self.crystal.empty:
+            self.sim_num = 0
+            self.init_crystal()
+        else:
+            self.openglwidget.showNoDataOverlay()
 
     def updateVisualizationSettings(self):
         pass

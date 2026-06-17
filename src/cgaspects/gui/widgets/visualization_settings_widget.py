@@ -277,7 +277,7 @@ class VisualizationSettingsWidget(QWidget):
         layout.setSpacing(5)
         self.widgets = {}
 
-        w = LabelledDoubleSlider("Point Size", vrange=(0.5, 30.0), steps=30, parent=self)
+        w = LabelledDoubleSlider("Point Size", vrange=(0.5, 100.0), steps=100, parent=self)
         w.setValue(20.0)
 
         self.widgets["Point Size"] = w

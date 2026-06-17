@@ -107,6 +107,35 @@ class WorkerXYZ(CancellableRunnable):
         self.signals.finished.emit()
 
 
+class WorkerCheckpoint(CancellableRunnable):
+    """Load a Checkpoint from a checkpoint file on a background thread.
+
+    Emits the raw :class:`~cgaspects.fileio.cg_checkpoint.Checkpoint` object
+    via ``signals.result``.  Callers decide whether to pass it to
+    ``openglwidget.set_checkpoint()`` (grid view) or convert it to a
+    ``CrystalCloud`` (point-cloud view).
+    """
+
+    def __init__(self, checkpoint_file, n_tiles, crystallography):
+        super().__init__()
+        self.checkpoint_file = checkpoint_file
+        self.n_tiles = n_tiles
+        self.crystallography = crystallography
+
+    @emit_error_on_exception
+    @Slot()
+    def run(self):
+        from ..fileio.cg_checkpoint import Checkpoint
+
+        checkpoint = Checkpoint.from_file(
+            self.checkpoint_file,
+            self.n_tiles,
+            self.crystallography,
+        )
+        self.signals.result.emit(checkpoint)
+        self.signals.finished.emit()
+
+
 class WorkerAspectRatios(CancellableRunnable):
     def __init__(
         self,

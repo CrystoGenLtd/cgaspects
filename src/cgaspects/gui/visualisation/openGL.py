@@ -203,7 +203,12 @@ class VisualisationWidget(QOpenGLWidget):
     def get_XYZ_from_list(self, value):
         if self.sim_num != value:
             self.sim_num = value
-            self.crystal = CrystalCloud.from_file(self.xyz_path_list[value])
+            path = self.xyz_path_list[value]
+            if Path(path).stem.endswith("_checkpoint"):
+                # Checkpoint files are loaded via set_checkpoint(); skip here.
+                self.showNoDataOverlay()
+                return
+            self.crystal = CrystalCloud.from_file(path)
             if self.crystal.empty:
                 self.showNoDataOverlay()
                 return
@@ -995,16 +1000,6 @@ class VisualisationWidget(QOpenGLWidget):
 
     def store_view(self):
         self.camera.storeOrientation()
-
-    def increase_point_size(self):
-        self.point_size = min(self.point_size + 1.0, 30.0)
-        self.pointSizeChanged.emit(int(self.point_size))
-        self.update()
-
-    def decrease_point_size(self):
-        self.point_size = max(self.point_size - 1.0, 0.5)
-        self.pointSizeChanged.emit(int(self.point_size))
-        self.update()
 
     def set_point_size(self, value: int):
         self.point_size = float(value)
