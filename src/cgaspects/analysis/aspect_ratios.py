@@ -8,7 +8,6 @@ from PySide6.QtWidgets import QDialog, QWidget
 from ..fileio.find_data import (combine_xyz_cda, create_aspects_folder,
                                 find_info, summary_compare)
 from ..gui.dialogs.aspectratio_dialog import AnalysisOptionsDialog
-from ..gui.dialogs.plot_dialog import PlottingDialog
 from ..plot.plot_data import Plotting
 from ..utils.data_structures import ar_selection_tuple, results_tuple
 from .ar_dataframes import (build_cda, build_ratio_equations, collect_all,
@@ -134,16 +133,15 @@ class AspectRatio(QWidget):
         self.plot(plotting_csv=plotting_csv)
 
     def plot(self, plotting_csv):
-        # self.circular_progress.hide()
+        # Generate the static plot files. The interactive PlottingDialog is
+        # opened by the main window in response to the result signal emitted in
+        # set_plotting() -- opening one here too would show the window twice.
         if self.options.plotting:
             self.perform_plotting(
                 csv_file=plotting_csv,
                 folderpath=self.output_folder,
                 selected_directions=self.options.selected_directions,
             )
-
-        PlottingDialogs = PlottingDialog(csv=plotting_csv, signals=self.signals)
-        PlottingDialogs.show()
 
     def perform_plotting(self, csv_file, folderpath, selected_directions=None):
         plotting = Plotting()

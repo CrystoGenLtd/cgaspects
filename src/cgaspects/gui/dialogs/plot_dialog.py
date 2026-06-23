@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from cgaspects.utils.naming import simulation_id_from_path
 from cgaspects.gui.dialogs.axes_customization_dialog import AxesCustomizationDialog
 from cgaspects.gui.dialogs.data_filter_dialog import DataFilterDialog
 from cgaspects.gui.dialogs.plotsavedialog import PlotSaveDialog
@@ -80,6 +81,7 @@ class PlottingDialog(QDialog):
 
         self.signals = signals
         self.summary_df = summary_df  # Summary file dataframe for mapping file prefixes to values
+        self._xyz_index_by_name = {}
         self._axes_dialog = None  # persistent AxesCustomizationDialog instance
         self.annot = None
         self.trendline = None
@@ -153,6 +155,7 @@ class PlottingDialog(QDialog):
 
         self.csv = csv
         self.site_analysis_data = None
+        self._build_xyz_index_map()  # rebuild name -> xyz index map for click resolution
 
         if isinstance(self.csv, pd.DataFrame):
             self.df_original = self.csv.copy()
@@ -2947,6 +2950,31 @@ class PlottingDialog(QDialog):
         if not clicked_on_point:
             self.handle_whitespace_click()
 
+    def _build_xyz_index_map(self):
+        """Build a simulation-id -> xyz_files index lookup (rebuilt on each load).
+
+        Keys are produced with the same extraction used to build the dataframe's
+        "Simulation Number" column (simulation_id_from_path), so a clicked row's
+        value resolves to the right simulation with a single dict lookup -- no
+        separate numeric/name handling needed. The file list comes from the
+        parent main window's live xyz_files.
+        """
+        self._xyz_index_by_name = {}
+        xyz_files = getattr(self.parent(), "xyz_files", None)
+        if not xyz_files:
+            return
+        for idx, xyz_file in enumerate(xyz_files):
+            self._xyz_index_by_name.setdefault(simulation_id_from_path(xyz_file), idx)
+
+    def _resolve_xyz_index(self, sim_value):
+        """Map a row's "Simulation Number" value to an index into xyz_files."""
+        if sim_value is None:
+            return None
+        idx = self._xyz_index_by_name.get(str(sim_value))
+        if idx is None:
+            logger.warning("Could not match Simulation Number '%s' to an XYZ file", sim_value)
+        return idx
+
     def handle_click(self, scatter, _colour_data, _column_name, ind):
         """Handle click event on scatter plot points."""
         # index of the clicked point
@@ -2972,11 +3000,8 @@ class PlottingDialog(QDialog):
         if self.df is not None and point_index < len(self.df):
             row_data = self.df.iloc[point_index]
 
-            try:
-                _sim_id = int(row_data["Simulation Number"] - 1)
-            except KeyError:
-                _sim_id = None
-            if self.signals:
+            _sim_id = self._resolve_xyz_index(row_data.get("Simulation Number"))
+            if self.signals and _sim_id is not None:
                 self.signals.sim_id.emit(_sim_id)
             logger.info(f"Clicked on row {point_index}: {row_data}")
         else:

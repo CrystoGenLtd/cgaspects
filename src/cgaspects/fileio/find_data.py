@@ -286,7 +286,8 @@ def summary_compare(summary_csv, aspect_csv=False, aspect_df=""):
         sim_num = None
         try:
             sim_num = int(row["Simulation Number"]) - 1 + start_num
-        except TypeError:
+        except (TypeError, ValueError):
+            # non-numeric id (e.g. a solvent name) -> use it verbatim as the key
             sim_num = row["Simulation Number"]
         except KeyError:
             sim_num = row.iloc[0]

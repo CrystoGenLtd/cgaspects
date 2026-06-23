@@ -150,13 +150,6 @@ class SiteAnalysis:
         self.signals.result.emit(result)
         logger.info("Plotting information sent to GUI successfully")
 
-    def plot(self, plotting_csv):
-        """Show the plotting dialog for site analysis data."""
-        from ..gui.dialogs.plot_dialog import PlottingDialog
-
-        PlottingDialogs = PlottingDialog(csv=plotting_csv, signals=self.signals)
-        PlottingDialogs.show()
-
     def get_location(self, location):
         self.output_folder = location
         self.signals.location.emit(location)

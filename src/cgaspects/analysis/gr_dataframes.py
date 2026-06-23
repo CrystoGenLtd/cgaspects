@@ -1,9 +1,10 @@
 import logging
-import re
 from typing import List
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+from ..utils.naming import simulation_id_from_path
 
 logger = logging.getLogger("CA:GR-Dataframes")
 
@@ -65,6 +66,7 @@ def build_growthrates(
 
     growth_list = []
     kept_supersats = []
+    sim_numbers = []
 
     # In "index" mode we never look at the time column
     use_index_for_all = xaxis_mode == "index"
@@ -74,6 +76,7 @@ def build_growthrates(
         restart = False
         growth_list = []
         kept_supersats = []
+        sim_numbers = []
 
         for i, f in enumerate(size_file_list):
             if signals is not None and signals.cancel_flag.is_set():
@@ -137,8 +140,7 @@ def build_growthrates(
                     else:
                         x_data = x_time
 
-            tokens = re.findall(r"\d+", f.name)
-            sim_num = int(tokens[-1])
+            sim_num = simulation_id_from_path(f)
 
             # Keep rows only up to the first row where any direction is 0
             all_positive = np.all(
@@ -151,7 +153,7 @@ def build_growthrates(
             mask = np.zeros(len(all_positive), dtype=bool)
             mask[:cutoff] = True
 
-            gr_list = [sim_num]
+            gr_list = []
             for direction in directions:
                 y_data = np.asarray(lt_df[direction], dtype=float)
                 if mask.sum() < 2:
@@ -162,6 +164,7 @@ def build_growthrates(
 
             growth_list.append(gr_list)
             kept_supersats.append(supersat_list[i])
+            sim_numbers.append(sim_num)
 
             if signals:
                 prog = (100 * (i + 1)) // n_size_files
@@ -171,8 +174,9 @@ def build_growthrates(
         logger.warning("No files were processed successfully")
         return None
 
-    growth_array = np.asarray(growth_list)
-    gr_df = pd.DataFrame(growth_array, columns=["Simulation Number"] + directions)
+    growth_array = np.asarray(growth_list, dtype=float)
+    gr_df = pd.DataFrame(growth_array, columns=directions)
+    gr_df.insert(0, "Simulation Number", sim_numbers)
     gr_df.insert(1, "Supersaturation", kept_supersats)
 
     return gr_df
