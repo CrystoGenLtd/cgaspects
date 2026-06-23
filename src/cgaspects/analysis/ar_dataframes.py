@@ -1,12 +1,12 @@
 import logging
 import os
-import re
 from itertools import permutations
 from pathlib import Path
 import pandas as pd
 
 from .shape_analysis import ShapeAnalyser
 from ..fileio.xyz_file import CrystalCloud
+from ..utils.naming import simulation_id_from_path
 
 LOG = logging.getLogger("CA:AR-Dataframes")
 
@@ -242,10 +242,7 @@ def collect_all(folder: Path = None, xyz_files: list[Path] = None, signals=None)
             LOG.info("Aspect ratio analysis cancelled after %d / %d files.", i - 1, n_xyzs)
             signals.cancelled.emit()
             return None
-        try:
-            sim_num = re.findall(r"\d+", file.name)[-1]
-        except IndexError:
-            sim_num = file.name.split("_")[0]
+        sim_num = simulation_id_from_path(file)
         try:
             crystal = CrystalCloud.from_file(file)
             shape_analyser.analyse_crystal(crystal, frame_idx=None)
