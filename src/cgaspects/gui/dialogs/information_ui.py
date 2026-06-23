@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'information.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.7.2
+## Created by: Qt User Interface Compiler version 6.11.1
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -61,22 +61,22 @@ class Ui_information_Dialog(object):
     def retranslateUi(self, information_Dialog):
         information_Dialog.setWindowTitle(QCoreApplication.translate("information_Dialog", u"Dialog", None))
         ___qtablewidgetitem = self.tableWidget.horizontalHeaderItem(0)
-        ___qtablewidgetitem.setText(QCoreApplication.translate("information_Dialog", u"Value", None));
+        ___qtablewidgetitem.setText(QCoreApplication.translate("information_Dialog", u"Value", None))
         ___qtablewidgetitem1 = self.tableWidget.horizontalHeaderItem(1)
-        ___qtablewidgetitem1.setText(QCoreApplication.translate("information_Dialog", u"Units", None));
+        ___qtablewidgetitem1.setText(QCoreApplication.translate("information_Dialog", u"Units", None))
         ___qtablewidgetitem2 = self.tableWidget.verticalHeaderItem(0)
-        ___qtablewidgetitem2.setText(QCoreApplication.translate("information_Dialog", u"Aspect Ratio (S:M)", None));
+        ___qtablewidgetitem2.setText(QCoreApplication.translate("information_Dialog", u"Aspect Ratio (S:M)", None))
         ___qtablewidgetitem3 = self.tableWidget.verticalHeaderItem(1)
-        ___qtablewidgetitem3.setText(QCoreApplication.translate("information_Dialog", u"Aspect Ratio (M:L)", None));
+        ___qtablewidgetitem3.setText(QCoreApplication.translate("information_Dialog", u"Aspect Ratio (M:L)", None))
         ___qtablewidgetitem4 = self.tableWidget.verticalHeaderItem(2)
-        ___qtablewidgetitem4.setText(QCoreApplication.translate("information_Dialog", u"General Shape", None));
+        ___qtablewidgetitem4.setText(QCoreApplication.translate("information_Dialog", u"General Shape", None))
         ___qtablewidgetitem5 = self.tableWidget.verticalHeaderItem(3)
-        ___qtablewidgetitem5.setText(QCoreApplication.translate("information_Dialog", u"Surface Area : Volume", None));
+        ___qtablewidgetitem5.setText(QCoreApplication.translate("information_Dialog", u"Surface Area : Volume", None))
         ___qtablewidgetitem6 = self.tableWidget.verticalHeaderItem(4)
-        ___qtablewidgetitem6.setText(QCoreApplication.translate("information_Dialog", u"Crystal Surface Area", None));
+        ___qtablewidgetitem6.setText(QCoreApplication.translate("information_Dialog", u"Crystal Surface Area", None))
         ___qtablewidgetitem7 = self.tableWidget.verticalHeaderItem(5)
-        ___qtablewidgetitem7.setText(QCoreApplication.translate("information_Dialog", u"Crystal Volume", None));
+        ___qtablewidgetitem7.setText(QCoreApplication.translate("information_Dialog", u"Crystal Volume", None))
         ___qtablewidgetitem8 = self.tableWidget.verticalHeaderItem(6)
-        ___qtablewidgetitem8.setText(QCoreApplication.translate("information_Dialog", u"Space Group", None));
+        ___qtablewidgetitem8.setText(QCoreApplication.translate("information_Dialog", u"Space Group", None))
     # retranslateUi
 
