@@ -410,6 +410,49 @@ def parse_multiple_site_csvs(csv_paths: List[Path]) -> List[Dict]:
     return results
 
 
+# Per-site colour fields exposed to the checkpoint viewer. Keys are the labels
+# shown in the "Color By" combo; values pull a scalar out of a parsed site dict.
+SITE_METADATA_FIELDS: dict[str, callable] = {
+    "Coordination": lambda s: s.get("coordination"),
+    "Energy": lambda s: s.get("energy"),
+    "Events/Population": lambda s: (
+        s.get("total_events")
+        if s.get("total_events") is not None
+        else s.get("total_population")
+    ),
+}
+
+
+def build_site_metadata_maps(merged_results: Dict[str, Dict]) -> Dict[str, Dict[int, float]]:
+    """Build {field_label: {site_number: value}} maps from merged site results.
+
+    Site numbers are global across files, so sites from every prefix are merged
+    into a single lookup per field (a later prefix wins on collision). Sites with
+    a ``None`` value for a field are simply omitted from that field's map.
+    """
+    maps: Dict[str, Dict[int, float]] = {label: {} for label in SITE_METADATA_FIELDS}
+
+    for result in merged_results.values():
+        for site_num, site_data in result.get("sites", {}).items():
+            site_num = int(site_num)
+            for label, getter in SITE_METADATA_FIELDS.items():
+                value = getter(site_data)
+                if value is not None:
+                    maps[label][site_num] = float(value)
+
+    return maps
+
+
+def load_site_metadata_maps(json_path: Path) -> Dict[str, Dict[int, float]]:
+    """Load the saved site-analysis JSON and build per-field site→value maps."""
+    import json
+
+    with open(json_path, encoding="utf-8") as fh:
+        merged_results = json.load(fh)
+
+    return build_site_metadata_maps(merged_results)
+
+
 def get_site_summary(parsed_data: Dict) -> Dict:
     """
     Generate a summary of the parsed site data.

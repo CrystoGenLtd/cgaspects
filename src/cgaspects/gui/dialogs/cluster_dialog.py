@@ -147,6 +147,42 @@ class ClusterAnalysisDialog(QDialog):
         layout.addWidget(params_group)
         self._params_group = params_group
 
+        # --- Radial profile (distance from origin, using site-analysis metadata) ---
+        radial_group = QGroupBox("Radial Profile")
+        radial_group.setCheckable(True)
+        radial_group.setChecked(False)
+        radial_group.setToolTip(
+            "Write radial_analysis.csv: point density and the proportion of points "
+            "with each coordination number / energy level versus distance from the "
+            "origin. Coordination and energy are read from the site-analysis metadata."
+        )
+        radial_layout = QFormLayout()
+
+        self.radial_bins_spin = QSpinBox()
+        self.radial_bins_spin.setRange(2, 500)
+        self.radial_bins_spin.setValue(30)
+        self.radial_bins_spin.setToolTip("Number of radial shells (bins) from the origin.")
+        radial_layout.addRow("Radial bins:", self.radial_bins_spin)
+
+        self.radial_source_combo = QComboBox()
+        self.radial_source_combo.addItems(["XYZ point cloud", "Checkpoint grid"])
+        self.radial_source_combo.setToolTip(
+            "Source of points and site numbers. Checkpoint mode expands the grid "
+            "and needs a structure file loaded (skips KDTree clustering)."
+        )
+        radial_layout.addRow("Source:", self.radial_source_combo)
+
+        self.radial_middle_checkbox = QCheckBox("Include interior (middle) cells")
+        self.radial_middle_checkbox.setToolTip(
+            "Checkpoint source only: expand the full grid (edges + interior) rather "
+            "than just the surface strip-edge cells. Slower and much larger."
+        )
+        radial_layout.addRow("", self.radial_middle_checkbox)
+
+        radial_group.setLayout(radial_layout)
+        layout.addWidget(radial_group)
+        self._radial_group = radial_group
+
         run_row = QHBoxLayout()
         run_row.addStretch()
         self._run_btn = QPushButton("Run Analysis")
@@ -274,6 +310,12 @@ class ClusterAnalysisDialog(QDialog):
         else:
             files_to_analyse = None  # means "all"
 
+        radial_source = (
+            "checkpoint"
+            if self.radial_source_combo.currentText().startswith("Checkpoint")
+            else "xyz"
+        )
+
         return cluster_options_tuple(
             eps=self.eps_spin.value(),
             min_samples=self.min_samples_spin.value(),
@@ -284,4 +326,8 @@ class ClusterAnalysisDialog(QDialog):
             colour_mode=colour_mode,
             colour_cmap=self._cmap_combo.currentText(),
             files_to_analyse=files_to_analyse,
+            radial=self._radial_group.isChecked(),
+            radial_bins=self.radial_bins_spin.value(),
+            radial_source=radial_source,
+            radial_include_middle=self.radial_middle_checkbox.isChecked(),
         )

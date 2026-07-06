@@ -116,23 +116,85 @@ class WorkerCheckpoint(CancellableRunnable):
     ``CrystalCloud`` (point-cloud view).
     """
 
-    def __init__(self, checkpoint_file, n_tiles, crystallography):
+    def __init__(self, checkpoint_file, n_tiles, crystallography, build_visual_data=False):
         super().__init__()
         self.checkpoint_file = checkpoint_file
         self.n_tiles = n_tiles
         self.crystallography = crystallography
+        self.build_visual_data = build_visual_data
 
     @emit_error_on_exception
     @Slot()
     def run(self):
         from ..fileio.cg_checkpoint import Checkpoint
 
+        # File read fills 0–70% of the bar; grid→point-cloud expansion the rest.
+        def read_progress(current, total):
+            if total:
+                self.signals.progress.emit(int(current / total * 70))
+
         checkpoint = Checkpoint.from_file(
             self.checkpoint_file,
             self.n_tiles,
             self.crystallography,
+            progress_callback=read_progress,
         )
+
+        # For the grid view, expand occupied cells to centroids here (off the GUI
+        # thread) so the main thread only has to upload to the GPU. Templates are
+        # attached later on the main thread where mol data lives.
+        if self.build_visual_data:
+            cryst = checkpoint.crystallography or self.crystallography
+            if cryst is not None:
+                from ..gui.visualisation.visual_data import VisualData
+
+                def expand_progress(current, total):
+                    if total:
+                        self.signals.progress.emit(70 + int(current / total * 30))
+
+                checkpoint.prebuilt_visual_data = VisualData.from_checkpoint(
+                    checkpoint, cryst, progress_callback=expand_progress
+                )
+        self.signals.progress.emit(100)
         self.signals.result.emit(checkpoint)
+        self.signals.finished.emit()
+
+
+class WorkerCheckpointExpand(CancellableRunnable):
+    """Expand a loaded Checkpoint grid into a VisualData on a background thread.
+
+    Used when the user switches interior (middle) cells on: expanding the full
+    grid (edges + middle) can be several times heavier than the edges-only load,
+    so it must stay off the GUI thread. Templates are attached later on the main
+    thread (where mol data lives), matching WorkerCheckpoint.
+    """
+
+    def __init__(self, checkpoint, crystallography, include_middle=True):
+        super().__init__()
+        self.checkpoint = checkpoint
+        self.crystallography = crystallography
+        self.include_middle = include_middle
+
+    @emit_error_on_exception
+    @Slot()
+    def run(self):
+        from ..gui.visualisation.visual_data import VisualData
+
+        cryst = self.crystallography or self.checkpoint.crystallography
+
+        def expand_progress(current, total):
+            if total:
+                self.signals.progress.emit(int(current / total * 100))
+
+        vd = VisualData.from_checkpoint(
+            self.checkpoint, cryst, include_middle=self.include_middle,
+            progress_callback=expand_progress,
+        )
+        if self.is_cancelled:
+            self.signals.cancelled.emit()
+            self.signals.finished.emit()
+            return
+        self.signals.result.emit(vd)
         self.signals.finished.emit()
 
 
@@ -550,6 +612,9 @@ class WorkerClusters(CancellableRunnable):
         input_folder: Path,
         output_folder: Path,
         xyz_files: list[Path],
+        site_metadata=None,
+        crystallography=None,
+        n_tiles: int | None = None,
     ):
         super().__init__()
         self.information = information
@@ -557,6 +622,9 @@ class WorkerClusters(CancellableRunnable):
         self.input_folder = input_folder
         self.output_folder = output_folder
         self.xyz_files = xyz_files
+        self.site_metadata = site_metadata
+        self.crystallography = crystallography
+        self.n_tiles = n_tiles
 
     @emit_error_on_exception
     def run(self):
@@ -575,6 +643,9 @@ class WorkerClusters(CancellableRunnable):
                 options=self.options,
                 output_folder=self.output_folder,
                 signals=self.signals,
+                site_metadata=self.site_metadata,
+                crystallography=self.crystallography,
+                n_tiles=self.n_tiles,
             )
             single_file_mode = getattr(self.options, "files_to_analyse", None) is not None
             if csv_path is None and not single_file_mode:

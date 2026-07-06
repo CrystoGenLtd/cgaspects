@@ -16,6 +16,8 @@ from PySide6.QtGui import QOpenGLExtraFunctions
 from PySide6.QtOpenGL import (QOpenGLBuffer, QOpenGLShader,
                               QOpenGLShaderProgram, QOpenGLVertexArrayObject)
 
+from .shading import LIGHTING_GLSL
+
 
 class BondRenderer(QOpenGLExtraFunctions):
     """Instanced cylinder renderer for bond half-segments."""
@@ -40,9 +42,11 @@ class BondRenderer(QOpenGLExtraFunctions):
 
     out vec4 v_color;
     out vec3 v_normal;
-    out vec3 v_position;
+    out vec3 v_viewPos;
 
     uniform mat4 u_viewMat;
+    uniform mat4 u_modelMat;
+    uniform mat4 u_modelViewMat;
     uniform mat4 u_modelViewProjectionMat;
     uniform float u_pointSize;
 
@@ -86,8 +90,8 @@ class BondRenderer(QOpenGLExtraFunctions):
         vec3 worldNorm = rot * vertexNormal;
 
         v_color    = vec4(iColor, 1.0);
-        v_normal   = normalize(mat3(u_viewMat) * worldNorm);
-        v_position = worldPos;
+        v_normal   = normalize(mat3(u_viewMat) * mat3(u_modelMat) * worldNorm);
+        v_viewPos  = (u_modelViewMat * vec4(worldPos, 1.0)).xyz;
         gl_Position = u_modelViewProjectionMat * vec4(worldPos, 1.0);
     }
     """
@@ -97,17 +101,18 @@ class BondRenderer(QOpenGLExtraFunctions):
 
     in vec4 v_color;
     in vec3 v_normal;
-    in vec3 v_position;
+    in vec3 v_viewPos;
 
     out vec4 fragColor;
 
-    const vec3 lightDir   = normalize(vec3(0.2, 0.5, 1.0));
-    const vec3 lightColor = vec3(1.0, 1.0, 1.0);
+    uniform int u_perspective;
+
+    __LIGHTING__
 
     void main() {
         vec3 norm = normalize(v_normal);
-        float diff = min(0.3 + 0.7 * max(dot(norm, lightDir), 0.0), 1.0);
-        fragColor = vec4(diff * lightColor * v_color.rgb, v_color.a);
+        vec3 viewDir = (u_perspective == 1) ? normalize(-v_viewPos) : vec3(0.0, 0.0, 1.0);
+        fragColor = vec4(shadeSurface(v_color.rgb, norm, viewDir, 0.0), v_color.a);
     }
     """
 
@@ -119,7 +124,10 @@ class BondRenderer(QOpenGLExtraFunctions):
 
         self.program = QOpenGLShaderProgram()
         self.program.addShaderFromSourceCode(QOpenGLShader.Vertex, self.vertex_shader_source)
-        self.program.addShaderFromSourceCode(QOpenGLShader.Fragment, self.fragment_shader_source)
+        self.program.addShaderFromSourceCode(
+            QOpenGLShader.Fragment,
+            self.fragment_shader_source.replace("__LIGHTING__", LIGHTING_GLSL),
+        )
         self.program.link()
 
         self.vao = QOpenGLVertexArrayObject()

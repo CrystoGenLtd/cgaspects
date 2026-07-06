@@ -410,6 +410,9 @@ class PlottingDialog(QDialog):
         # Initialize checkboxes
         self.checkbox_grid = QCheckBox("Show Grid")
         self.checkbox_legend = QCheckBox("Show Legend")
+        self.checkbox_line_plot = QCheckBox("Line Plot")
+        self.checkbox_line_plot.setToolTip("Connect points with lines (plt.plot 'o-') instead of scatter")
+        self.checkbox_line_plot.hide()  # Only visible in Custom mode
         self.checkbox_zingg = QCheckBox("Zingg")
         self.checkbox_corr_mat = QCheckBox("Correlation Matix")
         self.checkbox_cluster_mat = QCheckBox("Hierarchical Clustering")
@@ -448,6 +451,7 @@ class PlottingDialog(QDialog):
         self.button_group_data.clicked.connect(self.toggle_gr_grouping)
         self.checkbox_grid.stateChanged.connect(self.trigger_plot)
         self.checkbox_legend.stateChanged.connect(self.trigger_plot)
+        self.checkbox_line_plot.stateChanged.connect(self.trigger_plot)
         self.checkbox_zingg.stateChanged.connect(
             lambda: self._handle_plot_checkboxes(self.checkbox_zingg)
         )
@@ -529,6 +533,7 @@ class PlottingDialog(QDialog):
         hbox1.addWidget(self.toolbar)
         hbox1.addStretch()
         hbox1.addWidget(self.checkbox_legend)
+        hbox1.addWidget(self.checkbox_line_plot)
         hbox1.addWidget(self.checkbox_grid)
         hbox1.addWidget(self.label_pointsize)
         hbox1.addWidget(self.spin_point_size)
@@ -704,6 +709,7 @@ class PlottingDialog(QDialog):
             self.checkbox_zingg.show()
             self.checkbox_cluster_mat.setEnabled(True)
             self.checkbox_cluster_mat.show()
+            self.checkbox_line_plot.show()
             # Enable filter data button in Custom mode
             self.button_filter_data.setEnabled(True)
             # Hide hide bulk checkbox in Custom mode
@@ -874,6 +880,10 @@ class PlottingDialog(QDialog):
 
             # Hide time-series widget
             self.time_series_widget.hide()
+
+        # Hide line-plot checkbox for all non-Custom modes
+        if mode != "Custom":
+            self.checkbox_line_plot.hide()
 
         # Hide view-angle sliders and disable Z-inversion for all non-4D modes
         if mode != "4D":
@@ -1284,6 +1294,7 @@ class PlottingDialog(QDialog):
 
         self.grid = self.checkbox_grid.isChecked()
         self.show_legend = self.checkbox_legend.isChecked()
+        self.use_line_plot = self.checkbox_line_plot.isChecked()
         self.zingg = self.checkbox_zingg.isChecked()
         self.covmat = self.checkbox_corr_mat.isChecked()
         self.cluster_mat = self.checkbox_cluster_mat.isChecked()
@@ -1756,6 +1767,11 @@ class PlottingDialog(QDialog):
         if self.plot_type == "Growth Rates":
             return
         if self.permutation == 0:
+            self._set_data()
+            return
+        # Non-CDA CSVs (e.g. radial_analysis.csv) have no permutation column —
+        # nothing to mask, so fall back to the unmasked data.
+        if "CDA_Permutation" not in self.df.columns:
             self._set_data()
             return
         mask = self.df["CDA_Permutation"] == int(self.permutation)
@@ -2322,10 +2338,15 @@ class PlottingDialog(QDialog):
             scatter_kwargs["vmin"] = 0
             scatter_kwargs["vmax"] = 1
 
-        scatter = self.ax.scatter(**scatter_kwargs)
-        line = None
-        if add_line:
-            (line,) = self.ax.plot(x, y, label=label)
+        if getattr(self, "use_line_plot", False) and c is None:
+            markersize = max(2, int(self.point_size ** 0.5))
+            (line,) = self.ax.plot(x, y, marker=marker, linestyle="-", label=label, markersize=markersize)
+            scatter = None
+        else:
+            scatter = self.ax.scatter(**scatter_kwargs)
+            line = None
+            if add_line:
+                (line,) = self.ax.plot(x, y, label=label)
 
         if self.zingg:
             # Zingg specific modifications: dashed lines at 2/3 on both axes
@@ -2826,6 +2847,8 @@ class PlottingDialog(QDialog):
             # Function to handle hover event for a scatter plot
             def handle_hover(scatter):
                 nonlocal cont
+                if scatter is None:
+                    return
                 cont, ind = scatter.contains(event)
                 if cont:
                     self.update_annot(

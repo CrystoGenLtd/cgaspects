@@ -144,10 +144,10 @@ def analyse_frame(
         labels, coord_numbers = _cluster(all_coords, eps, min_samples, scale)
 
     # Coordination-number aggregate stats
-    out["coord_mean"] = float(coord_numbers.mean())
-    out["coord_std"] = float(coord_numbers.std())
-    out["coord_max"] = int(coord_numbers.max())
-    out["coord_min"] = int(coord_numbers.min())
+    out["CN_mean"] = float(coord_numbers.mean())
+    out["CN_std"] = float(coord_numbers.std())
+    out["CN_max"] = int(coord_numbers.max())
+    out["CN_min"] = int(coord_numbers.min())
 
     # Global metrics
     for k, v in _global_stats(labels).items():
@@ -194,12 +194,262 @@ def analyse_frame(
     return out, labels, coord_numbers
 
 
+# ---------------------------------------------------------------------------
+# Radial profile (distance from origin) using site-analysis metadata
+# ---------------------------------------------------------------------------
+
+# Above this many distinct coordination/energy levels we skip the per-level
+# proportion columns and keep only the shell mean, to avoid an unwieldy CSV.
+RADIAL_MAX_LEVELS = 40
+
+
+def radial_profile(
+    coords: np.ndarray,
+    site_numbers: np.ndarray | None,
+    site_metadata: dict[str, dict[int, float]] | None,
+    nbins: int,
+    origin: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Radial profile of point density and site-metadata proportions.
+
+    Points are binned into ``nbins`` shells by distance from *origin* (default
+    (0, 0, 0), the CrystalGrower nucleation seed). Coordination number and
+    energy are looked up per point from the site-analysis metadata maps using
+    the point's site number — the same mapping the checkpoint viewer uses to
+    colour by coordination/energy.
+
+    Returns one row per shell (wide format). Besides the geometry/density
+    columns, every distinct coordination number and energy level gets a
+    ``coord_<k>_frac`` / ``energy_<v>_frac`` column giving the proportion of
+    that shell's metadata-bearing points holding that value — one series per
+    value, ready for a multi-line custom plot.
+    """
+    coords = np.asarray(coords, dtype=float)
+    n = len(coords)
+    origin = np.zeros(3) if origin is None else np.asarray(origin, dtype=float)
+
+    dist = np.linalg.norm(coords - origin, axis=1) if n else np.zeros(0)
+    r_max = float(dist.max()) if n else 0.0
+    edges = np.linspace(0.0, r_max if r_max > 0 else 1.0, nbins + 1)
+    r_lo, r_hi = edges[:-1], edges[1:]
+    bin_idx = (
+        np.clip(np.digitize(dist, edges) - 1, 0, nbins - 1)
+        if n else np.zeros(0, dtype=int)
+    )
+
+    counts = np.bincount(bin_idx, minlength=nbins)
+    total = int(counts.sum())
+    shell_vol = (4.0 / 3.0) * np.pi * (r_hi ** 3 - r_lo ** 3)
+
+    df = pd.DataFrame(
+        {
+            "r_lo": r_lo,
+            "r_mid": 0.5 * (r_lo + r_hi),
+            "r_hi": r_hi,
+            "n_points": counts,
+            "density": counts / total if total else np.zeros(nbins),
+            "number_density": np.divide(
+                counts, shell_vol, out=np.zeros(nbins), where=shell_vol > 0
+            ),
+        }
+    )
+
+    if site_numbers is None or not site_metadata or n == 0:
+        return df
+
+    sites = np.asarray(site_numbers, dtype=float).astype(int)
+
+    def add_metric(label: str, mean_col: str, level_name) -> None:
+        vmap = site_metadata.get(label)
+        if not vmap:
+            return
+        vals = np.array([vmap.get(int(s), np.nan) for s in sites], dtype=float)
+        has = ~np.isnan(vals)
+        if not has.any():
+            return
+
+        # Denominator: points that carry a value for this metric, per shell —
+        # so per-shell proportions sum to 1 regardless of missing metadata.
+        valid_counts = np.bincount(bin_idx[has], minlength=nbins)
+        sums = np.bincount(bin_idx[has], weights=vals[has], minlength=nbins)
+        df[mean_col] = np.divide(
+            sums, valid_counts, out=np.full(nbins, np.nan), where=valid_counts > 0
+        )
+
+        levels = np.unique(np.round(vals[has], 3))
+        if len(levels) > RADIAL_MAX_LEVELS:
+            logger.info(
+                "Radial: %d distinct %s levels (> %d) — writing %s only",
+                len(levels), label, RADIAL_MAX_LEVELS, mean_col,
+            )
+            return
+
+        rounded = np.round(vals, 3)
+        for v in levels:
+            sel = has & (rounded == v)
+            per_bin = np.bincount(bin_idx[sel], minlength=nbins)
+            df[level_name(v)] = np.divide(
+                per_bin, valid_counts, out=np.zeros(nbins), where=valid_counts > 0
+            )
+
+    # Coordination-number columns are named CN<k> (e.g. CN6); energy stays
+    # energy_<v>_frac. Both hold the per-shell proportion of points at that level.
+    add_metric("Coordination", "CN_mean", lambda v: f"CN{v:g}")
+    add_metric("Energy", "energy_mean", lambda v: f"energy_{v:g}_frac")
+    return df
+
+
+def _write_radial_csv(radial_frames: list[pd.DataFrame], output_folder: Path) -> Path:
+    """Concatenate per-file radial frames and write ``radial_analysis.csv``."""
+    radial_df = pd.concat(radial_frames, ignore_index=True)
+    # Different files can expose different coord/energy levels; a level absent
+    # from a file means zero proportion there, so fill the aligned NaNs with 0.
+    # Proportion columns are the per-level ones (CN<k> and energy_<v>_frac), not
+    # the *_mean summaries which stay NaN where a shell has no data.
+    frac_cols = [
+        c for c in radial_df.columns
+        if c.endswith("_frac") or (c.startswith("CN") and c != "CN_mean")
+    ]
+    if frac_cols:
+        radial_df[frac_cols] = radial_df[frac_cols].fillna(0.0)
+    radial_csv = output_folder / "radial_analysis.csv"
+    radial_df.to_csv(radial_csv, index=False)
+    logger.info("Radial analysis CSV saved: %s", radial_csv)
+    return radial_csv
+
+
+def _checkpoint_points(
+    checkpoint_file: Path,
+    n_tiles: int,
+    crystallography,
+    include_middle: bool = False,
+    read_callback=None,
+    expand_callback=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand a checkpoint grid to centred Cartesian points and their site numbers.
+
+    Mirrors the checkpoint viewer: every occupied (cell, tile) becomes one point,
+    the site number is the grid value there, and coordinates are frac→Cartesian
+    then centred so the origin sits at the crystal centre.
+
+    ``read_callback(current, total)`` tracks the file parse; ``expand_callback``
+    reports the (vectorised) expansion at coarse stages so a GUI can show both.
+
+    Returns ``(coords (M, 3), site_numbers (M,))``.
+    """
+    from ..fileio.cg_checkpoint import Checkpoint
+
+    chk = Checkpoint.from_file(
+        checkpoint_file, n_tiles, crysallography=crystallography,
+        progress_callback=read_callback,
+    )
+    if include_middle or chk.edge_mask is None:
+        data = chk.data
+    else:
+        data = np.where(chk.edge_mask[..., None], chk.data, 0)
+
+    occupied = np.argwhere(data)  # (M, 4): i, j, k, tile
+    if expand_callback is not None:
+        expand_callback(1, 2)
+    if not len(occupied):
+        if expand_callback is not None:
+            expand_callback(2, 2)
+        return np.zeros((0, 3)), np.zeros(0, dtype=int)
+
+    ijk = occupied[:, :3]
+    tiles = occupied[:, 3]
+    site_vals = data[ijk[:, 0], ijk[:, 1], ijk[:, 2], tiles].astype(int)
+    coords = crystallography.frac_to_cart(ijk.astype(float))
+    if len(coords):
+        coords = coords - coords.mean(axis=0)  # centre → origin at crystal centre
+    if expand_callback is not None:
+        expand_callback(2, 2)
+    return coords, site_vals
+
+
+def _run_checkpoint_radial(
+    files: list,
+    options: cluster_options_tuple,
+    output_folder: Path,
+    signals,
+    site_metadata,
+    crystallography,
+    n_tiles: int,
+) -> Path | None:
+    """Radial analysis over checkpoint files (KDTree clustering is skipped).
+
+    Coordination/energy come from the site-analysis metadata, looked up per
+    point by the site number stored in the checkpoint grid.
+    """
+    if crystallography is None or n_tiles is None:
+        raise RuntimeError(
+            "Checkpoint radial analysis needs a loaded structure "
+            "(crystallography + tile count)."
+        )
+
+    radial_frames: list[pd.DataFrame] = []
+    total = len(files)
+    for i, path in enumerate(files):
+        if signals is not None and signals.cancel_flag.is_set():
+            signals.cancelled.emit()
+            return None
+        path = Path(path)
+        if signals is not None:
+            signals.message.emit(
+                f"Reading checkpoint {i + 1}/{total}: {path.name}"
+            )
+
+        # Map this file's read (first 70%) and expansion (last 30%) into its
+        # slice [base, base + span) of the overall 0–95% progress range.
+        base = i / total * 95.0
+        span = 95.0 / total
+
+        def read_cb(cur, tot, _b=base, _s=span):
+            if signals is not None and tot:
+                signals.progress.emit(int(_b + (cur / tot) * _s * 0.7))
+
+        def expand_cb(cur, tot, _b=base, _s=span):
+            if signals is not None and tot:
+                signals.progress.emit(int(_b + _s * 0.7 + (cur / tot) * _s * 0.3))
+
+        try:
+            coords, site_numbers = _checkpoint_points(
+                path, n_tiles, crystallography,
+                include_middle=getattr(options, "radial_include_middle", False),
+                read_callback=read_cb, expand_callback=expand_cb,
+            )
+        except Exception as e:  # noqa: BLE001 - keep going through the batch
+            logger.warning("Failed to load checkpoint %s: %s", path.name, e)
+            continue
+        if len(coords) == 0:
+            logger.warning("No occupied cells in %s", path.name)
+            continue
+
+        prof = radial_profile(coords, site_numbers, site_metadata, options.radial_bins)
+        prof.insert(0, "Simulation Number", i + 1)
+        radial_frames.append(prof)
+
+        if signals is not None:
+            signals.progress.emit(int((i + 1) / total * 95))
+
+    if not radial_frames:
+        raise RuntimeError("No checkpoint files could be analysed.")
+
+    radial_csv = _write_radial_csv(radial_frames, output_folder)
+    if signals is not None:
+        signals.progress.emit(100)
+    return radial_csv
+
+
 def run_cluster_analysis(
     xyz_files: list,
     information,
     options: cluster_options_tuple,
     output_folder: Path,
     signals=None,
+    site_metadata: dict[str, dict[int, float]] | None = None,
+    crystallography=None,
+    n_tiles: int | None = None,
 ) -> tuple[Path | None, dict, dict]:
     """
     Run cluster analysis on all XYZ files.
@@ -213,9 +463,21 @@ def run_cluster_analysis(
     coord_cache : dict[str, np.ndarray]
         Mapping from str(xyz_path) → per-particle coordination-number array.
     """
+    radial = getattr(options, "radial", False)
+    radial_source = getattr(options, "radial_source", "xyz")
+
+    # Checkpoint radial mode: no XYZ clustering — expand the grid and profile it.
+    if radial and radial_source == "checkpoint":
+        radial_csv = _run_checkpoint_radial(
+            xyz_files, options, output_folder, signals,
+            site_metadata, crystallography, n_tiles,
+        )
+        return radial_csv, {}, {}
+
     records = []
     labels_cache: dict[str, np.ndarray] = {}
     coord_cache: dict[str, np.ndarray] = {}
+    radial_frames: list[pd.DataFrame] = []
     total = len(xyz_files)
 
     for i, xyz_path in enumerate(xyz_files):
@@ -261,12 +523,26 @@ def run_cluster_analysis(
         labels_cache[str(xyz_path)] = labels
         coord_cache[str(xyz_path)] = coord_numbers
 
+        # Radial profile from the XYZ point cloud: site numbers live in raw col 6,
+        # coordination/energy come from the site-analysis metadata maps.
+        if radial and not options.ratios_only:
+            raw = frame.raw
+            site_numbers = raw[:, 6] if raw.ndim == 2 and raw.shape[1] > 6 else None
+            prof = radial_profile(
+                frame.coords, site_numbers, site_metadata, options.radial_bins
+            )
+            prof.insert(0, "Simulation Number", i + 1)
+            radial_frames.append(prof)
+
         if signals is not None:
             progress = int((i + 1) / total * 80)
             signals.progress.emit(progress)
 
     if not records:
         raise RuntimeError("No XYZ files could be clustered.")
+
+    if radial and radial_frames:
+        _write_radial_csv(radial_frames, output_folder)
 
     if options.files_to_analyse is not None:
         if signals is not None:
@@ -326,6 +602,13 @@ class ClusterAnalysis:
         self.coord_cache: dict[str, np.ndarray] = {}
         self.signals = signals
 
+        # Context for the radial site-metadata profile. site_metadata is the
+        # {field: {site_number: value}} map from the site-analysis workflow;
+        # crystallography/n_tiles are needed only for the checkpoint source.
+        self.site_metadata: dict[str, dict[int, float]] = {}
+        self.crystallography = None
+        self.n_tiles: int | None = None
+
         self.dialog = ClusterAnalysisDialog()
         self.dialog.runRequested.connect(self._run_analysis)
 
@@ -337,6 +620,14 @@ class ClusterAnalysis:
 
     def set_xyz_files(self, xyz_files: list[Path]):
         self.xyz_files = list(xyz_files)
+
+    def set_site_metadata(self, maps: dict[str, dict[int, float]] | None):
+        self.site_metadata = maps or {}
+
+    def set_checkpoint_context(self, crystallography, n_tiles: int | None):
+        """Structure context (from the session) used for checkpoint radial mode."""
+        self.crystallography = crystallography
+        self.n_tiles = n_tiles
 
     def set_current_file(self, path: Path | None):
         self.current_file = path
@@ -390,6 +681,9 @@ class ClusterAnalysis:
                 input_folder=self.input_folder,
                 output_folder=self.output_folder,
                 xyz_files=xyz_files,
+                site_metadata=self.site_metadata,
+                crystallography=self.crystallography,
+                n_tiles=self.n_tiles,
             )
             self.worker.signals.progress.connect(self.update_progress, Qt.QueuedConnection)
             self.worker.signals.result.connect(self.set_plotting, Qt.QueuedConnection)
@@ -413,6 +707,9 @@ class ClusterAnalysis:
                 options=self.options,
                 output_folder=self.output_folder,
                 signals=self.signals,
+                site_metadata=self.site_metadata,
+                crystallography=self.crystallography,
+                n_tiles=self.n_tiles,
             )
             self.set_plotting((csv_path, labels_cache, coord_cache))
         except Exception as e:

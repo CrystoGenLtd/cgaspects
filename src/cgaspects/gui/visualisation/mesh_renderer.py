@@ -199,6 +199,9 @@ class MeshRenderer:
 
     def setMesh(self, mesh, vertex_colors=None):
         self.mesh = mesh
+        if mesh is None:
+            self.vertices = None
+            return
         self._updateBuffers(vertex_colors=vertex_colors)
 
     def _updateBuffers(self, vertex_colors=None):

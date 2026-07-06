@@ -322,17 +322,14 @@ class VisualizationSettingsWidget(QWidget):
         self.widgets["Background Color"] = w
         w.valueChanged.connect(self.settingsChanged)
 
+        # How centroids are drawn. The data source (Crystal / Docking / Checkpoint)
+        # and the atom/centroid toggle live in the View menu, not here.
         w = LabelledComboBox(
-            "Style",
+            "Render Style",
             (
                 "Spheres",
                 "Points",
                 "Convex Hull",
-                "Atoms",
-                "Docking",
-                "Docking Atoms",
-                "Checkpoint",
-                "Checkpoint Atoms",
             ),
         )
         self.widgets["Style"] = w

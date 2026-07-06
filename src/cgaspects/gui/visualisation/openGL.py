@@ -26,6 +26,7 @@ from .line_renderer import LineRenderer
 from .mesh_renderer import MeshRenderer
 from .plane_renderer import PlaneRenderer
 from .point_cloud_renderer import SimplePointRenderer
+from .shading import RenderSettings
 from .sphere_renderer import SphereRenderer
 from .sphere_selection_renderer import SphereSelectionRenderer
 from .visual_data import VisualData
@@ -34,7 +35,14 @@ logger = logging.getLogger("CA:OpenGL")
 
 
 class VisualisationWidget(QOpenGLWidget):
-    style = "Spheres"
+    # Data source shown in the viewport. Orthogonal to the atom/centroid toggle
+    # and the render option, so any combination of the three is valid.
+    VIS_MODES = ("Crystal", "Docking", "Checkpoint")
+    # How centroids are drawn when the atom view is off.
+    RENDER_OPTIONS = ("Spheres", "Points", "Convex Hull")
+
+    vis_mode = "Crystal"
+    render_option = "Spheres"
     show_mesh_edges = False
 
     # Non-configurable viewport shortcuts shown read-only in the Keyboard Shortcuts dialog.
@@ -61,8 +69,9 @@ class VisualisationWidget(QOpenGLWidget):
     pointsDeleted = Signal(int)  # Number of points deleted
     pointSizeChanged = Signal(int)  # Emitted when point size changes (integer value)
     legendChanged = Signal(dict)  # Emitted when the colour legend data changes
-    styleChanged = Signal(str)  # Emitted when the render style changes (e.g. "Atoms", "Spheres")
-    colorByOptionsChanged = Signal(list, str)  # (options_list, default_option)
+    # Emitted when the visualisation mode, atom/centroid toggle, or render option changes.
+    viewStateChanged = Signal()
+    renderedCountChanged = Signal(int, str)  # (count, label) after legend filtering is applied
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -126,10 +135,16 @@ class VisualisationWidget(QOpenGLWidget):
         self.single_color = QColor(128, 128, 128)  # Default grey color
         self._legend_info = None
 
+        # Legend-driven point filter: set of *visible* legend keys, or None (show all).
+        # Only valid for the (vis_mode, atom_view, color_by) recorded in _legend_filter_sig.
+        self._legend_filter: set | None = None
+        self._legend_filter_sig: tuple | None = None
+
         self.viewInitialized = False
         self.point_size = 20.0
         self.point_type = "Point"
         self.backgroundColor = QColor(Qt.white)
+        self.render_settings = RenderSettings()
 
         self.overlay = TransparentOverlay(self)
         self.overlay.setGeometry(self.geometry())
@@ -178,10 +193,17 @@ class VisualisationWidget(QOpenGLWidget):
         self._checkpoint: Checkpoint | None = None
         self._checkpoint_coords = None  # np.ndarray (N, 3) centred, for sphere mode
         self._checkpoint_center: np.ndarray | None = None
-        self._checkpoint_visual_data: VisualData | None = None  # separate from _visual_data
+        self._checkpoint_visual_data: VisualData | None = None  # active view (full or edges)
+        self._checkpoint_vd_full: VisualData | None = None  # all cells, expanded once
+        self._checkpoint_vd_edges: VisualData | None = None  # cached edges-only subset
+        # {field_label: {site_number: value}} from the site-analysis workflow
+        self._site_metadata: dict[str, dict[int, float]] = {}
 
         # Unified display data – rebuilt whenever the active data source changes
         self._visual_data: VisualData | None = None
+
+        # Atom (True) vs centroid (False) representation, remembered per mode.
+        self._atom_view: dict[str, bool] = {mode: False for mode in self.VIS_MODES}
 
     @property
     def xyz(self):
@@ -294,7 +316,7 @@ class VisualisationWidget(QOpenGLWidget):
             converted = visible
         self.plane_renderer.set_planes(converted, self._planes_crystallography)
         if self._visual_data is not None:
-            if self.style == "Atoms":
+            if self.vis_mode == "Crystal" and self.is_atom_view:
                 self._update_atom_view()
             else:
                 self.initGeometry()
@@ -312,9 +334,6 @@ class VisualisationWidget(QOpenGLWidget):
         """Half-range of the crystal in world units (same as _cart_max_extent after pre-scaling)."""
         return self._cart_max_extent()
 
-    _ATOM_STYLES = frozenset(("Atoms", "Docking Atoms"))
-    _FRAC_STYLES = frozenset(("Points", "Spheres", "Convex Hull", "Docking"))
-
     # (shell_id, display_name) pairs — use _shell_name() / _shell_id() helpers
     _SHELL_NAMES: tuple = ((30, "Central"), (31, "1st Shell"), (32, "2nd Shell"))
 
@@ -329,12 +348,75 @@ class VisualisationWidget(QOpenGLWidget):
     _ATOM_COLOR_BY = ("Atom",) + _NORMAL_COLOR_BY
     _DOCKING_COLOR_BY = ("Coordination Shell", "Atom Type")
     _DOCKING_ATOM_COLOR_BY = ("Atom", "Coordination Shell", "Atom Type")
+    # Site-analysis fields appended dynamically when metadata is loaded.
+    _SITE_METADATA_COLOR_BY = ("Coordination", "Energy", "Events/Population")
     _CHECKPOINT_COLOR_BY = ("Single Colour", "Z Layer")
     _CHECKPOINT_ATOM_COLOR_BY = ("Atom", "Tile")
 
-    def _rescale_camera_for_style(self, old_style, new_style):
-        """No-op: centroid coordinates are pre-scaled to Cartesian Å in pass_XYZ,
-        so all render styles share the same world-space scale."""
+    @property
+    def is_atom_view(self) -> bool:
+        """True when the current mode is showing atoms rather than centroids."""
+        return self._atom_view.get(self.vis_mode, False)
+
+    def _active_visual_data(self) -> VisualData | None:
+        """The VisualData backing the current visualisation mode."""
+        if self.vis_mode == "Docking":
+            return self._docking_visual_data
+        if self.vis_mode == "Checkpoint":
+            return self._checkpoint_visual_data
+        return self._visual_data
+
+    def _apply_view_state(self):
+        """Reconcile colour options with the new view state and rebuild the scene."""
+        opts, default = self._color_by_options_for_state()
+        if self.color_by not in opts:
+            self.color_by = default
+        self.viewStateChanged.emit()
+        self.initGeometry()
+        self.update()
+
+    def set_visualisation_mode(self, mode: str) -> bool:
+        """Switch the data source (Crystal / Docking / Checkpoint)."""
+        if mode not in self.VIS_MODES:
+            logger.warning("Unknown visualisation mode: %s", mode)
+            return False
+        if mode == self.vis_mode:
+            return False
+        self.vis_mode = mode
+        self._apply_view_state()
+        return True
+
+    def set_atom_view(self, enabled: bool) -> bool:
+        """Switch the current mode between atom and centroid representation."""
+        enabled = bool(enabled)
+        if enabled == self.is_atom_view:
+            return True
+        if enabled and self._mol_templates is None:
+            QMessageBox.information(
+                self,
+                "No Molecular Data",
+                "No structure file was found.\n"
+                "Load a CrystalGrower simulation folder that includes a structure file.",
+            )
+            return False
+        self._atom_view[self.vis_mode] = enabled
+        self._apply_view_state()
+        return True
+
+    def toggle_atom_view(self):
+        """Toggle atom/centroid representation for the current mode. Shift+V shortcut."""
+        self.set_atom_view(not self.is_atom_view)
+
+    def set_render_option(self, option: str) -> bool:
+        """Set how centroids are drawn (Spheres / Points / Convex Hull)."""
+        if option not in self.RENDER_OPTIONS:
+            logger.warning("Unknown render option: %s", option)
+            return False
+        if option == self.render_option:
+            return True
+        self.render_option = option
+        self._apply_view_state()
+        return True
 
     def recentre_view(self):
         """Fit the camera to the current geometry.  Used as a menu action (F)
@@ -420,7 +502,7 @@ class VisualisationWidget(QOpenGLWidget):
         export_options = ["2D Image (PNG)", "3D Mesh"]
 
         # Only allow 3D mesh export if not in Points mode
-        if self.style == "Points":
+        if not self.is_atom_view and self.render_option == "Points":
             export_options = ["2D Image (PNG)"]
 
         export_type, ok = QInputDialog.getItem(
@@ -675,15 +757,20 @@ class VisualisationWidget(QOpenGLWidget):
         """
         mesh = None
 
-        if self.style == "Spheres":
-            # Generate mesh from sphere instances with colors
-            mesh = self._generateSphereMesh(subdivision_level=subdivision_level)
-        elif self.style == "Convex Hull":
+        if self.is_atom_view:
+            raise ValueError("Cannot export mesh in atom view")
+
+        if self.render_option == "Convex Hull":
             # Use the existing convex hull mesh (without colors)
             mesh = self.mesh_renderer.mesh
+        elif self.render_option == "Spheres" and self.vis_mode == "Crystal":
+            # Generate mesh from sphere instances with colors
+            mesh = self._generateSphereMesh(subdivision_level=subdivision_level)
 
         if mesh is None:
-            raise ValueError(f"Cannot export mesh in '{self.style}' mode")
+            raise ValueError(
+                f"Cannot export mesh in '{self.vis_mode} / {self.render_option}' mode"
+            )
 
         # Export using trimesh
         mesh.export(file_name)
@@ -750,6 +837,18 @@ class VisualisationWidget(QOpenGLWidget):
         )
         return mesh
 
+    def set_render_settings(self, settings: RenderSettings):
+        """Apply material / lighting / ambient-occlusion settings from the dialog.
+
+        Most fields are plain uniforms and take effect on the next repaint; the
+        AO toggle re-uploads instance buffers (occlusion is precomputed per point).
+        """
+        self.render_settings = settings
+        for renderer in (self.sphere_renderer, self.atom_renderer):
+            if renderer is not None:
+                renderer.set_ao_enabled(settings.ao_enabled)
+        self.update()
+
     def setBackgroundColor(self, color):
         self.backgroundColor = QColor(color)
         self.makeCurrent()
@@ -769,14 +868,10 @@ class VisualisationWidget(QOpenGLWidget):
             self.colormap = kwargs["Color Map"]
             needs_reinit = True
 
-        if present_and_changed("Style", self.style):
-            old_style = self.style
-            self.style = kwargs["Style"]
-            self.styleChanged.emit(self.style)
-            self._rescale_camera_for_style(old_style, self.style)
-            opts, default = self._color_by_options_for_style(self.style)
-            self.colorByOptionsChanged.emit(list(opts), default)
-            needs_reinit = True
+        if "Style" in kwargs:
+            # The settings panel sends the render option (Spheres / Points / Convex
+            # Hull); set_render_option rebuilds the scene itself when it changes.
+            self.set_render_option(kwargs["Style"])
 
         if present_and_changed("Show Mesh Edges", self.show_mesh_edges):
             self.show_mesh_edges = kwargs["Show Mesh Edges"]
@@ -1282,6 +1377,78 @@ class VisualisationWidget(QOpenGLWidget):
         """Return the most recently computed legend info dict, or None if not yet available."""
         return self._legend_info
 
+    # ------------------------------------------------------------------
+    # Legend colour filter (show only selected legend colours)
+    # ------------------------------------------------------------------
+
+    def set_legend_filter(self, visible_keys):
+        """Restrict the view to points whose colour matches the given legend keys.
+
+        ``visible_keys`` is a set of legend row keys (element symbols, shell
+        names or numeric values, matching the current legend's ``rows``), or
+        ``None`` to clear the filter and show every colour again.
+        """
+        self._legend_filter = set(visible_keys) if visible_keys is not None else None
+        self._legend_filter_sig = (self.vis_mode, self.is_atom_view, self.color_by)
+        self.initGeometry()
+        self.update()
+
+    def _sync_filter_signature(self):
+        """Drop the legend filter when the (style, color_by) it was set for changes.
+
+        Called at the start of each geometry builder so a filter picked for one
+        colouring never leaks into a different one.
+        """
+        sig = (self.vis_mode, self.is_atom_view, self.color_by)
+        if sig != self._legend_filter_sig:
+            self._legend_filter = None
+            self._legend_filter_sig = sig
+
+    @staticmethod
+    def _pack_rgb(colors: np.ndarray) -> np.ndarray:
+        """Pack an (N, 3) float RGB array into (N,) int64 codes for exact matching."""
+        q = np.clip(np.rint(np.asarray(colors, dtype=np.float64) * 65535.0), 0, 65535).astype(
+            np.int64
+        )
+        return (q[:, 0] << 32) | (q[:, 1] << 16) | q[:, 2]
+
+    def _visible_color_codes(self):
+        """Packed RGB codes for the currently-visible legend rows, or None (no filter)."""
+        if self._legend_filter is None or not self._legend_info:
+            return None
+        rows = self._legend_info.get("rows", [])
+        visible_rgbs = [rgb for key, rgb in rows if key in self._legend_filter]
+        if not visible_rgbs:
+            return np.zeros(0, dtype=np.int64)
+        return np.unique(self._pack_rgb(np.array(visible_rgbs, dtype=np.float64)))
+
+    def _color_visibility_mask(self, colors: np.ndarray):
+        """Boolean keep-mask over ``colors`` for the active filter, or None if inactive."""
+        codes_visible = self._visible_color_codes()
+        if codes_visible is None:
+            return None
+        if len(colors) == 0:
+            return np.zeros(0, dtype=bool)
+        return np.isin(self._pack_rgb(colors), codes_visible)
+
+    def _apply_atom_color_filter(self, atom_arr, bond_arr):
+        """Drop atoms (and their bonds) whose colour is hidden by the legend filter."""
+        if self._legend_filter is None or atom_arr is None or len(atom_arr) == 0:
+            return atom_arr, bond_arr
+        amask = self._color_visibility_mask(atom_arr[:, 3:6])
+        if amask is None:
+            return atom_arr, bond_arr
+        atom_arr = atom_arr[amask]
+        if bond_arr is not None and len(bond_arr):
+            bmask = self._color_visibility_mask(bond_arr[:, 6:9])
+            if bmask is not None:
+                bond_arr = bond_arr[bmask]
+        return atom_arr, bond_arr
+
+    def _emit_rendered_count(self, count: int, label: str):
+        """Publish the number of primitives actually uploaded (post-filter)."""
+        self.renderedCountChanged.emit(int(count), label)
+
     def get_active_xyz(self):
         """Get XYZ data excluding deleted points.
 
@@ -1438,51 +1605,88 @@ class VisualisationWidget(QOpenGLWidget):
         if self.point_cloud_renderer is None:
             return
 
-        if self.style == "Atoms":
+        if self.vis_mode == "Docking":
+            if self.is_atom_view:
+                self._update_docking_atom_view()
+            else:
+                self._update_docking_sphere_view()
+            self.update()
+            return
+
+        if self.vis_mode == "Checkpoint":
+            if self.is_atom_view:
+                self._update_checkpoint_atom_view()
+            else:
+                self._update_checkpoint_view()
+            self.update()
+            return
+
+        if self.is_atom_view:
             self._update_atom_view()
             self._apply_planes()
             self._apply_directions()
             self.update()
             return
 
-        if self.style == "Docking":
-            self._update_docking_sphere_view()
-            self.update()
-            return
-
-        if self.style == "Docking Atoms":
-            self._update_docking_atom_view()
-            self.update()
-            return
-
-        if self.style == "Checkpoint":
-            self._update_checkpoint_view()
-            self.update()
-            return
-
-        if self.style == "Checkpoint Atoms":
-            self._update_checkpoint_atom_view()
-            self.update()
-            return
-
         varray = self.updatePointCloudVertices()
-        self.point_cloud_renderer.setPoints(varray)
-        self.sphere_renderer.setPoints(varray)
+        self._upload_centroid_varray(varray)
+        self.update()
 
-        if self.style == "Convex Hull":
-            hull = ConvexHull(varray[:, :3])
-            mesh = trimesh.Trimesh(vertices=varray[:, :3], faces=hull.simplices)
+    def _upload_centroid_varray(self, varray, hull_points=None):
+        """Upload a (N, 7) centroid vertex array to the renderer for the active
+        render style, clearing the inactive one.
+
+        Only the active renderer is fed: at checkpoint scale the array can run to
+        gigabytes, so mirroring it into a renderer that is never drawn doubles the
+        upload time and GPU memory for nothing. Switching render style goes through
+        set_render_option → initGeometry, which re-uploads to the new target.
+
+        When Convex Hull is active the hull is built from ``hull_points`` (an
+        (M, 3) position array) if given, else from the varray positions. Callers
+        with a surface-only subset should pass it — interior points can never be
+        hull vertices, so the result is identical and Qhull runs on far fewer
+        points.
+        """
+        if varray is None:
+            varray = np.zeros((0, 7), dtype=np.float32)
+        empty = np.zeros((0, 7), dtype=np.float32)
+
+        if self.render_option == "Points":
+            self.point_cloud_renderer.setPoints(varray)
+            self.sphere_renderer.setPoints(empty)
+            return
+
+        if self.render_option == "Convex Hull":
+            self.point_cloud_renderer.setPoints(empty)
+            self.sphere_renderer.setPoints(empty)
+            points = varray[:, :3] if hull_points is None else hull_points
+            if len(points) < 4:
+                self.mesh_renderer.setMesh(None)
+                return
+            try:
+                hull = ConvexHull(points)
+            except Exception as exc:  # QhullError on degenerate point sets
+                logger.warning("Convex hull failed: %s", exc)
+                self.mesh_renderer.setMesh(None)
+                return
+            mesh = trimesh.Trimesh(vertices=points, faces=hull.simplices)
             # can pass vertex colors here, but I wouldn't
             self.mesh_renderer.setMesh(mesh)
 
             if self.show_mesh_edges:
                 self.line_renderer.setLines(self.mesh_renderer.getLines())
+            return
 
-        self.update()
+        self.sphere_renderer.setPoints(varray)
+        self.point_cloud_renderer.setPoints(empty)
 
     def updatePointCloudVertices(self):
         self.overlay.setVisible(False)
+        self._sync_filter_signature()
         vd = self._visual_data
+        if vd is None:
+            # No point-cloud data (e.g. a checkpoint-only sim shown in grid mode).
+            return np.zeros((0, 7), dtype=np.float32)
         logger.debug("Loading Vertices: %s centroids", vd.n_centroids)
 
         col_idx = self.columnLabelToIndex.get(self.color_by, 2)
@@ -1492,10 +1696,7 @@ class VisualisationWidget(QOpenGLWidget):
         # Resolve the 1-D values array for colormap, respecting available attributes
         if col_idx == -1:
             # Single colour
-            single_rgb = np.array(
-                [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
-                dtype=np.float32,
-            )
+            single_rgb = self._single_color_rgb()
             colors = vd.colors_uniform(single_rgb)
             min_val, max_val, legend_rows = 0.0, 0.0, [(None, tuple(single_rgb.tolist()))]
         else:
@@ -1604,10 +1805,17 @@ class VisualisationWidget(QOpenGLWidget):
         if slice_mask is not None:
             combined_mask &= slice_mask
 
+        # Legend colour filter (show only selected colours)
+        color_mask = self._color_visibility_mask(colors)
+        if color_mask is not None:
+            combined_mask &= color_mask
+
         if not np.all(combined_mask):
             points = points[combined_mask]
             colors = colors[combined_mask]
             selection_flags = selection_flags[combined_mask]
+
+        self._emit_rendered_count(len(points), "Points")
 
         try:
             return np.concatenate((points, colors, selection_flags), axis=1)
@@ -1797,20 +2005,136 @@ class VisualisationWidget(QOpenGLWidget):
         self._legend_info = info
         self.legendChanged.emit(info)
 
-    def _color_by_options_for_style(self, style: str) -> tuple[tuple, str]:
-        """Return (options_tuple, default_option) for the given render style."""
-        if style == "Atoms":
-            return self._ATOM_COLOR_BY, "Atom"
-        elif style == "Docking":
-            return self._DOCKING_COLOR_BY, "Coordination Shell"
-        elif style == "Docking Atoms":
-            return self._DOCKING_ATOM_COLOR_BY, "Atom"
-        elif style == "Checkpoint":
-            return self._CHECKPOINT_COLOR_BY, "Single Colour"
-        elif style == "Checkpoint Atoms":
-            return self._CHECKPOINT_ATOM_COLOR_BY, "Atom"
+    def _emit_checkpoint_legend(self, atom_view: bool):
+        """Build and emit a legend for the current Checkpoint / Checkpoint Atoms view.
+
+        Row colours are computed exactly as the matching builder colours the
+        centroids/atoms, so the legend colour filter matches them one-to-one.
+        """
+        vd = self._checkpoint_visual_data
+        if vd is None or vd.n_centroids == 0:
+            return
+        color_by = self.color_by
+
+        # Atom-element colouring (Checkpoint Atoms only)
+        if atom_view and color_by == "Atom" and vd.templates:
+            seen: dict[str, tuple] = {}
+            for tmpl in vd.templates.values():
+                colors, _ = self._resolved_atom_colors_radii(tmpl)
+                for sym, rgb in zip(tmpl["symbols"], colors):
+                    if sym not in seen:
+                        seen[sym] = tuple(float(v) for v in rgb)
+            rows = [(sym, seen[sym]) for sym in sorted(seen)]
+            info = {
+                "color_by": "Atom", "colormap": self.colormap, "min_val": 0.0,
+                "max_val": float(len(rows) - 1), "rows": rows, "mode": "atom",
+            }
+        # Site-analysis scalar (coordination / energy / population) colormap
+        elif color_by in self._SITE_METADATA_COLOR_BY and self._site_metadata.get(color_by):
+            site_map = self._site_metadata.get(color_by, {})
+            sites = vd.site_numbers
+            vals = (
+                np.array([site_map.get(int(s), np.nan) for s in sites], dtype=float)
+                if sites is not None else np.zeros(0)
+            )
+            valid = vals[~np.isnan(vals)]
+            if valid.size:
+                mn, mx = float(valid.min()), float(valid.max())
+                rng = mx - mn if mx != mn else 1.0
+                uniq = np.unique(valid)
+                rgb = self.availableColormaps[self.colormap]((uniq - mn) / rng)[:, :3]
+                rows = [(float(v), tuple(c.tolist())) for v, c in zip(uniq, rgb)]
+            else:
+                mn = mx = 0.0
+                rows = []
+            info = {
+                "color_by": color_by, "colormap": self.colormap, "min_val": mn,
+                "max_val": mx, "rows": rows, "mode": "colormap",
+            }
+        # Per-tile palette (Checkpoint Atoms, default colouring)
+        elif atom_view:
+            n_tiles = self._checkpoint.n_tiles if self._checkpoint else 1
+            palette = cm.tab10(np.linspace(0, 1, max(n_tiles, 1)))[:, :3].astype(np.float32)
+            tiles = vd.tile_indices
+            uniq = np.unique(tiles) if tiles is not None else np.zeros(0, dtype=int)
+            rows = [
+                (int(t), tuple(float(x) for x in palette[int(t) % len(palette)])) for t in uniq
+            ]
+            info = {
+                "color_by": color_by, "colormap": self.colormap, "min_val": 0.0,
+                "max_val": float(max(len(rows) - 1, 0)), "rows": rows, "mode": "colormap",
+            }
+        # Z-layer gradient (Checkpoint spheres) — sampled so the dialog shows a gradient
+        elif color_by == "Z Layer":
+            z = vd.centroids[:, 2]
+            zmin, zmax = float(z.min()), float(z.max())
+            ts = np.linspace(0.0, 1.0, 33)
+            rows = [
+                (zmin + t * (zmax - zmin), (float(t), 0.0, float(1.0 - t))) for t in ts
+            ]
+            info = {
+                "color_by": "Z Layer", "colormap": self.colormap, "min_val": zmin,
+                "max_val": zmax, "rows": rows, "mode": "colormap",
+            }
+        # Single solid colour (Checkpoint spheres, default)
         else:
-            return self._NORMAL_COLOR_BY, "Layer"
+            rgb = tuple(float(x) for x in self._single_color_rgb())
+            info = {
+                "color_by": color_by, "colormap": self.colormap, "min_val": 0.0,
+                "max_val": 0.0, "rows": [(None, rgb)], "mode": "colormap",
+            }
+        self._legend_info = info
+        self.legendChanged.emit(info)
+
+    def _available_site_color_by(self) -> tuple[str, ...]:
+        """Site-analysis colour fields that actually have data loaded."""
+        return tuple(
+            label
+            for label in self._SITE_METADATA_COLOR_BY
+            if self._site_metadata.get(label)
+        )
+
+    def set_site_metadata(self, maps: dict[str, dict[int, float]] | None):
+        """Provide per-site colour maps from the site-analysis workflow.
+
+        ``maps`` is {field_label: {site_number: value}}. Refreshes the view if a
+        checkpoint style is active so newly-available colour modes take effect.
+        """
+        self._site_metadata = maps or {}
+        if self.vis_mode == "Checkpoint":
+            self.initGeometry()
+            self.update()
+
+    def _color_by_options_for_state(
+        self, mode: str | None = None, atom_view: bool | None = None
+    ) -> tuple[tuple, str]:
+        """Return (options_tuple, default_option) for a (mode, atom_view) pair.
+
+        Defaults to the widget's current visualisation mode and atom/centroid state.
+        """
+        if mode is None:
+            mode = self.vis_mode
+        if atom_view is None:
+            atom_view = self._atom_view.get(mode, False)
+
+        if mode == "Docking":
+            if atom_view:
+                return self._DOCKING_ATOM_COLOR_BY, "Atom"
+            return self._DOCKING_COLOR_BY, "Coordination Shell"
+        if mode == "Checkpoint":
+            if atom_view:
+                return self._CHECKPOINT_ATOM_COLOR_BY + self._available_site_color_by(), "Atom"
+            return self._CHECKPOINT_COLOR_BY + self._available_site_color_by(), "Single Colour"
+        if atom_view:
+            return self._ATOM_COLOR_BY, "Atom"
+        return self._NORMAL_COLOR_BY, "Layer"
+
+    def _single_color_rgb(self) -> np.ndarray:
+        """The user-selected single colour as a (3,) float32 RGB array in [0, 1]."""
+        return np.array(
+            [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
+            dtype=np.float32,
+        )
 
     def _centroid_colormap_colors(self) -> np.ndarray:
         """(N, 3) float32 colours for each centroid in the current VisualData, based on color_by.
@@ -1823,11 +2147,7 @@ class VisualisationWidget(QOpenGLWidget):
             col_idx = 2
 
         if col_idx == -1:
-            rgb = np.array(
-                [self.single_color.redF(), self.single_color.greenF(), self.single_color.blueF()],
-                dtype=np.float32,
-            )
-            return vd.colors_uniform(rgb)
+            return vd.colors_uniform(self._single_color_rgb())
 
         if col_idx == 0:
             values = vd.mol_types.astype(np.float32)
@@ -1885,11 +2205,13 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_docking_sphere_view(self):
         """Upload docking data to the sphere renderer for the Docking style."""
+        self._sync_filter_signature()
         vd = self._docking_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
                 self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
             return
+        self.overlay.setVisible(False)
         if self.color_by == "Atom Type":
             colors = vd.colors_by_array(
                 vd.mol_types.astype(np.float32), self.availableColormaps[self.colormap]
@@ -1899,11 +2221,21 @@ class VisualisationWidget(QOpenGLWidget):
                 self._docking_data.SHELL_COLORS, self._docking_shell_color_overrides
             )
         varray = vd.sphere_vertices(colors)
+        self._emit_docking_legend()
+        keep = np.ones(len(varray), dtype=bool)
+        slice_mask = self._slice_centroid_mask(vd.centroids)
+        if slice_mask is not None:
+            keep &= slice_mask
+        color_mask = self._color_visibility_mask(colors)
+        if color_mask is not None:
+            keep &= color_mask
+        if not np.all(keep):
+            varray = varray[keep]
         self.sphere_renderer.setPoints(varray)
         if not self.viewInitialized:
             self.camera.fitToObject(vd.centroids)
             self.viewInitialized = True
-        self._emit_docking_legend()
+        self._emit_rendered_count(len(varray), "Points")
 
     # ------------------------------------------------------------------ docking
     def set_docking_data(self, docking_data):
@@ -1915,55 +2247,137 @@ class VisualisationWidget(QOpenGLWidget):
             )
         else:
             self._docking_visual_data = None
-        if self.style in ("Docking", "Docking Atoms"):
+        if self.vis_mode == "Docking":
             self.initGeometry()
         self.update()
 
     # --------------------------------------------------------------- checkpoint
     def set_checkpoint(self, checkpoint: Checkpoint):
-        """Store a Checkpoint object and refresh if a Checkpoint style is active."""
+        """Store a Checkpoint object and refresh if a Checkpoint style is active.
+
+        If the worker already expanded the grid into a VisualData (attached as
+        ``checkpoint.prebuilt_visual_data``), reuse it and only attach templates
+        here — the expensive argwhere/frac_to_cart stays off the GUI thread.
+        """
         self._checkpoint = checkpoint
+        # Only the edges are expanded at load (fast, memory-light). The full grid —
+        # edges + interior — is expanded lazily the first time middle cells are
+        # switched on (see _select_checkpoint_vd), then cached for instant toggling.
+        self._checkpoint_vd_full = None
         if checkpoint is not None:
             cryst = checkpoint.crystallography or self._mol_crystallography
-            if cryst is not None:
-                self._checkpoint_visual_data = VisualData.from_checkpoint(
+            prebuilt = getattr(checkpoint, "prebuilt_visual_data", None)
+            if prebuilt is not None:
+                if prebuilt.templates is None and self._mol_templates and cryst is not None:
+                    prebuilt.templates = VisualData._build_cart_templates(
+                        self._mol_templates, cryst
+                    )
+                self._checkpoint_vd_edges = prebuilt
+            elif cryst is not None:
+                self._checkpoint_vd_edges = VisualData.from_checkpoint(
                     checkpoint, cryst, self._mol_templates
                 )
-                self._checkpoint_coords = self._checkpoint_visual_data.centroids
-                self._checkpoint_center = np.zeros(3, dtype=np.float64)
             else:
-                self._checkpoint_visual_data = None
-                self._checkpoint_coords = np.zeros((0, 3), dtype=np.float64)
-                self._checkpoint_center = np.zeros(3, dtype=np.float64)
+                self._checkpoint_vd_edges = None
         else:
-            self._checkpoint_visual_data = None
-            self._checkpoint_coords = None
-            self._checkpoint_center = None
-        if self.style in ("Checkpoint", "Checkpoint Atoms"):
+            self._checkpoint_vd_edges = None
+        self._select_checkpoint_vd()
+        if self.vis_mode == "Checkpoint":
             self.initGeometry()
         self.update()
 
+    def _select_checkpoint_vd(self):
+        """Point ``_checkpoint_visual_data`` at the full or edges-only set.
+
+        Only chooses among already-built VisualData — it never expands the grid.
+        When ``show_middle`` is on but the full set isn't cached yet, it stays on
+        edges; the caller is expected to build the full set off-thread and install
+        it via :meth:`apply_checkpoint_full_vd`.
+        """
+        edges = self._checkpoint_vd_edges
+        if edges is None:
+            self._checkpoint_visual_data = None
+            self._checkpoint_coords = np.zeros((0, 3), dtype=np.float64)
+            self._checkpoint_center = np.zeros(3, dtype=np.float64)
+            return
+        show_middle = bool(getattr(self._checkpoint, "show_middle", False))
+        if show_middle and self._checkpoint_vd_full is not None:
+            vd = self._checkpoint_vd_full
+        else:
+            vd = edges
+        self._checkpoint_visual_data = vd
+        self._checkpoint_coords = vd.centroids
+        self._checkpoint_center = np.zeros(3, dtype=np.float64)
+
+    def _checkpoint_site_colors(self, vd, label: str) -> np.ndarray:
+        """Per-centroid colours from a site-analysis field (coordination, energy …)."""
+        site_map = self._site_metadata.get(label, {})
+        cmap_fn = self.availableColormaps[self.colormap]
+        return vd.colors_by_site_metadata(site_map, cmap_fn)
+
+    def _checkpoint_hull_points(self) -> np.ndarray | None:
+        """Surface-only positions for the checkpoint convex hull.
+
+        Interior (middle) cells always lie on the segment between their strip
+        block's edge cells, so the hull of the edges-only set is identical to the
+        hull of the full grid — use it even when middle cells are shown.
+        """
+        evd = self._checkpoint_vd_edges
+        if evd is None:
+            return None
+        points = evd.centroids
+        slice_mask = self._slice_centroid_mask(points)
+        if slice_mask is not None:
+            points = points[slice_mask]
+        return points
+
     def _update_checkpoint_view(self):
-        """Upload checkpoint grid points to the sphere renderer."""
+        """Upload checkpoint grid points to the renderer for the active style."""
+        self._sync_filter_signature()
         vd = self._checkpoint_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.sphere_renderer is not None:
-                self.sphere_renderer.setPoints(np.zeros((0, 7), dtype=np.float32))
+                self._upload_centroid_varray(None)
             return
-        colors = (
-            vd.colors_by_z() if self.color_by == "Z Layer" else vd.colors_uniform([0.2, 0.6, 1.0])
-        )
+        self.overlay.setVisible(False)
+        self._emit_checkpoint_legend(atom_view=False)
+
+        if self.render_option == "Convex Hull":
+            # Only the hull mesh is drawn — skip building the (N, 7) colour array,
+            # which at full-grid scale costs gigabytes for nothing.
+            points = self._checkpoint_hull_points()
+            self._upload_centroid_varray(None, hull_points=points)
+            if not self.viewInitialized:
+                self.camera.fitToObject(vd.centroids)
+                self.viewInitialized = True
+            self._emit_rendered_count(len(points) if points is not None else 0, "Points")
+            return
+
+        if self.color_by in self._SITE_METADATA_COLOR_BY and self._site_metadata.get(self.color_by):
+            colors = self._checkpoint_site_colors(vd, self.color_by)
+        elif self.color_by == "Z Layer":
+            colors = vd.colors_by_z()
+        else:
+            colors = vd.colors_uniform(self._single_color_rgb())
         varray = vd.sphere_vertices(colors)
-        mask = self._slice_centroid_mask(vd.centroids)
-        if mask is not None:
-            varray = varray[mask]
-        self.sphere_renderer.setPoints(varray)
+        keep = np.ones(len(varray), dtype=bool)
+        slice_mask = self._slice_centroid_mask(vd.centroids)
+        if slice_mask is not None:
+            keep &= slice_mask
+        color_mask = self._color_visibility_mask(colors)
+        if color_mask is not None:
+            keep &= color_mask
+        if not np.all(keep):
+            varray = varray[keep]
+        self._upload_centroid_varray(varray)
         if not self.viewInitialized:
             self.camera.fitToObject(vd.centroids)
             self.viewInitialized = True
+        self._emit_rendered_count(len(varray), "Points")
 
     def _update_checkpoint_atom_view(self):
         """Build atom/bond instances from checkpoint grid + mol templates and upload to GPU."""
+        self._sync_filter_signature()
         vd = self._checkpoint_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
@@ -1975,9 +2389,14 @@ class VisualisationWidget(QOpenGLWidget):
             logger.warning("Checkpoint Atoms: no mol templates available")
             return
 
+        self.overlay.setVisible(False)
         use_atom_colors = self.color_by == "Atom"
         if use_atom_colors:
             centroid_colors = None
+        elif self.color_by in self._SITE_METADATA_COLOR_BY and self._site_metadata.get(
+            self.color_by
+        ):
+            centroid_colors = self._checkpoint_site_colors(vd, self.color_by)
         else:
             n_tiles = self._checkpoint.n_tiles if self._checkpoint else 1
             tile_palette = cm.tab10(np.linspace(0, 1, max(n_tiles, 1)))[:, :3].astype(np.float32)
@@ -2000,39 +2419,51 @@ class VisualisationWidget(QOpenGLWidget):
             self.camera.fitToObject(atom_arr[:, :3])
             self.viewInitialized = True
 
+        self._emit_checkpoint_legend(atom_view=True)
+        atom_arr, bond_arr = self._apply_atom_color_filter(atom_arr, bond_arr)
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
+        self._emit_rendered_count(len(atom_arr), "Atoms")
 
-    def toggle_checkpoint_view(self):
-        """Cycle Spheres → Checkpoint → Checkpoint Atoms → Spheres. Shift+H shortcut."""
+    @property
+    def has_checkpoint(self) -> bool:
+        return self._checkpoint is not None
+
+    def request_show_middle(self, show_middle: bool) -> bool:
+        """Set the middle-cell visibility; return True if a background build is needed.
+
+        Turning middle cells *off*, or *on* when the full grid is already cached, is
+        an instant swap done here. Turning them *on* for the first time needs the
+        full grid expanded — too heavy for the GUI thread — so this returns True and
+        leaves the view on edges; the caller expands off-thread and installs the
+        result via :meth:`apply_checkpoint_full_vd`.
+        """
         if self._checkpoint is None:
-            QMessageBox.information(
-                self,
-                "No Checkpoint Data",
-                "No checkpoint file was found for this simulation.",
-            )
+            return False
+        self._checkpoint.show_middle = show_middle
+        if show_middle and self._checkpoint_vd_full is None:
+            return True
+        self._select_checkpoint_vd()
+        if self.vis_mode == "Checkpoint":
+            self.initGeometry()
+        return False
+
+    def apply_checkpoint_full_vd(self, vd: VisualData):
+        """Install a background-expanded full-grid VisualData and refresh the view."""
+        if vd is None or self._checkpoint is None:
             return
-        old_style = self.style
-        if self.style not in ("Checkpoint", "Checkpoint Atoms"):
-            new_style = "Checkpoint"
-        elif self.style == "Checkpoint":
-            new_style = (
-                "Checkpoint Atoms"
-                if (self._checkpoint_visual_data and self._checkpoint_visual_data.templates)
-                else "Spheres"
-            )
-        else:
-            new_style = "Spheres"
-        self.style = new_style
-        self.styleChanged.emit(self.style)
-        self._rescale_camera_for_style(old_style, self.style)
-        opts, default = self._color_by_options_for_style(self.style)
-        if self.color_by not in opts:
-            self.color_by = default
-        self.initGeometry()
+        cryst = self._checkpoint.crystallography or self._mol_crystallography
+        if vd.templates is None and self._mol_templates and cryst is not None:
+            vd.templates = VisualData._build_cart_templates(self._mol_templates, cryst)
+        self._checkpoint_vd_full = vd
+        self._select_checkpoint_vd()
+        if self.vis_mode == "Checkpoint":
+            self.initGeometry()
+        self.update()
 
     def _update_docking_atom_view(self):
         """Build atom/bond instances from docking centroids and upload to GPU."""
+        self._sync_filter_signature()
         vd = self._docking_visual_data
         if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
@@ -2044,6 +2475,7 @@ class VisualisationWidget(QOpenGLWidget):
             logger.warning("Docking Atoms requested but no molecular data available")
             return
 
+        self.overlay.setVisible(False)
         use_atom_colors = self.color_by == "Atom"
         if use_atom_colors:
             centroid_colors = None
@@ -2062,6 +2494,7 @@ class VisualisationWidget(QOpenGLWidget):
             color_overrides=self._atom_color_overrides or None,
             radius_overrides=self._atom_radius_overrides or None,
             bond_radius=self._bond_radius,
+            slice_planes=self._active_slice_planes() or None,
         )
 
         if len(atom_arr) == 0:
@@ -2072,9 +2505,11 @@ class VisualisationWidget(QOpenGLWidget):
             self.camera.fitToObject(atom_arr[:, :3])
             self.viewInitialized = True
 
+        self._emit_docking_legend()
+        atom_arr, bond_arr = self._apply_atom_color_filter(atom_arr, bond_arr)
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
-        self._emit_docking_legend()
+        self._emit_rendered_count(len(atom_arr), "Atoms")
 
     def initializeGL(self):
         logger.debug("Initialized OpenGL, version info: %s", self.context().format().version())
@@ -2216,6 +2651,7 @@ class VisualisationWidget(QOpenGLWidget):
 
     def _update_atom_view(self):
         """Compute atom and bond instances from current centroids and upload to GPU."""
+        self._sync_filter_signature()
         vd = self._visual_data
         if vd is None or vd.n_centroids == 0:
             if self.atom_renderer is not None:
@@ -2227,6 +2663,7 @@ class VisualisationWidget(QOpenGLWidget):
             logger.warning("Atom view requested but no molecular data available")
             return
 
+        self.overlay.setVisible(False)
         use_atom_colors = self.color_by == "Atom"
         centroid_colors = None if use_atom_colors else self._centroid_colormap_colors()
 
@@ -2238,6 +2675,7 @@ class VisualisationWidget(QOpenGLWidget):
             bond_radius=self._bond_radius,
             selected_indices=self._selected_points or None,
             slice_planes=self._active_slice_planes() or None,
+            deleted_indices=self._deleted_points or None,
         )
 
         if len(atom_arr) == 0:
@@ -2248,9 +2686,11 @@ class VisualisationWidget(QOpenGLWidget):
             self.camera.fitToObject(atom_arr[:, :3])
             self.viewInitialized = True
 
+        self._emit_atom_legend()
+        atom_arr, bond_arr = self._apply_atom_color_filter(atom_arr, bond_arr)
         self.atom_renderer.setPoints(atom_arr)
         self.bond_renderer.setBonds(bond_arr)
-        self._emit_atom_legend()
+        self._emit_rendered_count(len(atom_arr), "Atoms")
 
     def set_atom_overrides(
         self,
@@ -2262,8 +2702,8 @@ class VisualisationWidget(QOpenGLWidget):
         self._atom_color_overrides = color_overrides
         self._atom_radius_overrides = radius_overrides
         self._bond_radius = bond_radius
-        if self.style == "Atoms":
-            self._update_atom_view()
+        if self.is_atom_view:
+            self.initGeometry()
             self.update()
 
     def set_legend_element_color(self, symbol: str, color: tuple[float, float, float] | None):
@@ -2272,7 +2712,7 @@ class VisualisationWidget(QOpenGLWidget):
             self._atom_color_overrides.pop(symbol, None)
         else:
             self._atom_color_overrides[symbol] = color
-        if self.style in ("Atoms", "Docking Atoms"):
+        if self.is_atom_view:
             self.initGeometry()
 
     def set_legend_shell_color(self, shell_id: int, color: tuple[float, float, float] | None):
@@ -2281,14 +2721,14 @@ class VisualisationWidget(QOpenGLWidget):
             self._docking_shell_color_overrides.pop(shell_id, None)
         else:
             self._docking_shell_color_overrides[shell_id] = color
-        if self.style in ("Docking", "Docking Atoms"):
+        if self.vis_mode == "Docking":
             self.initGeometry()
 
     def reset_legend_colors(self):
         """Clear all legend-driven colour overrides (element and shell) and redraw."""
         self._atom_color_overrides.clear()
         self._docking_shell_color_overrides.clear()
-        if self.style in ("Atoms", "Docking", "Docking Atoms"):
+        if self.is_atom_view or self.vis_mode == "Docking":
             self.initGeometry()
 
     def get_visible_elements(self) -> list[str]:
@@ -2324,27 +2764,6 @@ class VisualisationWidget(QOpenGLWidget):
             self._bond_radius,
         )
 
-    def toggle_atom_view(self):
-        """Toggle between centroid (Spheres) and atom view. Shift+V shortcut."""
-        if self._mol_templates is None:
-            from PySide6.QtWidgets import QMessageBox
-
-            QMessageBox.information(
-                self,
-                "No Molecular Data",
-                "No structure file was found.\n"
-                "Load a CrystalGrower simulation folder that includes a structure file.",
-            )
-            return
-        old_style = self.style
-        self.style = "Atoms" if self.style != "Atoms" else "Spheres"
-        self.styleChanged.emit(self.style)
-        self._rescale_camera_for_style(old_style, self.style)
-        opts, default = self._color_by_options_for_style(self.style)
-        if self.color_by not in opts:
-            self.color_by = default
-        self.initGeometry()
-
     def draw(self, gl):
         from PySide6.QtGui import QMatrix4x4, QVector2D
 
@@ -2368,29 +2787,20 @@ class VisualisationWidget(QOpenGLWidget):
             "u_modelViewMat": modelView,
             "u_scale": self.camera.scale,
             "u_lineScale": 2.0,
+            **self.render_settings.shader_uniforms(self.camera.perspectiveProjection),
         }
 
-        if self.style == "Points":
+        if self.is_atom_view:
+            self._draw_bonds(gl, uniforms)
+            self._draw_atoms(gl, uniforms)
+        elif self.render_option == "Points":
             self._draw_points(gl, uniforms)
-        elif self.style == "Spheres":
-            self._draw_spheres(gl, uniforms)
-        elif self.style == "Convex Hull":
+        elif self.render_option == "Convex Hull":
             self._draw_mesh(gl, uniforms)
             if self.show_mesh_edges:
                 self._draw_lines(gl, uniforms)
-        elif self.style == "Atoms":
-            self._draw_bonds(gl, uniforms)
-            self._draw_atoms(gl, uniforms)
-        elif self.style == "Docking":
+        else:
             self._draw_spheres(gl, uniforms)
-        elif self.style == "Docking Atoms":
-            self._draw_bonds(gl, uniforms)
-            self._draw_atoms(gl, uniforms)
-        elif self.style == "Checkpoint":
-            self._draw_spheres(gl, uniforms)
-        elif self.style == "Checkpoint Atoms":
-            self._draw_bonds(gl, uniforms)
-            self._draw_atoms(gl, uniforms)
 
         self.axes_renderer.bind()
         self.axes_renderer.setUniforms(**uniforms)

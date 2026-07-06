@@ -51,6 +51,7 @@ from ..utils.crystallography import Crystallography
 from ..visualisation.atom_renderer import AtomRenderer
 from ..visualisation.bond_renderer import BondRenderer
 from ..visualisation.camera import Camera
+from ..visualisation.shading import RenderSettings
 from ..visualisation.unit_cell_renderer import (
     _AXIS_COLORS,
     _EDGES,
@@ -574,6 +575,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
             "u_scale": self._camera.scale,
             "u_lineScale": 2.0,
             "u_axesMat": axes,
+            **RenderSettings().shader_uniforms(self._camera.perspectiveProjection),
         }
 
     # ------------------------------------------------------------------

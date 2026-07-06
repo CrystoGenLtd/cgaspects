@@ -11,7 +11,7 @@ import pandas as pd
 from natsort import natsorted
 from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QSignalBlocker, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QIcon, Qt
+from PySide6.QtGui import QAction, QActionGroup, QIcon, Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from ..analysis.aspect_ratios import AspectRatio
 from ..analysis.cluster_analysis import ClusterAnalysis
 from ..analysis.growth_rates import GrowthRate
-from ..analysis.gui_threads import WorkerCheckpoint, WorkerXYZ
+from ..analysis.gui_threads import WorkerCheckpoint, WorkerCheckpointExpand, WorkerXYZ
 from ..analysis.site_analysis import SiteAnalysis
 from ..fileio.cg_checkpoint import Checkpoint
 from ..fileio.find_data import (
@@ -51,6 +51,7 @@ from .dialogs.directions_dialog import DirectionsDialog
 from .dialogs.keyboard_shortcuts import KeyboardShortcutsDialog
 from .dialogs.lattice_dialog import LatticeParametersDialog
 from .dialogs.planes_dialog import PlanesDialog
+from .dialogs.render_settings_dialog import RenderSettingsDialog
 from .dialogs.settings import SettingsDialog
 from .dialogs.site_highlight_dialog import SiteHighlightDialog
 from .dialogs.unit_cell_viewer_dialog import UnitCellViewerDialog
@@ -146,6 +147,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.worker_signals.highlight_site.connect(self.highlight_site_in_visualization)
         self.worker_signals.error.connect(self.show_worker_error)
         # Other self variables
+        self.crystal = None  # current CrystalCloud; None in checkpoint-grid mode
         self.sim_num: int | None = None
         self.input_folder: Path | None = None
         self.output_folder: Path | None = None
@@ -159,7 +161,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.cluster_labels_cache: dict = {}
         self.coord_cache: dict = {}
 
-        self._prev_style: str | None = None
+        # (vis_mode, is_atom_view) last seen — used to trigger data loads on change.
+        self._prev_view_state: tuple[str, bool] | None = None
         self._docking_file_map: dict[Path, Path] = {}  # normal_xyz -> docking_xyz
         self._checkpoint_file_map: dict[Path, Path] = {}  # normal_xyz -> checkpoint_txt
         self._structure: Structure | None = None
@@ -201,6 +204,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Connect OpenGL widget signals to toolbar
         self.openglwidget.pointHovered.connect(self.pointInfoToolbar.update_hover_info)
         self.openglwidget.selectionChanged.connect(self.pointInfoToolbar.update_selection_info)
+        # Keep the Crystal Information point count in sync with what is actually rendered
+        # (e.g. after the colour-legend filter hides some points).
+        self.openglwidget.renderedCountChanged.connect(self._handle_rendered_count)
         self.pointInfoToolbar.set_point_data_fn(self.openglwidget._get_point_data)
 
         self.xyzFilenameListWidget.currentRowChanged.connect(self.setCurrentXYZIndex)
@@ -227,7 +233,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Create atom mode settings dialog (non-modal, shown via Crystallography menu)
         self.atom_mode_settings_dialog = AtomModeSettingsDialog(parent=self)
         self.atom_mode_settings_dialog.settingsChanged.connect(self._handle_atom_mode_settings)
-        self.openglwidget.styleChanged.connect(self._on_style_changed)
+        self.openglwidget.viewStateChanged.connect(self._on_view_state_changed)
 
         # Create unit cell viewer dialog (Tools menu)
         self.unit_cell_viewer_dialog = UnitCellViewerDialog(parent=self)
@@ -240,6 +246,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Create axes settings dialog
         self.axes_settings_dialog = AxesSettingsDialog(parent=self)
         self.axes_settings_dialog.settingsChanged.connect(self.handle_axes_settings_changed)
+
+        # Create sphere material / lighting settings dialog
+        self.render_settings_dialog = RenderSettingsDialog(parent=self)
+        self.render_settings_dialog.settingsChanged.connect(
+            self.openglwidget.set_render_settings
+        )
 
         # Create directions and planes dialogs
         self.directions_dialog = DirectionsDialog(parent=self)
@@ -377,6 +389,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionAxesSettings.triggered.connect(self.show_axes_settings_dialog)
         self.menuView.addAction(self.actionAxesSettings)
 
+        # Add Sphere & Lighting Settings action to View menu
+        self.actionRenderSettings = QAction("Sphere && Lighting Settings", self)
+        self.actionRenderSettings.setObjectName("actionRenderSettings")
+        self.actionRenderSettings.setToolTip(
+            "Configure sphere material, lighting and ambient occlusion"
+        )
+        self.actionRenderSettings.triggered.connect(self.show_render_settings_dialog)
+        self.menuView.addAction(self.actionRenderSettings)
+
         # Add Toggle Point Info Sidebar action to View menu
         self.actionToggleSidebar = QAction("Toggle Point Info Panel", self)
         self.actionToggleSidebar.setObjectName("actionToggleSidebar")
@@ -480,23 +501,53 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         actStore.triggered.connect(self.openglwidget.store_view)
         self.menuView.addAction(actStore)
 
-        actAtomView = QAction("Toggle Atom View", self)
-        actAtomView.setObjectName("actionToggleAtomView")
-        actAtomView.setShortcut("Shift+V")
-        actAtomView.setToolTip(
-            "Switch between centroid (Spheres) and per-atom view (requires structure file)"
-        )
-        actAtomView.triggered.connect(self.openglwidget.toggle_atom_view)
-        self.menuView.addAction(actAtomView)
+        # Visualisation Mode submenu — which data source is shown (Crystal = the
+        # normal .XYZ output, Docking = docking-site file, Checkpoint = grid file).
+        # Docking / Checkpoint entries are enabled per-simulation when files exist.
+        menuVisMode = QMenu("Visualisation Mode", self)
+        self.menuVisualisationMode = menuVisMode
+        self._vis_mode_group = QActionGroup(self)
+        self._vis_mode_group.setExclusive(True)
+        self._vis_mode_actions: dict[str, QAction] = {}
+        for mode, shortcut, tooltip in [
+            ("Crystal", "Shift+C", "Show the crystal (.XYZ) output"),
+            ("Docking", "Shift+D", "Show docking sites (requires docking file)"),
+            ("Checkpoint", "Shift+H", "Show the checkpoint grid (requires checkpoint file)"),
+        ]:
+            act = QAction(mode, self)
+            act.setObjectName(f"actionVisMode{mode}")
+            act.setShortcut(shortcut)
+            act.setToolTip(tooltip)
+            act.setCheckable(True)
+            act.setEnabled(mode == "Crystal")
+            act.triggered.connect(lambda checked=False, m=mode: self._on_vis_mode_action(m))
+            self._vis_mode_group.addAction(act)
+            menuVisMode.addAction(act)
+            self._vis_mode_actions[mode] = act
+        self._vis_mode_actions["Crystal"].setChecked(True)
+        self.menuView.addMenu(menuVisMode)
 
-        actCheckpointView = QAction("Toggle Checkpoint View", self)
-        actCheckpointView.setObjectName("actionToggleCheckpointView")
-        actCheckpointView.setShortcut("Shift+H")
-        actCheckpointView.setToolTip(
-            "Switch between normal and Checkpoint visualiser view (requires checkpoint file)"
+        # Atom vs centroid representation for the current mode (centroid default).
+        self.actionAtomView = QAction("Atom View", self)
+        self.actionAtomView.setObjectName("actionToggleAtomView")
+        self.actionAtomView.setShortcut("Shift+V")
+        self.actionAtomView.setCheckable(True)
+        self.actionAtomView.setToolTip(
+            "Show individual atoms instead of centroids for the current visualisation "
+            "mode (requires structure file)"
         )
-        actCheckpointView.triggered.connect(self.openglwidget.toggle_checkpoint_view)
-        self.menuView.addAction(actCheckpointView)
+        self.actionAtomView.triggered.connect(self._on_atom_view_toggled)
+        self.menuView.addAction(self.actionAtomView)
+
+        actCheckpointMiddle = QAction("Toggle Checkpoint Middle Cells", self)
+        actCheckpointMiddle.setObjectName("actionToggleCheckpointMiddle")
+        actCheckpointMiddle.setShortcut("Shift+M")
+        actCheckpointMiddle.setToolTip(
+            "Show or hide the interior (middle) cells of the checkpoint grid "
+            "(edges only by default; requires checkpoint file)"
+        )
+        actCheckpointMiddle.triggered.connect(self.toggle_checkpoint_middle)
+        self.menuView.addAction(actCheckpointMiddle)
 
         menuPointSize = QMenu("Point Size", self)
         actIncrease = QAction("Increase", self)
@@ -677,6 +728,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._colour_legend_dialog.colorOverrideRequested.connect(
                 self._handle_legend_color_override
             )
+            self._colour_legend_dialog.filterChanged.connect(
+                self.openglwidget.set_legend_filter
+            )
             info = self.openglwidget.get_legend_info()
             if info is not None:
                 self._colour_legend_dialog.update_legend(info)
@@ -686,6 +740,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._colour_legend_dialog.activateWindow()
         else:
             self._colour_legend_dialog.show()
+
+    def _handle_rendered_count(self, count: int, label: str):
+        """Update the Crystal Information count to match the rendered (filtered) view."""
+        self.crystal_info.pointCount = count if count else None
+        self.crystal_info.countLabel = label
+        self.crystalInfoChanged.emit(self.crystal_info)
 
     def _handle_legend_color_override(self, mode: str, key, color):
         """Route legend colour-pick / reset signals to the GL widget."""
@@ -1133,6 +1193,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.axes_settings_dialog.show()
         self.axes_settings_dialog.raise_()
 
+    def show_render_settings_dialog(self):
+        """Show the sphere material / lighting settings dialog."""
+        self.render_settings_dialog.show()
+        self.render_settings_dialog.raise_()
+
     def handle_axes_settings_changed(self, settings):
         """Handle changes to axes settings."""
         if hasattr(self.openglwidget, "axes_renderer"):
@@ -1410,12 +1475,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             if Path(str(self.xyz_files[0])).stem.endswith("_checkpoint"):
                 if self._structure is None or self.crystallography is None:
                     self.log_message(
-                        "Load a structure file to visualise checkpoint data as a point cloud.",
+                        "Load a structure file to visualise checkpoint data.",
                         "warning",
                     )
                     self.openglwidget.showNoDataOverlay()
                 else:
-                    self._dispatch_checkpoint_as_crystal(0)
+                    # No real xyz crystal — render the checkpoint grid directly so
+                    # site-analysis colour modes (coordination, energy …) are available.
+                    self.sim_num = 0
+                    self._update_vis_mode_availability()
+                    self.openglwidget.set_visualisation_mode("Checkpoint")
                 self.aspect_ratio_pushButton.setEnabled(True)
                 self.variablesTabWidget.setCurrentIndex(0)
                 self.actionImport_Summary_File.setEnabled(True)
@@ -1532,8 +1601,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.crystalInfoChanged.emit(self.crystal_info)
             return
 
-        style = self.openglwidget.style
-        if style in self.openglwidget._ATOM_STYLES and vd.templates:
+        if self.openglwidget.is_atom_view and vd.templates:
             self.crystal_info.pointCount = vd.n_atoms or vd.n_centroids
             self.crystal_info.countLabel = "Atoms"
         else:
@@ -1737,6 +1805,11 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.clusteranalysis.set_current_file(self.xyz_files[self.sim_num])
         else:
             self.clusteranalysis.set_current_file(None)
+        # Site-analysis metadata (coordination/energy) + structure context feed the
+        # radial profile; coordination/energy are looked up per point by site number.
+        self.clusteranalysis.set_site_metadata(self._resolve_site_metadata())
+        n_tiles = self._structure.n_tiles if self._structure is not None else None
+        self.clusteranalysis.set_checkpoint_context(self.crystallography, n_tiles)
         self.clusteranalysis.calculate_clusters()
 
     def setShowPlottingButtons(self, state=True):
@@ -1807,6 +1880,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if value.folder:
             self.output_folder = value.folder
             self.log_message(f"Output folder updated: [{self.output_folder}]", "debug")
+
+        # Site-analysis output → refresh checkpoint colour maps (coordination, energy …)
+        if value.csv and str(value.csv).endswith("site_analysis_data.json"):
+            self._refresh_site_metadata()
 
         logger.debug("About to call replotting_called()")
         self.replotting_called()
@@ -1954,6 +2031,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.update_XYZ_info()
 
+        self._update_vis_mode_availability()
         self._update_docking_for_current_xyz()
         self._update_checkpoint_for_current_xyz()
         self.updateVisualizationSettings()
@@ -1963,15 +2041,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.update_variables(values=var_values)
 
     def _update_docking_for_current_xyz(self):
-        """Reload docking data for the new XYZ if a docking style is active."""
-        style_widget = self.visualizationSettings.widgets.get("Style")
-        if style_widget is not None and style_widget.value in ("Docking", "Docking Atoms"):
+        """Reload docking data for the new XYZ if Docking mode is active."""
+        if self.openglwidget.vis_mode == "Docking":
             self._load_docking_for_current_xyz()
 
     def _update_checkpoint_for_current_xyz(self):
-        """Reload checkpoint data for the new XYZ if a Checkpoint style is active."""
-        style_widget = self.visualizationSettings.widgets.get("Style")
-        if style_widget is not None and style_widget.value in self._CHECKPOINT_VIEW_STYLES:
+        """Reload checkpoint data for the new XYZ if Checkpoint mode is active."""
+        if self.openglwidget.vis_mode == "Checkpoint":
             self._load_checkpoint_for_current_xyz()
 
     def _load_docking_for_current_xyz(self):
@@ -2009,22 +2085,113 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             checkpoint_path,
             self._structure.n_tiles,
             self.crystallography,
+            build_visual_data=True,
         )
         worker.signals.result.connect(self._on_checkpoint_loaded_for_view)
+        worker.signals.progress.connect(self.update_progressbar)
         worker.signals.error.connect(
             lambda err: self.log_message(f"Failed to load checkpoint: {err[1]}", "error")
         )
         self.set_progressbar()
+        # Override the generic "Started Calculations…" banner: this is a file parse,
+        # not an analysis run, so the status should say so.
+        self.set_message(f"Loading checkpoint {checkpoint_path.name}…")
         worker.signals.finished.connect(self.clear_progressbar)
         self.threadpool.start(worker)
 
     def _on_checkpoint_loaded_for_view(self, checkpoint):
         """Receive a loaded Checkpoint and push it to the GL widget (grid/view mode)."""
         self.openglwidget.set_checkpoint(checkpoint)
+        self._refresh_site_metadata()
         self.log_message(
             f"Checkpoint loaded: {checkpoint.filepath.name} ({checkpoint.n_filled:,} filled cells)",
             "info",
         )
+
+    def toggle_checkpoint_middle(self):
+        """Show/hide the checkpoint's interior (middle) cells.
+
+        Switching middle cells *on* the first time expands the whole grid, which is
+        far heavier than the edges-only load, so it runs on a worker thread and the
+        view updates when it finishes. Switching off (or on again, once cached) is an
+        instant swap handled directly by the GL widget.
+        """
+        widget = self.openglwidget
+        if not widget.has_checkpoint:
+            self.log_message("No checkpoint loaded to toggle middle cells", "warning")
+            return
+        show_middle = not widget._checkpoint.show_middle
+        needs_build = widget.request_show_middle(show_middle)
+        if not needs_build:
+            self.log_message(
+                f"Checkpoint middle cells {'shown' if show_middle else 'hidden'}", "info"
+            )
+            return
+        # First time showing middle cells: expand the full grid off the GUI thread.
+        self.log_message("Expanding checkpoint interior cells…", "info")
+        cryst = widget._checkpoint.crystallography or self.crystallography
+        worker = WorkerCheckpointExpand(widget._checkpoint, cryst, include_middle=True)
+        worker.signals.result.connect(widget.apply_checkpoint_full_vd)
+        worker.signals.progress.connect(self.update_progressbar)
+        worker.signals.result.connect(
+            lambda _: self.log_message("Checkpoint middle cells shown", "info")
+        )
+        worker.signals.error.connect(
+            lambda err: self.log_message(f"Failed to expand checkpoint: {err[1]}", "error")
+        )
+        self.set_progressbar()
+        # Override the generic "Started Calculations…" banner (see checkpoint load).
+        self.set_message("Expanding checkpoint interior cells…")
+        worker.signals.finished.connect(self.clear_progressbar)
+        self.threadpool.start(worker)
+
+    def _find_site_analysis_json(self) -> Path | None:
+        """Locate a saved site_analysis_data.json (output folder, then input tree)."""
+        candidates: list[Path] = []
+        if self.output_folder:
+            candidates.append(Path(self.output_folder) / "site_analysis_data.json")
+        of = getattr(self.siteanalysis, "output_folder", None)
+        if of:
+            candidates.append(Path(of) / "site_analysis_data.json")
+        if self.input_folder:
+            candidates.extend(Path(self.input_folder).rglob("site_analysis_data.json"))
+        for candidate in candidates:
+            if candidate and candidate.is_file():
+                return candidate
+        return None
+
+    def _resolve_site_metadata(self) -> dict[str, dict[int, float]]:
+        """Build site→value colour maps: in-session parsed data first, else saved JSON."""
+        from ..analysis.site_parser import build_site_metadata_maps, load_site_metadata_maps
+
+        parsed = getattr(self.siteanalysis, "parsed_data", None)
+        if parsed:
+            try:
+                return build_site_metadata_maps(parsed)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to build site metadata from in-session data: %s", exc)
+
+        json_path = self._find_site_analysis_json()
+        if json_path is not None:
+            try:
+                return load_site_metadata_maps(json_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to load site metadata from %s: %s", json_path, exc)
+
+        return {}
+
+    def _refresh_site_metadata(self):
+        """Resolve site-analysis colour maps, push them to the GL widget, and
+        repopulate the Color By combo so new modes appear for the active style."""
+        maps = self._resolve_site_metadata()
+        self.openglwidget.set_site_metadata(maps)
+        if any(maps.values()):
+            available = [k for k, v in maps.items() if v]
+            logger.info("Site colour metadata available: %s", ", ".join(available))
+
+        # Refresh Color By options for the current view state (the new fields only
+        # show in Checkpoint mode, but this is harmless otherwise).
+        self._update_color_by_options_for_current_state()
 
     def _dispatch_checkpoint_as_crystal(self, index):
         """Start a worker to load checkpoint file *index* as a point-cloud CrystalCloud."""
@@ -2035,6 +2202,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.crystallography,
         )
         worker.signals.result.connect(self._on_checkpoint_loaded_as_crystal)
+        worker.signals.progress.connect(self.update_progressbar)
         worker.signals.error.connect(
             lambda err: self.log_message(f"Checkpoint point-cloud error: {err[1]}", "error")
         )
@@ -2070,81 +2238,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def updateVisualizationSettings(self):
         pass
 
-    _REINIT_VIEW_STYLES = frozenset(
-        ("Docking", "Docking Atoms", "Unit Cell", "Checkpoint", "Checkpoint Atoms")
-    )
-    _DOCKING_VIEW_STYLES = frozenset(("Docking", "Docking Atoms"))
-    _CHECKPOINT_VIEW_STYLES = frozenset(("Checkpoint", "Checkpoint Atoms"))
-
     def handleVisualizationSettingsChange(self):
         settings = self.visualizationSettings.settings()
-        new_style = settings.get("Style", "")
-        old_style = self._prev_style  # capture before update
-
-        # Update Color By options when style changes (before reading color_by)
-        if new_style != self._prev_style:
-            self._prev_style = new_style
-            self._update_color_by_options_for_style(new_style, settings)
-            settings = self.visualizationSettings.settings()  # re-read updated color_by
-
-        self._prev_color_by = settings.get("Color By")
-
         self.openglwidget.updateSettings(**settings)
-
-        # Keep "Atom Mode Settings" menu item in sync with current style
-        self.actionAtomModeSettings.setEnabled(new_style in ("Atoms", "Unit Cell"))
-
-        # Auto-load docking data when switching to a docking style
-        if new_style in ("Docking", "Docking Atoms"):
-            self._load_docking_for_current_xyz()
-
-        # Recentre camera whenever crossing the normal ↔ reinit-style boundary
-        # (entering Docking/Unit Cell/Checkpoint, or returning to normal mode from them).
-        # Exception: Docking ↔ Docking Atoms only rescales, rotation is preserved.
-        style_changed = new_style != old_style
-        between_docking = (
-            old_style in self._DOCKING_VIEW_STYLES and new_style in self._DOCKING_VIEW_STYLES
-        )
-        crossing_boundary = (
-            style_changed
-            and not between_docking
-            and (
-                (old_style in self._REINIT_VIEW_STYLES) != (new_style in self._REINIT_VIEW_STYLES)
-                or new_style in self._REINIT_VIEW_STYLES
-            )
-        )
-        if crossing_boundary:
-            self.openglwidget.recentre_view()
 
         fps = self.visualizationSettings.fps()
         if self.fps != fps:
             self.frame_timer.start(1000 // self.fps)
             self.fps = fps
 
-    def _update_color_by_options_for_style(self, style: str, current_settings: dict):
-        """Update the Color By combo options to match the active render style."""
-        from .visualisation.openGL import VisualisationWidget as _VW
-
-        if style in ("Atoms", "Unit Cell"):
-            options = list(_VW._ATOM_COLOR_BY)
-            default = "Atom"
-        elif style == "Docking":
-            options = list(_VW._DOCKING_COLOR_BY)
-            default = "Coordination Shell"
-        elif style == "Docking Atoms":
-            options = list(_VW._DOCKING_ATOM_COLOR_BY)
-            default = "Atom"
-        elif style == "Checkpoint":
-            options = list(_VW._CHECKPOINT_COLOR_BY)
-            default = "Single Colour"
-        elif style == "Checkpoint Atoms":
-            options = list(_VW._CHECKPOINT_ATOM_COLOR_BY)
-            default = "Atom"
-        else:
-            options = list(_VW._NORMAL_COLOR_BY)
-            default = "Layer"
-
-        current_val = current_settings.get("Color By", "")
+    def _update_color_by_options_for_current_state(self):
+        """Update the Color By combo options to match the active mode / atom view."""
+        opts, default = self.openglwidget._color_by_options_for_state()
+        options = list(opts)
+        current_val = self.visualizationSettings.settings().get("Color By", "")
         effective_default = current_val if current_val in options else default
         self.visualizationSettings.setColorByOptions(options, effective_default)
 
@@ -2172,38 +2279,91 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         """Relay atom-mode override changes from the dialog to the OpenGL widget."""
         self.openglwidget.set_atom_overrides(color_overrides, radius_overrides, bond_radius)
 
-    def _on_style_changed(self, style: str):
-        """Keep the Style combo, Color By combo, and Atom Mode Settings menu in sync with the active style."""
-        is_mol_style = style in ("Atoms", "Unit Cell")
-        self.actionAtomModeSettings.setEnabled(is_mol_style)
+    def _on_vis_mode_action(self, mode: str):
+        """Handle a Visualisation Mode menu selection (Crystal / Docking / Checkpoint)."""
+        changed = self.openglwidget.set_visualisation_mode(mode)
+        # Re-sync checks in case the switch was refused or was a no-op.
+        self._sync_view_menu_checks()
+        if changed:
+            self.openglwidget.recentre_view()
 
-        is_convex_hull = style == "Convex Hull"
-        self.actionShowMeshEdges.setEnabled(is_convex_hull)
-        if not is_convex_hull and self.openglwidget.show_mesh_edges:
-            self.openglwidget.show_mesh_edges = False
-            self.openglwidget.update()
+    def _on_atom_view_toggled(self, checked: bool):
+        """Handle the Atom View menu toggle for the current visualisation mode."""
+        self.openglwidget.set_atom_view(checked)
+        # Re-sync in case the switch was refused (e.g. no structure file loaded).
+        self._sync_view_menu_checks()
 
-        is_atom_style = style in ("Atoms", "Docking Atoms", "Checkpoint Atoms")
-        self.menuBondRadius.setEnabled(is_atom_style)
-        if style in ("Docking", "Docking Atoms"):
-            self._load_docking_for_current_xyz()
-        if style in self._CHECKPOINT_VIEW_STYLES:
-            self._load_checkpoint_for_current_xyz()
+    def _sync_view_menu_checks(self):
+        mode = self.openglwidget.vis_mode
+        for m, act in self._vis_mode_actions.items():
+            act.setChecked(m == mode)
+        self.actionAtomView.setChecked(self.openglwidget.is_atom_view)
+
+    def _update_vis_mode_availability(self):
+        """Enable Docking/Checkpoint modes per current simulation; fall back if needed."""
+        current_path = (
+            self.xyz_files[self.sim_num]
+            if self.xyz_files and self.sim_num is not None and self.sim_num < len(self.xyz_files)
+            else None
+        )
+        checkpoint_only = current_path is not None and Path(str(current_path)).stem.endswith(
+            "_checkpoint"
+        )
+        available = {
+            "Crystal": current_path is not None and not checkpoint_only,
+            "Docking": current_path in self._docking_file_map,
+            "Checkpoint": checkpoint_only or current_path in self._checkpoint_file_map,
+        }
+        for mode, act in self._vis_mode_actions.items():
+            act.setEnabled(available[mode])
+
+        # If the active mode is no longer available, fall back to the first enabled one.
+        if not available.get(self.openglwidget.vis_mode, False):
+            for mode in ("Crystal", "Checkpoint", "Docking"):
+                if available[mode]:
+                    self.openglwidget.set_visualisation_mode(mode)
+                    break
+            self._sync_view_menu_checks()
+
+    def _on_view_state_changed(self):
+        """Keep menus, combos, and info panels in sync when the viewport's
+        visualisation mode, atom/centroid toggle, or render option changes."""
+        gl = self.openglwidget
+        mode, atom_view = gl.vis_mode, gl.is_atom_view
+        self._sync_view_menu_checks()
+
+        # Sync the render-style combo (blocked so this doesn't loop back)
         style_widget = self.visualizationSettings.widgets.get("Style")
         if style_widget is not None:
             style_widget.comboBox.blockSignals(True)
-            style_widget.setValue(style)
+            style_widget.setValue(gl.render_option)
             style_widget.comboBox.blockSignals(False)
-        # Update Color By options when the style changes externally (e.g. toggle_atom_view shortcut)
-        if style != self._prev_style:
-            self._prev_style = style
-            current_settings = self.visualizationSettings.settings()
-            self._update_color_by_options_for_style(style, current_settings)
 
-        # Update crystal info count when switching between atom and sphere/point modes
-        vd = self.openglwidget._visual_data
+        self.actionAtomModeSettings.setEnabled(atom_view)
+        self.menuBondRadius.setEnabled(atom_view)
+
+        is_convex_hull = not atom_view and gl.render_option == "Convex Hull"
+        self.actionShowMeshEdges.setEnabled(is_convex_hull)
+        if not is_convex_hull and gl.show_mesh_edges:
+            gl.show_mesh_edges = False
+            gl.update()
+
+        self._update_color_by_options_for_current_state()
+
+        # Load mode data only when the (mode, atom view) pair actually changes —
+        # render-option changes must not re-trigger file loads.
+        state = (mode, atom_view)
+        if state != self._prev_view_state:
+            self._prev_view_state = state
+            if mode == "Docking":
+                self._load_docking_for_current_xyz()
+            elif mode == "Checkpoint":
+                self._load_checkpoint_for_current_xyz()
+
+        # Update crystal info count when switching between atom and centroid views
+        vd = gl._visual_data
         if vd is not None and vd.n_centroids > 0:
-            if style in self.openglwidget._ATOM_STYLES and vd.templates:
+            if atom_view and vd.templates:
                 self.crystal_info.pointCount = vd.n_atoms or vd.n_centroids
                 self.crystal_info.countLabel = "Atoms"
             else:
@@ -2211,8 +2371,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.crystal_info.countLabel = "Points"
             self.crystalInfoChanged.emit(self.crystal_info)
 
-        # If switching into a molecular style and the dialog is already open, refresh it
-        if is_mol_style and self.atom_mode_settings_dialog.isVisible():
+        # If switching into an atom view and the dialog is already open, refresh it
+        if atom_view and self.atom_mode_settings_dialog.isVisible():
             elements = self.openglwidget.get_visible_elements()
             color_ov, radius_ov, bond_r = self.openglwidget.get_atom_overrides()
             bond_summary = self.openglwidget.get_bond_summary()
@@ -2281,7 +2441,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         snap = dataclasses.replace(
             snap,
-            style=settings.get("Style", self.openglwidget.style),
+            style=settings.get("Style", self.openglwidget.render_option),
             color_by=settings.get("Color By", self.openglwidget.color_by),
             colormap=settings.get("Color Map", self.openglwidget.colormap),
             single_color=sc,

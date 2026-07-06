@@ -30,8 +30,29 @@ class VisualData:
     # Raw per-source backing array (N, K); column layout depends on source:
     #   xyz        – the full original xyz input array; columns by native position
     #   docking    – col 0: shells
-    #   checkpoint – col 0: tile_indices
+    #   checkpoint – col 0: tile_indices, col 1: site_numbers
     _raw: np.ndarray | None = field(default=None, repr=False)
+
+    # (N,) bool – checkpoint only: True for centroids on a strip-block edge cell,
+    # False for interior (middle) cells. Lets the viewer hide/show middle cells by
+    # sub-setting the already-expanded point set instead of rebuilding it.
+    edge_flags: np.ndarray | None = field(default=None, repr=False)
+
+    def subset(self, mask: np.ndarray) -> "VisualData":
+        """Return a new VisualData keeping only centroids where *mask* is True.
+
+        Templates are shared (not copied); all per-centroid arrays are indexed so
+        the result stays internally aligned. Cheap fancy-indexing, no re-expansion.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        return VisualData(
+            centroids=self.centroids[mask],
+            mol_types=self.mol_types[mask],
+            source=self.source,
+            templates=self.templates,
+            _raw=self._raw[mask] if self._raw is not None else None,
+            edge_flags=self.edge_flags[mask] if self.edge_flags is not None else None,
+        )
 
     # ------------------------------------------------------------------ metadata
 
@@ -51,6 +72,8 @@ class VisualData:
     def site_numbers(self) -> np.ndarray | None:
         if self.source == "xyz" and self._raw is not None and self._raw.shape[1] > 6:
             return self._raw[:, 6]
+        if self.source == "checkpoint" and self._raw is not None and self._raw.shape[1] > 1:
+            return self._raw[:, 1]
         return None
 
     @property
@@ -191,28 +214,43 @@ class VisualData:
         checkpoint,
         crystallography,
         mol_templates: dict | None = None,
+        include_middle: bool = False,
+        progress_callback=None,
     ) -> "VisualData":
-        """Build from a Checkpoint grid by expanding occupied cells to Cartesian Å."""
+        """Build from a Checkpoint grid by expanding occupied cells to Cartesian Å.
+
+        ``include_middle`` controls scale: False (default) expands only the strip
+        edge cells — the fast, memory-light default used at load. True expands the
+        whole grid (edges + interior), which can be several times larger; build it
+        lazily and only when the user asks to see middle cells.
+
+        Both builds are centred on the edge cells, so an edges-only VisualData and a
+        full one share the same world frame and toggling never shifts the object.
+
+        ``progress_callback`` — optional ``(current, total)`` hook called at the
+        coarse stages of this (vectorised, non-chunked) expansion so a GUI can show
+        the grid → point-cloud build advancing.
+        """
+        def _tick(step: int) -> None:
+            if progress_callback is not None:
+                progress_callback(step, 3)
+
+        _tick(0)
         templates = (
             cls._build_cart_templates(mol_templates, crystallography)
             if mol_templates and crystallography
             else None
         )
-        centroid_chunks: list[np.ndarray] = []
-        mol_type_chunks: list[np.ndarray] = []
-        tile_chunks: list[np.ndarray] = []
-
-        for t in range(checkpoint.n_tiles):
-            indices = np.argwhere(checkpoint.data[..., t]).astype(float)
-            if not len(indices):
-                continue
-            cart = crystallography.frac_to_cart(indices).astype(np.float32)
-            mol_type = t + 1
-            centroid_chunks.append(cart)
-            mol_type_chunks.append(np.full(len(cart), mol_type, dtype=int))
-            tile_chunks.append(np.full(len(cart), t, dtype=int))
-
-        if not centroid_chunks:
+        # Single pass: one argwhere on the contiguous array is far cheaper than a
+        # strided argwhere per tile. When hiding the interior, filter the found
+        # rows by edge_mask rather than np.where-copying the whole 4D grid first.
+        occupied = np.argwhere(checkpoint.data)  # (M, 4): i, j, k, tile
+        if not include_middle and checkpoint.edge_mask is not None:
+            keep = checkpoint.edge_mask[occupied[:, 0], occupied[:, 1], occupied[:, 2]]
+            occupied = occupied[keep]
+        _tick(1)
+        if not len(occupied):
+            _tick(3)
             return cls(
                 centroids=np.zeros((0, 3), dtype=np.float32),
                 mol_types=np.zeros(0, dtype=int),
@@ -220,15 +258,36 @@ class VisualData:
                 templates=templates,
             )
 
-        centroids = np.vstack(centroid_chunks)
-        center = centroids.mean(axis=0)
-        return cls(
+        ijk = occupied[:, :3]
+        tiles = occupied[:, 3]
+        # Site number stored in each occupied cell (0 == empty, already excluded).
+        site_vals = checkpoint.data[ijk[:, 0], ijk[:, 1], ijk[:, 2], tiles]
+        edge_flags = (
+            checkpoint.edge_mask[ijk[:, 0], ijk[:, 1], ijk[:, 2]]
+            if checkpoint.edge_mask is not None
+            else None
+        )
+
+        centroids = crystallography.frac_to_cart(ijk.astype(float)).astype(np.float32)
+        _tick(2)
+        # Centre on the edge cells (the outer shell ≈ geometric centre) so the
+        # default edges-only view sits at the origin, and the middle-on view shares
+        # the same frame — toggling middle cells never shifts the object.
+        if edge_flags is not None and edge_flags.any():
+            center = centroids[edge_flags].mean(axis=0)
+        else:
+            center = centroids.mean(axis=0)
+        result = cls(
             centroids=(centroids - center).astype(np.float32),
-            mol_types=np.concatenate(mol_type_chunks),
+            mol_types=(tiles + 1).astype(int),
             source="checkpoint",
             templates=templates,
-            _raw=np.concatenate(tile_chunks).reshape(-1, 1),
+            # col 0: tile index, col 1: site number (from the checkpoint grid)
+            _raw=np.column_stack([tiles.astype(int), site_vals.astype(int)]),
+            edge_flags=edge_flags,
         )
+        _tick(3)
+        return result
 
     # ------------------------------------------------------------------ colour getters
 
@@ -270,6 +329,37 @@ class VisualData:
         t = (v - lo) / max(hi - lo, 1e-9)
         return colormap_fn(t.astype(np.float32))[:, :3].astype(np.float32)
 
+    def colors_by_site_metadata(
+        self,
+        site_to_value: dict[int, float],
+        colormap_fn,
+        min_val: float | None = None,
+        max_val: float | None = None,
+        missing_rgb: tuple[float, float, float] = (0.3, 0.3, 0.3),
+    ) -> np.ndarray:
+        """(N, 3) float32 – colormap a per-site scalar looked up by site number.
+
+        ``site_to_value`` maps a site number (as registered by the site-analysis
+        workflow) to a scalar such as coordination number or energy. Centroids
+        whose site number is absent from the map are painted ``missing_rgb``.
+        """
+        colors = np.tile(
+            np.asarray(missing_rgb, dtype=np.float32), (self.n_centroids, 1)
+        )
+        sites = self.site_numbers
+        if sites is None or not site_to_value:
+            return colors
+
+        values = np.array(
+            [site_to_value.get(int(s), np.nan) for s in sites], dtype=float
+        )
+        valid = ~np.isnan(values)
+        if valid.any():
+            colors[valid] = self.colors_by_array(
+                values[valid], colormap_fn, min_val, max_val
+            )
+        return colors
+
     def colors_by_tile(self, palette: np.ndarray) -> np.ndarray:
         """(N, 3) float32 – per-tile palette colours (checkpoint atoms view)."""
         colors = np.zeros((self.n_centroids, 3), dtype=np.float32)
@@ -303,6 +393,7 @@ class VisualData:
         bond_radius: float = 0.1,
         selected_indices: set | None = None,
         slice_planes: list | None = None,
+        deleted_indices: set | None = None,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Build GPU vertex arrays for atom and bond rendering.
 
@@ -314,14 +405,16 @@ class VisualData:
         if not self.templates:
             return np.zeros((0, 8), dtype=np.float32), None
 
-        # Build slice keep-mask once (True = keep centroid).
+        # Combined centroid keep-mask (True = keep): slice planes ∩ not-deleted.
+        slice_keep = None
         if slice_planes:
             slice_keep = np.array(
                 [not _centroid_clipped(c.astype(np.float64), slice_planes) for c in self.centroids],
                 dtype=bool,
             )
-        else:
-            slice_keep = None
+        if deleted_indices:
+            del_keep = ~np.isin(np.arange(self.n_centroids), list(deleted_indices))
+            slice_keep = del_keep if slice_keep is None else (slice_keep & del_keep)
 
         global_indices = np.arange(self.n_centroids)
         atom_chunks: list[np.ndarray] = []

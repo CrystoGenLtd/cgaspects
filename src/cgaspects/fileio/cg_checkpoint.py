@@ -17,6 +17,20 @@ class Checkpoint:
     n_tiles: int
     crystallography: Crystallography
     data: np.ndarray
+    # (a, b, c) bool mask flagging the edge cells of every strip block. The full
+    # ``data`` grid always holds *all* sites; ``edge_mask`` lets callers toggle the
+    # interior (middle) cells on/off without re-reading the file.
+    edge_mask: np.ndarray = None
+    # When False (default) only edge cells are shown; when True the middle cells
+    # are included too. Flip this and re-read ``visible_data`` — no file I/O needed.
+    show_middle: bool = False
+
+    @property
+    def visible_data(self) -> np.ndarray:
+        """Grid honouring ``show_middle``: full data, or edges only when off."""
+        if self.show_middle or self.edge_mask is None:
+            return self.data
+        return np.where(self.edge_mask[..., None], self.data, 0)
 
     @property
     def grid_shape(self) -> tuple[int, int, int]:
@@ -24,7 +38,7 @@ class Checkpoint:
 
     @property
     def n_filled(self) -> int:
-        return int(self.data.sum())
+        return int(np.count_nonzero(self.visible_data))
 
     @property
     def n_empty(self) -> int:
@@ -72,7 +86,7 @@ class Checkpoint:
         if self.crystallography is None:
             raise ValueError("Cannot convert to Cartesian: Crystallography is not set")
 
-        mask = self.data.any(axis=-1)          # (a, b, c) — any tile occupied
+        mask = self.visible_data.any(axis=-1)  # (a, b, c) — any tile occupied
         indices = np.argwhere(mask).astype(float)  # (N, 3)
         return self.crystallography.frac_to_cart(indices)
 
@@ -86,74 +100,99 @@ class Checkpoint:
     ):
         t_start = time.perf_counter()
         checkpoint_path = Path(checkpoint_file)
-        file_size = checkpoint_path.stat().st_size
+
+        # Tokenise the whole file in one C-level pass. The checkpoint is a flat
+        # stream of whitespace-separated integers (after the header words), so
+        # splitting once is far cheaper than iterating and int()-parsing lines.
+        tokens = checkpoint_path.read_text(errors="replace").split()
+
+        # Locate the Grid dimensions and the start of the Strip data. Newlines
+        # collapse under split(), and the marker lines can carry trailing words
+        # ("Grid dimensions:", "Strip data:"), so skip past any non-integer
+        # tokens to find the actual numbers rather than assuming fixed offsets.
+        def _is_int(s: str) -> bool:
+            try:
+                int(s)
+                return True
+            except ValueError:
+                return False
 
         a = b = c = None
-        found_strip = False
+        strip_idx = None
+        i = 0
+        n_tokens = len(tokens)
+        while i < n_tokens:
+            tok = tokens[i]
+            if a is None and tok.startswith("Grid"):
+                dims = []
+                j = i + 1
+                while j < n_tokens and len(dims) < 3:
+                    if tokens[j].startswith("Strip"):
+                        break
+                    if _is_int(tokens[j]):
+                        dims.append(int(tokens[j]))
+                    j += 1
+                if len(dims) < 3:
+                    raise ValueError(
+                        "Failed to read Grid dimensions from checkpoint file"
+                    )
+                a, b, c = dims
+                i = j
+                continue
+            if tok.startswith("Strip"):
+                j = i + 1
+                while j < n_tokens and not _is_int(tokens[j]):
+                    j += 1
+                strip_idx = j
+                break
+            i += 1
 
-        with checkpoint_path.open(errors="replace") as f:
-            line_iter = iter(f)
+        if a is None:
+            raise ValueError("Grid section was not found in checkpoint file")
 
-            # Read header / locate Strip section
-            for line in line_iter:
-                line = line.strip()
+        if strip_idx is None:
+            raise ValueError("Strip section was not found in checkpoint file")
 
-                if line.startswith("Grid"):
-                    try:
-                        a, b, c = map(int, next(line_iter).split())
-                    except (StopIteration, ValueError) as exc:
-                        raise ValueError(
-                            "Failed to read Grid dimensions from checkpoint file"
-                        ) from exc
+        grid = np.zeros((a, b, c, n_tiles), dtype=np.int32)
+        edge_mask = np.zeros((a, b, c), dtype=bool)
 
-                    grid = np.zeros((a, b, c, n_tiles), dtype=bool)
+        # Everything past the Strip marker is integers; parse them in bulk (C)
+        # and hand back native Python ints so the structural walk below is pure
+        # list indexing with no per-site int()/strip()/iterator overhead.
+        try:
+            nums = np.array(tokens[strip_idx:], dtype=np.int64).tolist()
+        except ValueError as exc:
+            raise ValueError("Non-integer value found in strip data") from exc
+        del tokens
 
-                elif line.startswith("Strip"):
-                    found_strip = True
-                    break
+        total = len(nums)
+        pos = 0
+        try:
+            while pos < total:
+                y, z, num_blocks = nums[pos], nums[pos + 1], nums[pos + 2]
+                pos += 3
 
-            if a is None:
-                raise ValueError("Grid section was not found in checkpoint file")
+                for _ in range(num_blocks):
+                    start = nums[pos]
+                    end = nums[pos + 1] + 1
+                    pos += 2
 
-            if not found_strip:
-                raise ValueError("Strip section was not found in checkpoint file")
+                    for cell in range(start, end):
+                        if cell == start or cell == end - 1:
+                            edge_mask[cell, y, z] = True
 
-            # Parse strip data
-            for line in line_iter:
-                line = line.strip()
+                        grid[cell, y, z, :] = nums[pos:pos + n_tiles]
+                        pos += n_tiles
 
-                if not line:
-                    continue
-
-                try:
-                    y, z = map(int, line.split())
-                    num_blocks = int(next(line_iter).strip())
-
-                    for _ in range(num_blocks):
-                        start = int(next(line_iter).strip())
-                        end = int(next(line_iter).strip()) + 1
-
-                        for cell in range(start, end):
-                            for tile in range(n_tiles):
-                                site = int(next(line_iter).strip())
-
-                                if site != 0:
-                                    grid[cell, y, z, tile] = 1
-
-                    if progress_callback is not None and file_size:
-                        progress_callback(f.tell(), file_size)
-
-                    continue
-
-                except ValueError as exc:
-                    raise ValueError(f"Invalid strip header line: {line!r}") from exc
-                except StopIteration as exc:
-                    raise ValueError("Unexpected end of file while reading strip data") from exc
+                if progress_callback is not None and total:
+                    progress_callback(pos, total)
+        except (IndexError, ValueError) as exc:
+            raise ValueError("Unexpected end of file while reading strip data") from exc
 
         elapsed = time.perf_counter() - t_start
         LOG.info("Loaded %s in %.3f s", checkpoint_path.name, elapsed)
 
-        return cls(checkpoint_path, n_tiles, crysallography, grid)
+        return cls(checkpoint_path, n_tiles, crysallography, grid, edge_mask)
 
 
 if __name__ == "__main__":

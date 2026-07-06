@@ -94,7 +94,7 @@ class CameraSnapshot:
     point_size: float = 2.0           # viewport point size
 
     # View / style state
-    style: str = "Spheres"            # render style (Spheres, Points, Atoms, …)
+    style: str = "Spheres"            # render option (Spheres, Points, Convex Hull)
     color_by: str = "Layer"           # coloring column
     colormap: str = "Viridis"         # matplotlib colormap name
     single_color: tuple = (0.5, 0.5, 0.5, 1.0)  # RGBA 0-1 for Single Colour mode
