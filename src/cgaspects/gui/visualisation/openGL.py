@@ -6,7 +6,7 @@ from matplotlib import cm
 from OpenGL.GL import GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QUrl, QPoint, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QFont, QVector3D
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QFont, QVector3D
 from PySide6.QtOpenGL import QOpenGLDebugLogger, QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
@@ -312,18 +312,27 @@ class VisualisationWidget(QOpenGLWidget):
 
     def renderToImage(self, scale):
         self.makeCurrent()
-        w = self.width() * scale
-        h = self.height() * scale
+        w = int(self.width() * scale)
+        h = int(self.height() * scale)
         gl = self.context().functions()
-        gl.glViewport(0, 0, w, h)
         fbo = QOpenGLFramebufferObject(w, h, QOpenGLFramebufferObject.CombinedDepthStencil)
 
         fbo.bind()
+        gl.glViewport(0, 0, w, h)
+        # Restore GL state that the QPainter label overlay may have changed
+        # in the previous on-screen frame (mirrors paintGL).
+        gl.glEnable(GL_DEPTH_TEST)
+        gl.glDisable(GL_BLEND)
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         self.draw(gl)
         fbo.release()
         result = fbo.toImage()
         self.doneCurrent()
+        # Blending (planes, selection sphere) leaves alpha < 1 in the FBO, and
+        # toImage() labels the buffer premultiplied — un-premultiplying would
+        # distort those colours. The RGB channels already hold the final
+        # blended colours, so reinterpret them as opaque instead.
+        result.reinterpretAsFormat(QImage.Format_RGB32)
         return result
 
     def saveRender(self, file_name, resolution):
