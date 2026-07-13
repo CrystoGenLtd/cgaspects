@@ -3,7 +3,7 @@ from typing import Tuple, List, Optional, Union, Iterable, Callable
 from pathlib import Path
 import trimesh
 import logging
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 
 
 from dataclasses import dataclass, field
@@ -146,54 +146,113 @@ class Frame:
 
 @dataclass
 class Frames:
-    """Container for multiple frames. Behaves like a list of Frame objects."""
+    """Container for multiple frames. Behaves like a list of Frame objects.
+
+    Can operate in two modes:
+    - eager: frames are held in memory as a plain list (used for small/single-frame
+      sources such as .txt/.stl, and by callers that build frames directly).
+    - lazy: only a byte-offset index into the source XYZ file is kept. Frame data is
+      parsed from disk on demand (and lightly cached), so opening a multi-GB
+      multi-frame file does not require materialising every frame in memory.
+    """
 
     _frames: list[Frame] = field(default_factory=list)
+    _filepath: Optional[Path] = None
+    _lazy_index: Optional[list[tuple[int, int, str]]] = None  # (data_offset, n_atoms, comment)
+    _cache: "OrderedDict[int, Frame]" = field(default_factory=OrderedDict, repr=False, compare=False)
+    _cache_limit: int = 4
+
+    @property
+    def _lazy(self) -> bool:
+        return self._lazy_index is not None
+
+    def _load_lazy_frame(self, idx: int, _retry: bool = True) -> Frame:
+        cached = self._cache.get(idx)
+        if cached is not None:
+            self._cache.move_to_end(idx)
+            return cached
+
+        data_offset, n_atoms, comment = self._lazy_index[idx]
+        if n_atoms == 0:
+            raw = np.empty((0, 0), dtype=float)
+        else:
+            try:
+                with self._filepath.open("r", encoding="utf-8") as file:
+                    file.seek(data_offset)
+                    raw = np.loadtxt(file, max_rows=n_atoms, dtype=float, ndmin=2)
+            except ValueError as e:
+                if _retry:
+                    LOG.warning(
+                        "Malformed values in %s; replacing '*' with '0' and retrying",
+                        self._filepath,
+                    )
+                    raw_text = self._filepath.read_text(encoding="utf-8").replace("*", "0")
+                    self._filepath.write_text(raw_text, encoding="utf-8")
+                    return self._load_lazy_frame(idx, _retry=False)
+                raise e
+
+        frame = Frame(raw=raw, comment=comment)
+        self._cache[idx] = frame
+        if len(self._cache) > self._cache_limit:
+            self._cache.popitem(last=False)
+        return frame
 
     # --- core list-like behaviour ---
     def __len__(self) -> int:
-        return len(self._frames)
+        return len(self._lazy_index) if self._lazy else len(self._frames)
 
     def __getitem__(self, idx: Union[int, slice]) -> Union[Frame, "Frames"]:
+        if self._lazy:
+            if isinstance(idx, slice):
+                return Frames([self._load_lazy_frame(i) for i in range(*idx.indices(len(self)))])
+            return self._load_lazy_frame(idx)
         if isinstance(idx, slice):
             return Frames(self._frames[idx])
         return self._frames[idx]
 
     def __iter__(self) -> Iterable[Frame]:
+        if self._lazy:
+            return (self._load_lazy_frame(i) for i in range(len(self)))
         return iter(self._frames)
 
     def append(self, frame: Frame) -> None:
+        if self._lazy:
+            raise TypeError("Cannot append to a lazily-loaded Frames container")
         self._frames.append(frame)
 
     def extend(self, frames: Iterable[Frame]) -> None:
+        if self._lazy:
+            raise TypeError("Cannot extend a lazily-loaded Frames container")
         self._frames.extend(frames)
 
     # --- convenience views ---
     @property
     def coords(self) -> dict[int, np.ndarray]:
         """All frame coordinates as dict {index: coords}."""
-        return {i: f.coords for i, f in enumerate(self._frames)}
+        return {i: self[i].coords for i in range(len(self))}
 
     @property
     def raw_coords(self) -> dict[int, np.ndarray]:
         """All frame coordinates as dict {index: coords}."""
-        return {i: f.raw for i, f in enumerate(self._frames)}
+        return {i: self[i].raw for i in range(len(self))}
 
     @property
     def comments(self) -> dict[int, Optional[str]]:
         """All frame comments as dict {index: comment}."""
+        if self._lazy:
+            return {i: c for i, (_, _, c) in enumerate(self._lazy_index)}
         return {i: f.comment for i, f in enumerate(self._frames)}
 
     def get_coords(self, idx: int) -> Optional[np.ndarray]:
         """Convenience: coords for a single frame."""
-        if -len(self._frames) <= idx < len(self._frames):
-            return self._frames[idx].coords
+        if -len(self) <= idx < len(self):
+            return self[idx].coords
         return None
 
     def get_raw_coords(self, idx: int) -> Optional[np.ndarray]:
         """Convenience: coords for a single frame."""
-        if -len(self._frames) <= idx < len(self._frames):
-            return self._frames[idx].raw
+        if -len(self) <= idx < len(self):
+            return self[idx].raw
         return None
 
 
@@ -238,8 +297,16 @@ class CrystalCloud:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         clean: bool = True,
     ) -> Frames:
-        """Parse multi-frame XYZ into Frames container."""
-        frames = Frames()
+        """Index a multi-frame XYZ file into a lazily-loaded Frames container.
+
+        Only byte offsets and atom counts are recorded here (no coordinate data is
+        parsed or held in memory), so this scales to very large, many-frame XYZ
+        files. Individual frames are parsed from disk on first access via
+        Frames.__getitem__ / get_coords / get_raw_coords, with a small cache.
+        """
+        filepath = Path(filepath)
+        file_size = filepath.stat().st_size
+        lazy_index: list[tuple[int, int, str]] = []
 
         with filepath.open("r", encoding="utf-8") as file:
             frame_idx = 0
@@ -254,30 +321,32 @@ class CrystalCloud:
                     raise ValueError(f"Invalid XYZ header at frame {frame_idx}: {e}")
 
                 comment = file.readline().strip()
+                data_offset = file.tell()
 
-                if n_atoms == 0:
-                    raw = np.empty((0, 0), dtype=float)
-                else:
-                    try:
-                        raw = np.loadtxt(file, max_rows=n_atoms, dtype=float, ndmin=2)
-                    except ValueError as e:
-                        if clean:
-                            raw_text = Path(filepath).read_text(encoding="utf-8").replace("*", "0")
-                            Path(filepath).write_text(raw_text, encoding="utf-8")
-                            return CrystalCloud.parse_xyz_file(filepath, progress_callback, clean=False)
-                        raise e
+                # Skip over this frame's data lines without parsing them into floats.
+                # Note: file.readline() is used deliberately rather than iterating the
+                # file object (e.g. via islice) - iteration uses an internal read-ahead
+                # buffer that permanently disables file.tell() on the handle.
+                truncated = False
+                for consumed in range(n_atoms):
+                    if not file.readline():
+                        LOG.warning(
+                            "Frame %d in %s is truncated (expected %d lines, found %d); "
+                            "stopping here and keeping the %d preceding complete frame(s).",
+                            frame_idx, filepath, n_atoms, consumed, frame_idx,
+                        )
+                        truncated = True
+                        break
+                if truncated:
+                    break
 
-                frames.append(Frame(raw=raw, comment=comment))
+                lazy_index.append((data_offset, n_atoms, comment))
                 frame_idx += 1
 
                 if progress_callback:
-                    try:
-                        total_frames = int(comment.split("//")[1])
-                    except Exception:
-                        total_frames = frame_idx
-                    progress_callback(frame_idx, total_frames)
+                    progress_callback(file.tell(), file_size)
 
-        return frames
+        return Frames(_filepath=filepath, _lazy_index=lazy_index)
 
     @staticmethod
     def normalise_verts(verts, center=True):

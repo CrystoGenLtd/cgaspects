@@ -27,6 +27,7 @@ uniform float u_shininess;
 uniform float u_specularTint;   // 0 = white highlight, 1 = tinted by base colour
 uniform int   u_toonLevels;     // 0 = smooth shading, >0 = banded (cel) shading
 uniform float u_aoStrength;
+uniform float u_brightness;     // overall exposure gain applied to the final colour
 
 vec3 shadeSurface(vec3 albedo, vec3 normal, vec3 viewDir, float occlusion) {
     vec3 L = normalize(u_lightDir);
@@ -41,7 +42,7 @@ vec3 shadeSurface(vec3 albedo, vec3 normal, vec3 viewDir, float occlusion) {
         if (u_toonLevels > 0) spec = spec > 0.5 ? 1.0 : 0.0;
         color += u_specular * spec * ao * mix(vec3(1.0), albedo, u_specularTint);
     }
-    return color;
+    return color * u_brightness;
 }
 """
 
@@ -76,6 +77,8 @@ class RenderSettings:
     # expressed as degrees. Defaults match the old fixed light (0.2, 0.5, 1.0).
     light_azimuth: float = 11.0
     light_elevation: float = 26.0
+    # Overall exposure gain on the final shaded colour (1.0 = unchanged).
+    brightness: float = 1.0
     ao_enabled: bool = False
     ao_strength: float = 0.55
 
@@ -99,6 +102,7 @@ class RenderSettings:
             "u_specularTint": float(self.specular_tint),
             "u_toonLevels": int(self.toon_levels),
             "u_aoStrength": float(self.ao_strength) if self.ao_enabled else 0.0,
+            "u_brightness": float(self.brightness),
             "u_perspective": 1 if perspective else 0,
         }
 

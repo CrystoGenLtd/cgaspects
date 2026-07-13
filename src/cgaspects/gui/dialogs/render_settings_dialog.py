@@ -83,6 +83,15 @@ class RenderSettingsDialog(QDialog):
         self.elevation_slider, elevation_row = self._angle_slider(-90, 90)
         light_layout.addRow("Elevation:", elevation_row)
 
+        self.brightness_spin = self._float_spin(0.0, 3.0, 0.1)
+        self.brightness_spin.setToolTip(
+            "Overall exposure gain on the final colour (1.0 = unchanged). "
+            "Values above 1 brighten the scene; applies to exported frames and movies too."
+        )
+        self.brightness_spin.valueChanged.disconnect(self._on_field_edited)
+        self.brightness_spin.valueChanged.connect(self._on_light_changed)
+        light_layout.addRow("Brightness:", self.brightness_spin)
+
         light_group.setLayout(light_layout)
         main_layout.addWidget(light_group)
 
@@ -153,6 +162,7 @@ class RenderSettingsDialog(QDialog):
             toon_levels=self.toon_spin.value(),
             light_azimuth=float(self.azimuth_slider.value()),
             light_elevation=float(self.elevation_slider.value()),
+            brightness=self.brightness_spin.value(),
             ao_enabled=self.ao_checkbox.isChecked(),
             ao_strength=self.ao_strength_spin.value(),
         )
@@ -169,6 +179,7 @@ class RenderSettingsDialog(QDialog):
             self.toon_spin.setValue(settings.toon_levels)
             self.azimuth_slider.setValue(round(settings.light_azimuth))
             self.elevation_slider.setValue(round(settings.light_elevation))
+            self.brightness_spin.setValue(settings.brightness)
             self.ao_checkbox.setChecked(settings.ao_enabled)
             self.ao_strength_spin.setValue(settings.ao_strength)
         finally:
