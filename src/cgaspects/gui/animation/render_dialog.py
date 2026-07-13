@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..dialogs.raytrace_dialog import PhotorealSettingsDialog
+from ..visualisation import raytrace_export as rt
 from .keyframe import AnimationTimeline
 from .render_worker import VideoRenderWorker
 
@@ -84,14 +86,40 @@ class RenderAnimationDialog(QDialog):
         self._combo_format.addItem("PNG Sequence (folder)", "image_sequence")
         if not mp4_available:
             note = QLabel(
-                "ℹ MP4 output requires imageio[ffmpeg]. "
-                "Install with: <code>pip install imageio[ffmpeg]</code>"
+                "ℹ MP4 output requires imageio-ffmpeg (normally bundled). "
+                "Reinstall it with: <code>pip install imageio-ffmpeg</code>"
             )
             note.setTextFormat(Qt.RichText)
             note.setWordWrap(True)
             form.addRow("", note)
         self._combo_format.currentIndexChanged.connect(self._on_format_changed)
         form.addRow("Format:", self._combo_format)
+
+        # Renderer: OpenGL (fast) or offline ray tracing (POV-Ray / Tachyon)
+        self._photoreal = rt.PhotorealOptions()
+        self._combo_renderer = QComboBox()
+        self._combo_renderer.addItem("OpenGL (fast)", None)
+        self._combo_renderer.addItem("POV-Ray (ray traced)", "povray")
+        self._combo_renderer.addItem("Tachyon (ray traced)", "tachyon")
+        self._combo_renderer.currentIndexChanged.connect(self._on_renderer_changed)
+        form.addRow("Renderer:", self._combo_renderer)
+
+        self._combo_quality = QComboBox()
+        self._combo_quality.addItem("Match GL settings", "match")
+        self._combo_quality.addItem("Photoreal", "photoreal")
+        self._combo_quality.setEnabled(False)
+        self._combo_quality.currentIndexChanged.connect(self._on_quality_changed)
+        form.addRow("Quality:", self._combo_quality)
+
+        self._btn_photoreal = QPushButton("Photoreal Settings…")
+        self._btn_photoreal.setEnabled(False)
+        self._btn_photoreal.clicked.connect(self._edit_photoreal)
+        form.addRow("", self._btn_photoreal)
+
+        self._lbl_renderer_status = QLabel("")
+        self._lbl_renderer_status.setWordWrap(True)
+        self._lbl_renderer_status.setVisible(False)
+        form.addRow("", self._lbl_renderer_status)
 
         # Resolution
         res_row = QWidget()
@@ -153,6 +181,33 @@ class RenderAnimationDialog(QDialog):
         else:
             self._edit_path.setPlaceholderText("Select output folder…")
 
+    def _on_renderer_changed(self):
+        backend = self._combo_renderer.currentData()
+        raytraced = backend is not None
+        self._combo_quality.setEnabled(raytraced)
+        self._on_quality_changed()
+        if not raytraced:
+            self._lbl_renderer_status.setVisible(False)
+            return
+        exe = rt.find_renderer(backend)
+        if exe:
+            self._lbl_renderer_status.setText(f"✓ {backend} found: {exe}")
+        else:
+            self._lbl_renderer_status.setText(
+                f"⚠ {backend} not found on PATH — install it to render (frames "
+                f"will be blank otherwise).")
+        self._lbl_renderer_status.setVisible(True)
+
+    def _on_quality_changed(self):
+        photoreal = (self._combo_renderer.currentData() is not None
+                     and self._combo_quality.currentData() == "photoreal")
+        self._btn_photoreal.setEnabled(photoreal)
+
+    def _edit_photoreal(self):
+        dlg = PhotorealSettingsDialog(self._photoreal, self)
+        if dlg.exec() == QDialog.Accepted:
+            self._photoreal = dlg.options()
+
     def _browse(self):
         fmt = self._combo_format.currentData()
         if fmt == "mp4":
@@ -180,12 +235,24 @@ class RenderAnimationDialog(QDialog):
         w = self._spin_width.value()
         h = self._spin_height.value()
 
+        backend = self._combo_renderer.currentData()
+        if backend is not None and rt.find_renderer(backend) is None:
+            QMessageBox.warning(
+                self, f"{backend} not found",
+                f"{backend} is not installed on PATH, so ray-traced frames would "
+                f"be blank. Install it, or choose the OpenGL renderer.")
+            return
+        photoreal = (self._photoreal
+                     if self._combo_quality.currentData() == "photoreal" else None)
+
         self._worker = VideoRenderWorker(
             timeline=self._timeline,
             output_path=path,
             resolution=(w, h),
             scale_factor=1.0,
             export_format=fmt,
+            raytrace_backend=backend,
+            photoreal=photoreal,
             parent=self,
         )
         self._worker.progressChanged.connect(self._on_progress)

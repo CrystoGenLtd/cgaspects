@@ -10,7 +10,7 @@ All shortcuts can be viewed and customised in **Help → Keyboard Shortcuts** (`
 |--------|----------|
 | Import | `Ctrl+I` |
 | Import CSV from Clipboard | `Ctrl+Shift+C` |
-| Render viewport | `Ctrl+R` |
+| Export graphics… | `Ctrl+E` |
 | Export XYZ | `Ctrl+Shift+E` |
 
 ---
@@ -28,6 +28,15 @@ All shortcuts can be viewed and customised in **Help → Keyboard Shortcuts** (`
 | Increase Point Size | `Ctrl+=` |
 | Decrease Point Size | `Ctrl+-` |
 | Open Log File | `Ctrl+L` |
+
+---
+
+## Animation
+
+| Action | Shortcut |
+|--------|----------|
+| Toggle Keyframe Timeline | `Ctrl+T` |
+| Add Keyframe Here | `K` |
 
 ---
 

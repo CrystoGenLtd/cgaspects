@@ -10,7 +10,7 @@
 | Import Summary File | — | Load a simulation summary data file |
 | Open Input Directory | — | Open the loaded input folder in the system file manager |
 | Open Results Directory | — | Open the analysis output folder in the system file manager |
-| Render | `Ctrl+R` | Save the current 3D viewport as an image |
+| Export graphics… | `Ctrl+E` | Save the viewport as a PNG, a ray-traced (POV-Ray/Tachyon) image, or a 3D mesh |
 | Export XYZ | `Ctrl+Shift+E` | Export the current point cloud to an XYZ file |
 | Plotting Dialog | — | Open the advanced data plotting window |
 
@@ -23,6 +23,7 @@
 | Highlight Sites | `Ctrl+Shift+S` | Open the site highlighting dialog |
 | Switch Projection | `Ctrl+Shift+P` | Toggle between perspective and orthographic projection |
 | Axes Settings | `Ctrl+Shift+A` | Configure axes rendering style, labels, and scale |
+| Sphere & Lighting Settings | — | Configure sphere material, lighting, brightness, and ambient occlusion |
 | Toggle Point Info Panel | `Ctrl+B` | Show or hide the point information sidebar |
 | **Align View** | | |
 | — Align to X Axis | `X` | Look along the X (or a) axis |
@@ -39,6 +40,20 @@
 | Colour Legend | — | Open a colour legend showing what values each colour represents in the viewport |
 | Open Log File | `Ctrl+L` | Open the application log file |
 | Clear Log File | — | Clear all log entries |
+
+---
+
+## Animation Menu
+
+| Action | Shortcut | Description |
+|--------|----------|-------------|
+| Keyframe Timeline | `Ctrl+T` | Show or hide the keyframe timeline dock |
+| Add Keyframe Here | `K` | Capture the current view as a keyframe |
+| Render Animation… | — | Render the timeline to an MP4 video or PNG sequence (OpenGL or ray traced) |
+| Save Animation… | — | Save the keyframe timeline to a JSON file |
+| Load Animation… | — | Load a keyframe timeline from a JSON file |
+
+See [Animation & Movie Rendering](../features/animation.md) for the full workflow.
 
 ---
 

@@ -45,6 +45,8 @@ class VideoRenderWorker(QThread):
         resolution: tuple[int, int],
         scale_factor: float,
         export_format: str,   # "mp4" | "image_sequence"
+        raytrace_backend: Optional[str] = None,  # None=OpenGL, else "povray"|"tachyon"
+        photoreal=None,       # rt.PhotorealOptions or None (Match GL)
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -53,6 +55,13 @@ class VideoRenderWorker(QThread):
         self._resolution = resolution
         self._scale_factor = scale_factor
         self._export_format = export_format
+        # Read by the main-thread frame handler to choose GL vs offline raytracing.
+        self.raytrace_backend = raytrace_backend
+        self.photoreal = photoreal
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return self._resolution
 
         self._mutex = QMutex()
         self._condition = QWaitCondition()
@@ -110,7 +119,7 @@ class VideoRenderWorker(QThread):
             import imageio
         except ImportError:
             self.error.emit(
-                "imageio is not installed. Run: pip install imageio[ffmpeg]"
+                "imageio is not installed. Run: pip install imageio imageio-ffmpeg"
             )
             return
 

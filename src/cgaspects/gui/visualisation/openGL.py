@@ -507,17 +507,24 @@ class VisualisationWidget(QOpenGLWidget):
 
     def saveRenderDialog(self):
         # First ask user what type of export they want
-        export_options = ["2D Image (PNG)", "3D Mesh"]
+        raytrace_option = "Ray-Traced Image (POV-Ray / Tachyon)"
+        export_options = ["2D Image (PNG)", raytrace_option, "3D Mesh"]
 
         # Only allow 3D mesh export if not in Points mode
         if not self.is_atom_view and self.render_option == "Points":
-            export_options = ["2D Image (PNG)"]
+            export_options = ["2D Image (PNG)", raytrace_option]
 
         export_type, ok = QInputDialog.getItem(
             self, "Select Export Type", "Export as:", export_options, 0, False
         )
 
         if not ok:
+            return
+
+        if export_type == raytrace_option:
+            from ..dialogs.raytrace_dialog import RaytraceDialog
+
+            RaytraceDialog(self, parent=self).exec()
             return
 
         if export_type == "2D Image (PNG)":

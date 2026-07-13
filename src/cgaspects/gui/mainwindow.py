@@ -2551,9 +2551,47 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if data_frame is not None and self.frame_list:
             frame_idx_clamped = max(0, min(data_frame, len(self.frame_list) - 1))
             self.update_frame(frame_idx_clamped)
-        img = self.openglwidget.render_animation_frame()
-        if self._render_worker is not None:
-            self._render_worker.frame_ready(img)
+
+        worker = self._render_worker
+        backend = getattr(worker, "raytrace_backend", None) if worker else None
+        if backend:
+            img = self._raytrace_animation_frame(frame_idx, worker)
+        else:
+            img = self.openglwidget.render_animation_frame()
+        if worker is not None:
+            worker.frame_ready(img)
+
+    def _raytrace_animation_frame(self, frame_idx: int, worker):
+        """Render the current view for one animation frame via POV-Ray/Tachyon.
+
+        Runs on the main thread (needs the live widget state); reuses a per-render
+        scratch directory so scene files don't accumulate.
+        """
+        from PySide6.QtGui import QImage
+
+        from .visualisation import raytrace_export as rt
+
+        w, h = worker.resolution
+        scene = rt.build_scene_from_widget(
+            self.openglwidget, w, h, photoreal=worker.photoreal)
+        if not len(scene.spheres) and not len(scene.cylinders):
+            return QImage()
+
+        scratch = getattr(worker, "_rt_scratch", None)
+        if scratch is None:
+            import tempfile
+            scratch = Path(tempfile.mkdtemp(prefix="cga_raytrace_"))
+            worker._rt_scratch = scratch
+
+        suffix = rt.SCENE_SUFFIX[worker.raytrace_backend]
+        scene_path = scratch / f"frame_{frame_idx:05d}{suffix}"
+        image_path = scratch / f"frame_{frame_idx:05d}.png"
+        try:
+            rt.render_scene(scene, worker.raytrace_backend, scene_path, image_path)
+        except Exception:
+            logger.exception("Ray-traced frame %d failed", frame_idx)
+            return QImage()
+        return QImage(str(image_path))
 
     def _save_animation(self):
         """Save the current animation timeline to a JSON file."""

@@ -60,6 +60,7 @@ nav:
       - Panels: interface/panels.md
   - Features:
       - Visualisation: features/visualisation.md
+      - Animation & Movies: features/animation.md
       - Planes: features/planes.md
       - Directions: features/directions.md
       - Axes Settings: features/axes.md
