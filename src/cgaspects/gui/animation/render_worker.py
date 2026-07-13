@@ -59,14 +59,14 @@ class VideoRenderWorker(QThread):
         self.raytrace_backend = raytrace_backend
         self.photoreal = photoreal
 
-    @property
-    def resolution(self) -> tuple[int, int]:
-        return self._resolution
-
         self._mutex = QMutex()
         self._condition = QWaitCondition()
         self._current_image: Optional[QImage] = None
         self._cancelled = False
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        return self._resolution
 
     def frame_ready(self, image: QImage) -> None:
         """Called from the main thread to deliver a rendered frame."""
