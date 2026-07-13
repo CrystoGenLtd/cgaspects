@@ -1,26 +1,26 @@
 """Unit Cell / Crystal Net viewer dialog.
 
 Opens as a standalone window from the Tools menu.  Shows:
-  - The unit cell box (always, when crystallography is available).
+  - The unit cell box (or a user-grown supercell grid).
   - Molecule templates from the structure file positioned at their
-    fractional coordinates inside the cell (when a structure file was loaded).
-  - Interaction connections from a CrystalGrower net file (when imported),
-    drawn as coloured line segments between molecule centroids with the
-    correct source and target molecules shown at each end.
+    fractional coordinates inside each cell of the supercell.
+  - The crystal net parsed from the structure file itself: each tile
+    (molecule) lists its face neighbours with relative unit-cell offsets,
+    drawn as coloured line segments between molecule centroids.
+  - Optionally, a CrystalGrower net file imported on top to annotate each
+    connection with its interaction distance and energy.
 
-Two view modes are available once a net file is loaded:
-  - Unit Cell: unit cell box + molecule templates at their crystallographic positions.
-  - Net / Connections: source molecule(s) + all neighbour molecules at translated
-    positions + coloured connection lines between them.
+Molecule instances (a tile in a specific cell of the supercell), individual
+atoms, and individual connections can all be selected, hidden, or isolated
+from the tree panel.  Connections are drawn only from molecules that are
+visible and whose tile is ticked under "Show Connections From".
 
-All geometry is centred at the scene origin so rotation always happens at
-the centre of mass, not the world origin.
+All geometry is centred at the supercell centre so rotation always happens
+at the centre of mass, not the world origin.
 """
 
 import logging
-import re
 from pathlib import Path
-from typing import List
 
 import numpy as np
 from OpenGL.GL import GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
@@ -36,17 +36,19 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
 )
 
-from ...fileio.cg_net import CGNet, Molecule
-from ...fileio.structure import Structure
+from ...fileio.cg_net import CGNet
+from ...fileio.structure import Structure, TileConnection
 from ..utils.crystallography import Crystallography
 from ..visualisation.atom_renderer import AtomRenderer
 from ..visualisation.bond_renderer import BondRenderer
@@ -63,8 +65,9 @@ from ..visualisation.visual_data import VisualData
 logger = logging.getLogger("CGA:UnitCellViewer")
 
 _BOND_RADIUS = 0.15
+_MAX_SUPERCELL = 6
 
-# Distinct colours for interaction shells (cycled when more shells than entries)
+# Distinct colours for interaction groups (cycled when more groups than entries)
 _SHELL_COLORS = np.array(
     [
         [0.90, 0.20, 0.20],  # red
@@ -80,51 +83,51 @@ _SHELL_COLORS = np.array(
 )
 
 
-def _parse_mol_type(label: str) -> int | None:
-    """Extract the integer mol_type from a net-file label like '1A' → 1."""
-    m = re.match(r"(\d+)", label)
-    return int(m.group(1)) if m else None
-
-
-def _parse_translation(molecule_info: str) -> tuple[int, int, int] | None:
-    """Extract (tx, ty, tz) integers from a molecule_info string like '(1,0,-1)'."""
-    nums = re.findall(r"-?\d+", molecule_info)
-    if len(nums) >= 3:
-        return int(nums[0]), int(nums[1]), int(nums[2])
-    return None
-
-
 # ---------------------------------------------------------------------------
 # OpenGL viewer widget
 # ---------------------------------------------------------------------------
 
 
 class UnitCellViewerWidget(QOpenGLWidget):
-    """Lightweight QOpenGLWidget that renders a unit cell and optional data."""
+    """Lightweight QOpenGLWidget that renders a supercell of the crystal net.
 
-    itemTreeChanged = Signal()  # emitted when the available atoms/molecules/connections change
+    Item IDs used for selection and visibility:
+      ("mol", tile, (i, j, k))  — one molecule instance in one supercell cell
+      ("atom", tile, idx)       — atom idx of a tile, in all of its instances
+      ("conn", tile, k)         — k-th connection of a tile, in all instances
+    """
+
+    itemTreeChanged = Signal()  # emitted when the available items change
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         # Data
         self._crystallography: Crystallography | None = None
-        self._templates: dict | None = None  # mol_type → precomputed template dict
-        self._net_molecules: List[Molecule] | None = None
+        self._templates: dict | None = None  # tile → precomputed template dict
+        self._connections: dict[int, list[TileConnection]] = {}
+        # (tile, conn_idx) → {"r": float | None, "energy": float | str | None}
+        self._conn_annotations: dict | None = None
 
-        # Mol types to fan connection lines from (empty = no connections shown)
-        self._conn_source_types: set = set()
+        # Supercell extent along a, b, c
+        self._supercell: tuple[int, int, int] = (1, 1, 1)
+
+        # Tiles to fan connection lines from (empty = no connections shown)
+        self._conn_source_tiles: set = set()
 
         # Scene centre used to offset all geometry so rotation is at centre of mass
         self._scene_centre: np.ndarray = np.zeros(3, dtype=np.float32)
 
-        # Selection and visibility
-        self._selected_ids: set = set()   # {("mol", type), ("atom", type, idx), ("conn", idx)}
-        self._hidden_ids: set = set()     # same ID tuples; matched items are skipped in upload
+        # Selection and visibility (item ID tuples, see class docstring)
+        self._selected_ids: set = set()
+        self._hidden_ids: set = set()
 
         # Display toggles
+        self._show_cell = True
         self._show_molecules = True
         self._show_connections = True
+        self._show_neighbours = False  # ghost molecules outside the supercell
+        self._conn_tubes = False  # draw connections as energy-scaled tubes
         self._show_atom_labels = False
         self._show_mol_labels = False
 
@@ -135,12 +138,14 @@ class UnitCellViewerWidget(QOpenGLWidget):
         # Appearance parameters
         self._atom_radius_scale: float = 1.0
         self._bond_radius: float = _BOND_RADIUS
+        self._conn_radius_scale: float = 1.0
 
         # OpenGL resources (created in initializeGL)
         self._atom_renderer: AtomRenderer | None = None
         self._bond_renderer: BondRenderer | None = None
         self._cell_renderer: UnitCellRenderer | None = None
         self._conn_renderer: UnitCellRenderer | None = None
+        self._conn_tube_renderer: BondRenderer | None = None
         self._initialized = False
 
         # Camera
@@ -166,6 +171,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._bond_renderer = BondRenderer(gl)
         self._cell_renderer = UnitCellRenderer(gl)
         self._conn_renderer = UnitCellRenderer(gl)
+        self._conn_tube_renderer = BondRenderer(gl)
         gl.glEnable(GL_DEPTH_TEST)
         gl.glClearColor(0.12, 0.12, 0.12, 1.0)
         self._initialized = True
@@ -187,8 +193,8 @@ class UnitCellViewerWidget(QOpenGLWidget):
 
         uniforms = self._build_uniforms()
 
-        # Cell box
-        if self._cell_renderer.numberOfVertices() > 0:
+        # Cell box(es)
+        if self._show_cell and self._cell_renderer.numberOfVertices() > 0:
             self._cell_renderer.bind()
             self._cell_renderer.setUniforms(**uniforms)
             self._cell_renderer.draw(gl)
@@ -207,12 +213,21 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 self._bond_renderer.draw(gl)
                 self._bond_renderer.release()
 
-        # Interaction connections
-        if self._show_connections and self._conn_renderer.numberOfVertices() > 0:
-            self._conn_renderer.bind()
-            self._conn_renderer.setUniforms(**uniforms)
-            self._conn_renderer.draw(gl)
-            self._conn_renderer.release()
+        # Interaction connections (lines or energy-scaled tubes)
+        if self._show_connections:
+            if self._conn_tubes:
+                if self._conn_tube_renderer.numberOfInstances() > 0:
+                    self._conn_tube_renderer.bind(gl)
+                    self._conn_tube_renderer.setUniforms(**uniforms)
+                    self._conn_tube_renderer.draw(gl)
+                    self._conn_tube_renderer.release()
+            elif self._conn_renderer.numberOfVertices() > 0:
+                self._conn_renderer.bind()
+                self._conn_renderer.setUniforms(
+                    **{**uniforms, "u_lineScale": 2.0 * self._conn_radius_scale}
+                )
+                self._conn_renderer.draw(gl)
+                self._conn_renderer.release()
 
         if self._show_atom_labels or self._show_mol_labels:
             self._draw_labels()
@@ -227,32 +242,50 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._mark_dirty()
 
     def set_structure(self, structure: Structure | None):
-        if structure is None or not structure.templates:
+        if structure is None or not structure.templates or self._crystallography is None:
             self._templates = None
-        elif self._crystallography is not None:
+        else:
             self._templates = VisualData._build_cart_templates(
                 structure.templates, self._crystallography
             )
-        else:
-            self._templates = None
+        self._connections = dict(structure.connections) if structure is not None else {}
+        self._conn_annotations = None
         self._selected_ids = set()
         self._hidden_ids = set()
         self._view_fitted = False
         self._mark_dirty()
         self.itemTreeChanged.emit()
 
-    def set_net_molecules(self, molecules: List[Molecule] | None):
-        self._net_molecules = molecules
-        self._selected_ids = set()
-        self._hidden_ids = set()
+    def set_supercell(self, na: int, nb: int, nc: int):
+        supercell = (max(1, int(na)), max(1, int(nb)), max(1, int(nc)))
+        if supercell == self._supercell:
+            return
+        self._supercell = supercell
+        # Drop stale per-instance IDs that reference removed cells
+        valid = set(self.cells())
+        self._hidden_ids = {
+            i for i in self._hidden_ids if i[0] != "mol" or i[2] in valid
+        }
+        self._selected_ids = {
+            i for i in self._selected_ids if i[0] != "mol" or i[2] in valid
+        }
+        self._view_fitted = False
         self._mark_dirty()
         self.itemTreeChanged.emit()
 
-    def set_conn_source_types(self, mol_types: set):
-        """Set which mol types fan out connection lines; triggers geometry rebuild."""
-        self._conn_source_types = set(mol_types)
-        self._view_fitted = False
+    def set_conn_source_tiles(self, tiles: set):
+        """Set which tiles fan out connection lines; triggers geometry rebuild."""
+        self._conn_source_tiles = set(tiles)
         self._mark_dirty()
+
+    def set_conn_annotations(self, annotations: dict | None):
+        """Attach net-file r/energy annotations keyed by (tile, conn_idx)."""
+        self._conn_annotations = annotations
+        self._mark_dirty()
+
+    def set_show_cell(self, enabled: bool):
+        self._show_cell = enabled
+        self.update()
 
     def set_show_molecules(self, enabled: bool):
         self._show_molecules = enabled
@@ -262,10 +295,25 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._show_connections = enabled
         self.update()
 
+    def set_show_neighbours(self, enabled: bool):
+        self._show_neighbours = enabled
+        self._mark_dirty()
+
+    def set_conn_tubes(self, enabled: bool):
+        self._conn_tubes = enabled
+        self._mark_dirty()
+
     def reset_view(self):
         self._view_fitted = False
         self._dirty = True
         self.update()
+
+    def cells(self) -> list[tuple[int, int, int]]:
+        """All (i, j, k) cells of the current supercell."""
+        na, nb, nc = self._supercell
+        return [
+            (i, j, k) for i in range(na) for j in range(nb) for k in range(nc)
+        ]
 
     # ------------------------------------------------------------------
     # Selection / visibility API (called from dialog's selection panel)
@@ -280,7 +328,46 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._mark_dirty()
 
     def hide_unselected(self):
-        self._hidden_ids = self.get_all_item_ids() - self._selected_ids
+        keep = set(self._selected_ids)
+        sel_mol_tiles = {i[1] for i in self._selected_ids if i[0] == "mol"}
+        sel_atom_tiles = {i[1] for i in self._selected_ids if i[0] == "atom"}
+
+        # Isolating a connection keeps both endpoint molecules visible
+        for item_id in self._selected_ids:
+            if item_id[0] != "conn":
+                continue
+            tile, k = item_id[1], item_id[2]
+            conns = self._connections.get(tile, [])
+            if k >= len(conns):
+                continue
+            conn = conns[k]
+            for cell in self.cells():
+                keep.add(("mol", tile, cell))
+                keep.add(
+                    (
+                        "mol",
+                        conn.target,
+                        (
+                            cell[0] + conn.offset[0],
+                            cell[1] + conn.offset[1],
+                            cell[2] + conn.offset[2],
+                        ),
+                    )
+                )
+
+        # Isolating molecules keeps their connections visible
+        for tile in sel_mol_tiles:
+            keep |= {("conn", tile, k) for k in range(len(self._connections.get(tile, ())))}
+
+        # Atom IDs are global per tile: hiding them would blank the kept
+        # molecules too.  Only hide atoms within tiles where the user
+        # explicitly selected individual atoms.
+        if self._templates:
+            for tile, tmpl in self._templates.items():
+                if tile not in sel_atom_tiles:
+                    keep |= {("atom", tile, i) for i in range(len(tmpl["symbols"]))}
+
+        self._hidden_ids = self.get_all_item_ids() - keep
         self._mark_dirty()
 
     def show_all(self):
@@ -291,17 +378,16 @@ class UnitCellViewerWidget(QOpenGLWidget):
     def get_all_item_ids(self) -> set:
         """Return the complete set of item IDs currently in the scene."""
         ids: set = set()
+        cells = self.cells()
         if self._templates:
-            for mol_type, tmpl in self._templates.items():
-                ids.add(("mol", mol_type))
+            for tile, tmpl in self._templates.items():
+                for cell in cells:
+                    ids.add(("mol", tile, cell))
                 for i in range(len(tmpl["symbols"])):
-                    ids.add(("atom", mol_type, i))
-        if self._net_molecules:
-            idx = 0
-            for mol in self._net_molecules:
-                for _intr in mol.interactions:
-                    ids.add(("conn", idx))
-                    idx += 1
+                    ids.add(("atom", tile, i))
+        for tile, conns in self._connections.items():
+            for k in range(len(conns)):
+                ids.add(("conn", tile, k))
         return ids
 
     def set_show_atom_labels(self, enabled: bool):
@@ -316,6 +402,10 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._atom_radius_scale = max(0.1, float(scale))
         self._mark_dirty()
 
+    def set_conn_radius_scale(self, scale: float):
+        self._conn_radius_scale = max(0.1, float(scale))
+        self._mark_dirty()
+
     def set_bond_radius(self, radius: float):
         self._bond_radius = max(0.01, float(radius))
         self._mark_dirty()
@@ -328,157 +418,266 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._dirty = True
         self.update()
 
+    def _cell_cart(self, cell: tuple[int, int, int]) -> np.ndarray:
+        return self._crystallography.frac_to_cart(
+            np.array(cell, dtype=np.float64)
+        ).astype(np.float32)
+
+    def _conn_group_values(self) -> dict:
+        """(tile, conn_idx) → value used to colour-group connections.
+
+        Uses the net-file energy when annotated, then the annotated r,
+        falling back to the centroid–centroid distance computed from the
+        structure geometry (identical for all supercell instances).
+        """
+        values: dict = {}
+        if not self._connections or not self._templates:
+            return values
+        for tile, conns in self._connections.items():
+            src_tmpl = self._templates.get(tile)
+            for k, conn in enumerate(conns):
+                ann = (self._conn_annotations or {}).get((tile, k))
+                value = None
+                if ann is not None:
+                    energy = ann.get("energy")
+                    if isinstance(energy, (int, float)):
+                        value = round(float(energy), 6)
+                    elif ann.get("r") is not None:
+                        value = round(float(ann["r"]), 3)
+                if value is None and src_tmpl is not None:
+                    tgt_tmpl = self._templates.get(conn.target)
+                    if tgt_tmpl is not None:
+                        d = (
+                            tgt_tmpl["centroid"]
+                            + self._cell_cart(conn.offset)
+                            - src_tmpl["centroid"]
+                        )
+                        value = round(float(np.linalg.norm(d)), 3)
+                values[(tile, k)] = value
+        return values
+
+    def _emit_molecule(
+        self,
+        tile: int,
+        cell_cart: np.ndarray,
+        selected: bool,
+        atom_blocks: list,
+        bond_blocks: list,
+    ):
+        """Append one molecule instance's atoms/bonds/labels to the draw lists."""
+        tmpl = self._templates[tile]
+        n = len(tmpl["cart"])
+        pos = tmpl["cart"] + cell_cart - self._scene_centre
+        colors = tmpl["colors"]
+
+        visible = np.array(
+            [("atom", tile, i) not in self._hidden_ids for i in range(n)], dtype=bool
+        )
+        if not visible.any():
+            return
+
+        sel = np.array(
+            [
+                [1.0 if (selected or ("atom", tile, i) in self._selected_ids) else 0.0]
+                for i in range(n)
+            ],
+            dtype=np.float32,
+        )
+
+        atom_blocks.append(
+            np.hstack(
+                [
+                    pos[visible],
+                    colors[visible],
+                    sel[visible],
+                    (tmpl["radii"][visible] * self._atom_radius_scale)[:, None],
+                ]
+            )
+        )
+
+        for a1, a2 in tmpl["bonds"]:
+            if a1 < n and a2 < n and visible[a1] and visible[a2]:
+                p1, p2 = pos[a1], pos[a2]
+                mid = (p1 + p2) * 0.5
+                bond_blocks.append(np.concatenate([p1, mid, colors[a1], [self._bond_radius]]))
+                bond_blocks.append(np.concatenate([mid, p2, colors[a2], [self._bond_radius]]))
+
+        for i, sym in enumerate(tmpl["symbols"]):
+            if visible[i]:
+                self._atom_label_data.append((pos[i].copy(), sym))
+        self._mol_label_data.append(
+            ((tmpl["centroid"] + cell_cart - self._scene_centre).copy(), f"M{tile}")
+        )
+
     def _upload_geometry(self):
         """Rebuild and upload all GPU geometry from current data."""
         if self._crystallography is None:
             return
 
+        na, nb, nc = self._supercell
+        cells = self.cells()
+        cell_set = set(cells)
+
         scene_centre = self._crystallography.frac_to_cart(
-            np.array([0.5, 0.5, 0.5], dtype=np.float64)
+            np.array([na * 0.5, nb * 0.5, nc * 0.5], dtype=np.float64)
         ).astype(np.float32)
         self._scene_centre = scene_centre
 
-        self._cell_renderer.set_lines(self._build_cell_lines(scene_centre))
+        self._cell_renderer.set_lines(self._build_cell_lines(cells))
 
-        atom_blocks = []
-        bond_blocks = []
-        conn_vertices = []
+        atom_blocks: list = []
+        bond_blocks: list = []
         self._atom_label_data = []
         self._mol_label_data = []
 
-        # Pre-compute which mol types / connection instances are highlighted by a
-        # selected connection, so we can highlight both endpoint molecules.
-        selected_src_types: set = set()
-        selected_tgt_conn_idxs: set = set()
-        if self._net_molecules and self._conn_source_types:
-            ci = 0
-            for mol in self._net_molecules:
-                src_type = _parse_mol_type(mol.label)
-                for _intr in mol.interactions:
-                    if ("conn", ci) in self._selected_ids and src_type in self._conn_source_types:
-                        if src_type is not None:
-                            selected_src_types.add(src_type)
-                        selected_tgt_conn_idxs.add(ci)
-                    ci += 1
+        conns_active = bool(
+            self._connections and self._conn_source_tiles and self._templates
+        )
 
-        # Track (mol_type, tx, ty, tz) instances already drawn to avoid Z-fighting
-        # from duplicate molecules at overlapping positions.
-        drawn_instances: set = set()
+        # Instances highlighted because one of their connections is selected
+        highlight: set = set()
+        if conns_active:
+            sel_conns = {
+                (i[1], i[2]) for i in self._selected_ids if i[0] == "conn"
+            }
+            for tile, k in sel_conns:
+                conns = self._connections.get(tile)
+                if not conns or k >= len(conns) or tile not in self._conn_source_tiles:
+                    continue
+                conn = conns[k]
+                for cell in cells:
+                    if ("mol", tile, cell) in self._hidden_ids:
+                        continue
+                    tgt_cell = (
+                        cell[0] + conn.offset[0],
+                        cell[1] + conn.offset[1],
+                        cell[2] + conn.offset[2],
+                    )
+                    highlight.add((tile, cell))
+                    highlight.add((conn.target, tgt_cell))
 
-        # --- Unit cell molecules ---
+        # --- Supercell molecules ---
+        drawn: set = set()  # (tile, cell) instances with geometry emitted
         if self._templates:
-            for mol_type, tmpl in self._templates.items():
-                if ("mol", mol_type) in self._hidden_ids:
+            for cell in cells:
+                cell_cart = self._cell_cart(cell)
+                for tile in self._templates:
+                    if ("mol", tile, cell) in self._hidden_ids:
+                        continue
+                    drawn.add((tile, cell))
+                    selected = (
+                        ("mol", tile, cell) in self._selected_ids
+                        or (tile, cell) in highlight
+                    )
+                    self._emit_molecule(tile, cell_cart, selected, atom_blocks, bond_blocks)
+
+        # --- Connection lines (and ghost neighbours outside the supercell) ---
+        conn_vertices: list = []
+        if conns_active:
+            group_values = self._conn_group_values()
+            unique_vals = sorted({v for v in group_values.values() if v is not None})
+            val_color = {
+                v: _SHELL_COLORS[i % len(_SHELL_COLORS)]
+                for i, v in enumerate(unique_vals)
+            }
+
+            # Deduplicate reciprocal connections (1→3 and 3→1 describe the
+            # same segment) so selected lines are not z-fought by twins.
+            segments: dict = {}  # key → [p1, p2, color, selected, energy]
+            ghosts: dict = {}  # (tile, cell) → cell_cart
+
+            for cell in cells:
+                cell_cart = self._cell_cart(cell)
+                for tile in sorted(self._connections):
+                    if tile not in self._conn_source_tiles:
+                        continue
+                    if ("mol", tile, cell) in self._hidden_ids:
+                        continue
+                    src_tmpl = self._templates.get(tile)
+                    if src_tmpl is None:
+                        continue
+                    src_centroid = src_tmpl["centroid"] + cell_cart - scene_centre
+
+                    for k, conn in enumerate(self._connections[tile]):
+                        cid = ("conn", tile, k)
+                        if cid in self._hidden_ids:
+                            continue
+                        if conn.target == tile and conn.offset == (0, 0, 0):
+                            continue  # degenerate self-loop
+                        tgt_tmpl = self._templates.get(conn.target)
+                        if tgt_tmpl is None:
+                            continue
+                        tgt_cell = (
+                            cell[0] + conn.offset[0],
+                            cell[1] + conn.offset[1],
+                            cell[2] + conn.offset[2],
+                        )
+                        tgt_cart = self._cell_cart(tgt_cell)
+                        tgt_centroid = tgt_tmpl["centroid"] + tgt_cart - scene_centre
+
+                        selected = cid in self._selected_ids
+                        key = tuple(sorted(((tile, cell), (conn.target, tgt_cell))))
+                        seg = segments.get(key)
+                        if seg is None:
+                            color = val_color.get(
+                                group_values.get((tile, k)), _SHELL_COLORS[0]
+                            )
+                            ann = (self._conn_annotations or {}).get((tile, k))
+                            energy = ann.get("energy") if ann else None
+                            if not isinstance(energy, (int, float)):
+                                energy = None
+                            segments[key] = [
+                                src_centroid, tgt_centroid, color, selected, energy,
+                            ]
+                        elif selected:
+                            seg[3] = True
+
+                        # Ghost neighbour beyond the supercell boundary
+                        if (
+                            self._show_neighbours
+                            and tgt_cell not in cell_set
+                            and (conn.target, tgt_cell) not in drawn
+                            and ("mol", conn.target, tgt_cell) not in self._hidden_ids
+                        ):
+                            ghosts[(conn.target, tgt_cell)] = tgt_cart
+
+            for (tile, cell), cell_cart in ghosts.items():
+                if (tile, cell) in drawn:
                     continue
-                drawn_instances.add((mol_type, 0, 0, 0))
-
-                n = len(tmpl["cart"])
-                pos = tmpl["cart"] - scene_centre
-                colors = tmpl["colors"]
-                radii = tmpl["radii"]
-
-                atom_hidden = np.array(
-                    [("atom", mol_type, i) in self._hidden_ids for i in range(n)], dtype=bool
-                )
-                visible = ~atom_hidden
-                if not visible.any():
-                    continue
-
-                mol_sel = (
-                    ("mol", mol_type) in self._selected_ids
-                    or mol_type in selected_src_types
-                )
-                sel = np.array(
-                    [[1.0 if (mol_sel or ("atom", mol_type, i) in self._selected_ids) else 0.0]
-                     for i in range(n)],
-                    dtype=np.float32,
+                drawn.add((tile, cell))
+                self._emit_molecule(
+                    tile, cell_cart, (tile, cell) in highlight, atom_blocks, bond_blocks
                 )
 
-                vis_pos = pos[visible]
-                vis_radii = radii[visible]
-                vis_colors = colors[visible]
-                atom_blocks.append(np.hstack([
-                    vis_pos, vis_colors, sel[visible],
-                    (vis_radii * self._atom_radius_scale)[:, None],
-                ]))
+            # Tube radii scale with |interaction energy| when net energies are
+            # loaded; segments without a numeric energy use the minimum radius.
+            r_lo, r_hi = 0.06, 0.45
+            magnitudes = [
+                abs(s[4]) for s in segments.values() if s[4] is not None
+            ]
+            e_min = min(magnitudes) if magnitudes else 0.0
+            e_span = (max(magnitudes) - e_min) if magnitudes else 0.0
 
-                for a1, a2 in tmpl["bonds"]:
-                    if a1 < n and a2 < n and visible[a1] and visible[a2]:
-                        p1, p2 = pos[a1], pos[a2]
-                        mid = (p1 + p2) * 0.5
-                        bond_blocks.append(np.concatenate([p1, mid, colors[a1], [self._bond_radius]]))
-                        bond_blocks.append(np.concatenate([mid, p2, colors[a2], [self._bond_radius]]))
+            tube_blocks: list = []
+            for p1, p2, color, selected, energy in segments.values():
+                c = np.clip(color * 1.8, 0.0, 1.0) if selected else color
+                conn_vertices.append(np.concatenate([p1, c]))
+                conn_vertices.append(np.concatenate([p2, c]))
+                if self._conn_tubes:
+                    if energy is None:
+                        radius = r_lo
+                    elif e_span > 0.0:
+                        radius = r_lo + (abs(energy) - e_min) / e_span * (r_hi - r_lo)
+                    else:
+                        radius = (r_lo + r_hi) * 0.5
+                    radius *= self._conn_radius_scale
+                    tube_blocks.append(np.concatenate([p1, p2, c, [radius]]))
 
-                for i, sym in enumerate(tmpl["symbols"]):
-                    if visible[i]:
-                        self._atom_label_data.append((pos[i].copy(), sym))
-                self._mol_label_data.append(((tmpl["centroid"] - scene_centre).copy(), f"M{mol_type}"))
-
-        # --- Connection neighbours and lines ---
-        if self._net_molecules and self._conn_source_types and self._templates:
-            unique_r = sorted(
-                {intr.r for mol in self._net_molecules for intr in mol.interactions}
+            self._conn_tube_renderer.setBonds(
+                np.array(tube_blocks, dtype=np.float32)
+                if tube_blocks
+                else np.empty((0, 10), dtype=np.float32)
             )
-            r_color = {r: _SHELL_COLORS[i % len(_SHELL_COLORS)] for i, r in enumerate(unique_r)}
-
-            conn_idx = 0
-            for mol in self._net_molecules:
-                src_type = _parse_mol_type(mol.label)
-                src_tmpl = self._templates.get(src_type) if src_type is not None else None
-
-                if src_type not in self._conn_source_types or src_tmpl is None:
-                    conn_idx += len(mol.interactions)
-                    continue
-
-                src_centroid = src_tmpl["centroid"] - scene_centre
-
-                for intr in mol.interactions:
-                    cid = ("conn", conn_idx)
-                    conn_idx += 1
-
-                    if cid in self._hidden_ids:
-                        continue
-
-                    tgt_type = _parse_mol_type(intr.mol_type)
-                    tgt_tmpl = self._templates.get(tgt_type) if tgt_type is not None else None
-                    if tgt_tmpl is None:
-                        continue
-                    trans = _parse_translation(intr.molecule_info)
-                    if trans is None:
-                        continue
-
-                    trans_cart = self._crystallography.frac_to_cart(
-                        np.array(trans, dtype=np.float64)
-                    ).astype(np.float32)
-
-                    tgt_pos = tgt_tmpl["cart"] + trans_cart - scene_centre
-                    tgt_centroid = tgt_tmpl["centroid"] + trans_cart - scene_centre
-                    tgt_colors = tgt_tmpl["colors"]
-                    tgt_radii = tgt_tmpl["radii"]
-                    nt = len(tgt_pos)
-
-                    # Draw the neighbour molecule unless it coincides with an already-drawn instance
-                    instance_key = (tgt_type, *trans)
-                    if instance_key not in drawn_instances:
-                        drawn_instances.add(instance_key)
-                        tgt_sel = cid[1] in selected_tgt_conn_idxs
-                        sel = np.full((nt, 1), 1.0 if tgt_sel else 0.0, dtype=np.float32)
-                        atom_blocks.append(np.hstack([
-                            tgt_pos, tgt_colors, sel,
-                            (tgt_radii * self._atom_radius_scale)[:, None],
-                        ]))
-                        for a1, a2 in tgt_tmpl["bonds"]:
-                            if a1 < nt and a2 < nt:
-                                p1, p2 = tgt_pos[a1], tgt_pos[a2]
-                                mid = (p1 + p2) * 0.5
-                                bond_blocks.append(np.concatenate([p1, mid, tgt_colors[a1], [self._bond_radius]]))
-                                bond_blocks.append(np.concatenate([mid, p2, tgt_colors[a2], [self._bond_radius]]))
-
-                    color = r_color[intr.r]
-                    if cid in self._selected_ids:
-                        color = np.clip(color * 1.8, 0.0, 1.0)
-                    conn_vertices.append(np.concatenate([src_centroid, color]))
-                    conn_vertices.append(np.concatenate([tgt_centroid, color]))
 
         if atom_blocks:
             atom_arr = np.vstack(atom_blocks).astype(np.float32)
@@ -486,27 +685,42 @@ class UnitCellViewerWidget(QOpenGLWidget):
             if not self._view_fitted:
                 self._camera.fitToObject(atom_arr[:, :3])
                 self._view_fitted = True
-        elif not self._view_fitted:
-            cart = self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32) - scene_centre
-            self._camera.fitToObject(cart)
-            self._view_fitted = True
+        else:
+            self._atom_renderer.setPoints(np.empty((0, 8), dtype=np.float32))
+            if not self._view_fitted:
+                corners = [
+                    self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32)
+                    + self._cell_cart(cell)
+                    - scene_centre
+                    for cell in cells
+                ]
+                self._camera.fitToObject(np.vstack(corners))
+                self._view_fitted = True
 
-        if bond_blocks:
-            self._bond_renderer.setBonds(np.array(bond_blocks, dtype=np.float32))
+        self._bond_renderer.setBonds(
+            np.array(bond_blocks, dtype=np.float32)
+            if bond_blocks
+            else np.empty((0, 10), dtype=np.float32)
+        )
 
+        if not conns_active:
+            self._conn_tube_renderer.setBonds(np.empty((0, 10), dtype=np.float32))
         self._conn_renderer.set_lines(
-            np.array(conn_vertices, dtype=np.float32).flatten() if conn_vertices
+            np.array(conn_vertices, dtype=np.float32).flatten()
+            if conn_vertices
             else np.array([], dtype=np.float32)
         )
 
-    def _build_cell_lines(self, offset: np.ndarray) -> np.ndarray:
-        """Build unit cell edge vertex array offset so that cell centre is at origin."""
-        cart = self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32) - offset
+    def _build_cell_lines(self, cells: list) -> np.ndarray:
+        """Build edge vertex array for every cell of the supercell."""
+        base = self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32)
         vertices = []
-        for i0, i1, ax in _EDGES:
-            color = _AXIS_COLORS[ax]
-            vertices.append(np.concatenate([cart[i0], color]))
-            vertices.append(np.concatenate([cart[i1], color]))
+        for cell in cells:
+            cart = base + self._cell_cart(cell) - self._scene_centre
+            for i0, i1, ax in _EDGES:
+                color = _AXIS_COLORS[ax]
+                vertices.append(np.concatenate([cart[i0], color]))
+                vertices.append(np.concatenate([cart[i1], color]))
         return np.array(vertices, dtype=np.float32).flatten()
 
     def _project_to_screen(self, pos3d: np.ndarray) -> tuple | None:
@@ -622,26 +836,57 @@ class UnitCellViewerDialog(QDialog):
         )
 
         self._viewer = UnitCellViewerWidget()
+        self._structure: Structure | None = None
+        self._conn_annotations: dict | None = None
 
-        # --- Net file controls ---
+        # --- Supercell controls ---
+        supercell_group = QGroupBox("Supercell")
+        layout = QHBoxLayout(supercell_group)
+
+        self._supercell_sbs = []
+
+        for axis in ("a", "b", "c"):
+            label = QLabel(axis)
+            sb = QSpinBox()
+            sb.setRange(1, _MAX_SUPERCELL)
+            sb.setValue(1)
+            sb.setToolTip(f"Number of unit cells along {axis}")
+            sb.valueChanged.connect(self._on_supercell_changed)
+
+            layout.addWidget(label)
+            layout.addWidget(sb)
+
+            self._supercell_sbs.append(sb)
+
+        layout.addStretch()
+
+        # --- Net file (energy overlay) controls ---
         self._net_label = QLabel("No net file loaded")
         self._net_label.setWordWrap(True)
 
         self._import_btn = QPushButton("Import Net File…")
+        self._import_btn.setToolTip(
+            "Overlay interaction distances and energies from a CrystalGrower net file"
+        )
         self._import_btn.clicked.connect(self._on_import_net)
 
         self._clear_net_btn = QPushButton("Clear Net")
         self._clear_net_btn.setEnabled(False)
         self._clear_net_btn.clicked.connect(self._on_clear_net)
 
-        # Checkboxes for selecting which unit-cell molecules to fan connections from;
-        # populated dynamically after a net file is loaded.
-        self._source_checkboxes: dict = {}  # mol_type → QCheckBox
+        # Checkboxes selecting which tiles fan out connection lines;
+        # populated from the structure file's net connectivity.
+        self._source_checkboxes: dict = {}  # tile → QCheckBox
         self._sources_group = QGroupBox("Show Connections From")
-        self._sources_layout = QVBoxLayout(self._sources_group)
+        self._sources_layout = QHBoxLayout(self._sources_group)
         self._sources_group.setVisible(False)
+        self._sources_layout.addStretch()
 
         # --- Display toggles ---
+        self._show_cell_cb = QCheckBox("Show Unit Cell")
+        self._show_cell_cb.setChecked(True)
+        self._show_cell_cb.toggled.connect(self._viewer.set_show_cell)
+
         self._show_mol_cb = QCheckBox("Show Molecules")
         self._show_mol_cb.setChecked(True)
         self._show_mol_cb.setEnabled(False)
@@ -652,6 +897,23 @@ class UnitCellViewerDialog(QDialog):
         self._show_conn_cb.setEnabled(False)
         self._show_conn_cb.toggled.connect(self._viewer.set_show_connections)
 
+        self._show_neigh_cb = QCheckBox("Show Neighbours Outside Supercell")
+        self._show_neigh_cb.setChecked(False)
+        self._show_neigh_cb.setEnabled(False)
+        self._show_neigh_cb.setToolTip(
+            "Draw the molecules that connections at the supercell boundary point to"
+        )
+        self._show_neigh_cb.toggled.connect(self._viewer.set_show_neighbours)
+
+        self._conn_tubes_cb = QCheckBox("Connections as Tubes (by Energy)")
+        self._conn_tubes_cb.setChecked(False)
+        self._conn_tubes_cb.setEnabled(False)
+        self._conn_tubes_cb.setToolTip(
+            "Draw connections as cylinders whose radius scales with the "
+            "interaction energy magnitude (needs an imported net file)"
+        )
+        self._conn_tubes_cb.toggled.connect(self._viewer.set_conn_tubes)
+
         self._reset_btn = QPushButton("Reset View")
         self._reset_btn.clicked.connect(self._viewer.reset_view)
 
@@ -659,27 +921,36 @@ class UnitCellViewerDialog(QDialog):
         self._status_label.setWordWrap(True)
 
         # --- Layout ---
-        net_group = QGroupBox("Crystal Net")
-        net_layout = QVBoxLayout(net_group)
+        net_group = QGroupBox("Interaction Energies (Net File)")
+        net_layout = QHBoxLayout(net_group)
         net_layout.addWidget(self._net_label)
         net_layout.addWidget(self._import_btn)
         net_layout.addWidget(self._clear_net_btn)
-        net_layout.addWidget(self._sources_group)
+        net_layout.addStretch()
 
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout(display_group)
+        display_layout.addWidget(self._show_cell_cb)
         display_layout.addWidget(self._show_mol_cb)
         display_layout.addWidget(self._show_conn_cb)
+        display_layout.addWidget(self._show_neigh_cb)
+        display_layout.addWidget(self._conn_tubes_cb)
         display_layout.addWidget(self._reset_btn)
 
         # --- Selection panel ---
-        sel_group = QGroupBox("Atoms / Molecules")
+        sel_group = QGroupBox("Molecules / Connections")
         sel_layout = QVBoxLayout(sel_group)
 
         self._sel_tree = QTreeWidget()
         self._sel_tree.setHeaderHidden(True)
         self._sel_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._sel_tree.setMinimumHeight(160)
+        # Let long labels (e.g. annotated connections) scroll horizontally
+        # instead of being clipped to the panel width.
+        self._sel_tree.setTextElideMode(Qt.ElideNone)
+        self._sel_tree.header().setStretchLastSection(False)
+        self._sel_tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._sel_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._sel_tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         sel_layout.addWidget(self._sel_tree)
 
@@ -688,7 +959,9 @@ class UnitCellViewerDialog(QDialog):
         self._hide_sel_btn.setToolTip("Hide the selected items")
         self._hide_sel_btn.clicked.connect(self._on_hide_selected)
         self._isolate_btn = QPushButton("Isolate")
-        self._isolate_btn.setToolTip("Hide everything except the selected items")
+        self._isolate_btn.setToolTip(
+            "Hide everything except the selected molecules and their connections"
+        )
         self._isolate_btn.clicked.connect(self._on_hide_unselected)
         self._show_all_btn = QPushButton("Show All")
         self._show_all_btn.clicked.connect(self._on_show_all)
@@ -718,11 +991,24 @@ class UnitCellViewerDialog(QDialog):
         self._bond_radius_sb.setToolTip("Bond cylinder radius in Ångströms")
         self._bond_radius_sb.valueChanged.connect(self._viewer.set_bond_radius)
         appearance_form.addRow("Bond Radius (Å):", self._bond_radius_sb)
+        self._conn_radius_sb = QDoubleSpinBox()
+        self._conn_radius_sb.setRange(0.1, 5.0)
+        self._conn_radius_sb.setSingleStep(0.1)
+        self._conn_radius_sb.setValue(1.0)
+        self._conn_radius_sb.setDecimals(2)
+        self._conn_radius_sb.setToolTip(
+            "Scale factor applied to connection lines/tubes (tube radii keep "
+            "their relative energy scaling)"
+        )
+        self._conn_radius_sb.valueChanged.connect(self._viewer.set_conn_radius_scale)
+        appearance_form.addRow("Connection Radius Scale:", self._conn_radius_sb)
 
         ctrl_layout = QVBoxLayout()
-        ctrl_layout.addWidget(net_group)
+        ctrl_layout.addWidget(supercell_group)
         ctrl_layout.addWidget(display_group)
+        ctrl_layout.addWidget(self._sources_group)
         ctrl_layout.addWidget(sel_group)
+        ctrl_layout.addWidget(net_group)
         ctrl_layout.addWidget(appearance_group)
         ctrl_layout.addWidget(self._status_label)
         ctrl_layout.addStretch()
@@ -740,15 +1026,38 @@ class UnitCellViewerDialog(QDialog):
         self._viewer.set_crystallography(crystallography)
 
     def set_structure(self, structure: Structure | None, crystallography: Crystallography | None = None):
-        """Update molecule templates.  Also accepts a fresh crystallography if needed."""
+        """Update molecule templates and net connectivity from the structure file."""
         if crystallography is not None:
             self._viewer.set_crystallography(crystallography)
+
+        self._structure = structure
+        self._conn_annotations = None
+        self._viewer.set_conn_annotations(None)
+        self._net_label.setText("No net file loaded")
+        self._clear_net_btn.setEnabled(False)
+
         has_templates = bool(structure and structure.templates)
+        has_connections = bool(structure and structure.connections)
+
         self._viewer.set_structure(structure)
         self._show_mol_cb.setEnabled(has_templates)
-        if has_templates:
+        self._show_conn_cb.setEnabled(has_connections)
+        self._show_neigh_cb.setEnabled(has_connections)
+        self._conn_tubes_cb.setEnabled(has_connections)
+        self._populate_source_checkboxes(
+            sorted(structure.connections) if has_connections else []
+        )
+
+        if has_templates and has_connections:
+            n_conn = sum(len(c) for c in structure.connections.values())
             self._status_label.setText(
-                f"Loaded {len(structure.templates)} molecule template(s)."
+                f"Loaded {len(structure.templates)} molecule(s) with "
+                f"{n_conn} net connections."
+            )
+        elif has_templates:
+            self._status_label.setText(
+                f"Loaded {len(structure.templates)} molecule template(s); "
+                "no net connectivity found in the structure file."
             )
         else:
             self._status_label.setText(
@@ -759,7 +1068,20 @@ class UnitCellViewerDialog(QDialog):
     # Slots
     # ------------------------------------------------------------------
 
+    def _on_supercell_changed(self):
+        na, nb, nc = (sb.value() for sb in self._supercell_sbs)
+        self._viewer.set_supercell(na, nb, nc)
+
     def _on_import_net(self):
+        if not (self._structure and self._structure.connections):
+            QMessageBox.information(
+                self,
+                "No Connectivity",
+                "Load a structure file with net connectivity before importing "
+                "a net file — the net file only supplies energies.",
+            )
+            return
+
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Crystal Net File", "", "Net Files (*.txt *.net);;All Files (*)"
         )
@@ -773,47 +1095,81 @@ class UnitCellViewerDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Failed to load net file:\n{exc}")
             return
 
-        if not net.molecules:
-            QMessageBox.information(
-                self, "Empty Net", "The net file contained no molecule interactions."
+        annotations = self._match_net_to_connections(net)
+        if annotations is None:
+            QMessageBox.warning(
+                self,
+                "Net Mismatch",
+                "Could not match the net file's interactions to the structure "
+                "file's connectivity (molecule or interaction counts differ).",
             )
             return
 
-        self._viewer.set_net_molecules(net.molecules)
+        self._conn_annotations = annotations
+        self._viewer.set_conn_annotations(annotations)
         self._net_label.setText(Path(path).name)
         self._clear_net_btn.setEnabled(True)
-        self._show_conn_cb.setEnabled(True)
-        n_mol = len(net.molecules)
-        n_int = sum(m.n_interactions for m in net.molecules)
-        self._status_label.setText(
-            f"Net: {n_mol} molecule type(s), {n_int} interactions."
+        n_energies = sum(
+            1 for a in annotations.values() if isinstance(a.get("energy"), (int, float))
         )
-        self._populate_source_checkboxes(net.molecules)
+        self._status_label.setText(
+            f"Net energies matched to {len(annotations)} connections "
+            f"({n_energies} with numeric energies)."
+        )
+        self._rebuild_item_list()
+
+    def _match_net_to_connections(self, net: CGNet) -> dict | None:
+        """Map net-file interactions onto structure connections.
+
+        Tries a one-to-one mapping of net molecules to tiles in order first,
+        then falls back to matching net labels against tile formulas (all
+        symmetry-equivalent tiles of a type share the same interaction list).
+        Returns {(tile, conn_idx): {"r": ..., "energy": ...}} or None.
+        """
+        connections = self._structure.connections
+        tiles = sorted(connections)
+        annotations: dict = {}
+
+        def add(tile: int, molecule) -> bool:
+            if molecule.n_interactions != len(connections[tile]):
+                return False
+            for k, intr in enumerate(molecule.interactions):
+                annotations[(tile, k)] = {"r": intr.r, "energy": intr.energy}
+            return True
+
+        if len(net.molecules) == len(tiles):
+            if all(add(t, m) for t, m in zip(tiles, net.molecules)):
+                return annotations
+            annotations = {}
+
+        by_label = {m.label: m for m in net.molecules}
+        templates = self._structure.templates
+        for tile in tiles:
+            tmpl = templates.get(tile)
+            molecule = by_label.get(tmpl.formula) if tmpl is not None else None
+            if molecule is None or not add(tile, molecule):
+                return None
+        return annotations
 
     def _on_clear_net(self):
-        self._viewer.set_net_molecules(None)
-        self._viewer.set_conn_source_types(set())
+        self._conn_annotations = None
+        self._viewer.set_conn_annotations(None)
         self._net_label.setText("No net file loaded")
-        self._show_conn_cb.setEnabled(False)
         self._clear_net_btn.setEnabled(False)
-        self._status_label.setText("Net cleared.")
-        self._clear_source_checkboxes()
+        self._status_label.setText("Net energies cleared.")
+        self._rebuild_item_list()
 
-    def _populate_source_checkboxes(self, molecules):
-        """Build one checkbox per unique source molecule type from the net."""
+    def _populate_source_checkboxes(self, tiles):
+        """Build one checkbox per tile that has net connectivity."""
         self._clear_source_checkboxes()
-        seen = set()
-        for mol in molecules:
-            mol_type = _parse_mol_type(mol.label)
-            if mol_type is None or mol_type in seen:
-                continue
-            seen.add(mol_type)
-            cb = QCheckBox(f"M{mol_type}  ({mol.label})")
-            cb.setChecked(False)
+        for tile in tiles:
+            cb = QCheckBox(f"M{tile}")
+            cb.setChecked(True)
             cb.toggled.connect(self._on_source_changed)
-            self._source_checkboxes[mol_type] = cb
+            self._source_checkboxes[tile] = cb
             self._sources_layout.addWidget(cb)
-        self._sources_group.setVisible(bool(seen))
+        self._sources_group.setVisible(bool(tiles))
+        self._viewer.set_conn_source_tiles(set(tiles))
 
     def _clear_source_checkboxes(self):
         for cb in self._source_checkboxes.values():
@@ -823,12 +1179,26 @@ class UnitCellViewerDialog(QDialog):
         self._sources_group.setVisible(False)
 
     def _on_source_changed(self):
-        checked = {mt for mt, cb in self._source_checkboxes.items() if cb.isChecked()}
-        self._viewer.set_conn_source_types(checked)
+        checked = {t for t, cb in self._source_checkboxes.items() if cb.isChecked()}
+        self._viewer.set_conn_source_tiles(checked)
 
     # ------------------------------------------------------------------
     # Selection panel
     # ------------------------------------------------------------------
+
+    def _conn_item_label(self, tile: int, k: int, conn: TileConnection) -> str:
+        dx, dy, dz = conn.offset
+        label = f"M{tile} → M{conn.target}  ({dx},{dy},{dz})"
+        ann = (self._conn_annotations or {}).get((tile, k))
+        if ann:
+            if ann.get("r") is not None:
+                label += f"  r={ann['r']:.2f} Å"
+            energy = ann.get("energy")
+            if isinstance(energy, (int, float)):
+                label += f"  E={energy:.3f}"
+            elif energy:
+                label += f"  E={energy}"
+        return label
 
     def _rebuild_item_list(self):
         """Repopulate the tree from whatever is currently loaded in the viewer."""
@@ -836,33 +1206,53 @@ class UnitCellViewerDialog(QDialog):
         self._sel_tree.clear()
 
         templates = self._viewer._templates
+        cells = self._viewer.cells()
         if templates:
             mol_root = QTreeWidgetItem(self._sel_tree, ["Molecules"])
             mol_root.setFlags(mol_root.flags() & ~Qt.ItemIsSelectable)
-            for mol_type, tmpl in sorted(templates.items()):
-                mol_item = QTreeWidgetItem(mol_root, [f"M{mol_type}"])
-                mol_item.setData(0, Qt.UserRole, ("mol", mol_type))
+            for tile, tmpl in sorted(templates.items()):
+                tile_item = QTreeWidgetItem(mol_root, [f"M{tile}"])
+                tile_item.setData(0, Qt.UserRole, ("moltype", tile))
+
+                if len(cells) > 1:
+                    for cell in cells:
+                        cell_item = QTreeWidgetItem(
+                            tile_item, [f"cell ({cell[0]},{cell[1]},{cell[2]})"]
+                        )
+                        cell_item.setData(0, Qt.UserRole, ("mol", tile, cell))
+
+                atoms_item = QTreeWidgetItem(tile_item, ["Atoms"])
+                atoms_item.setFlags(atoms_item.flags() & ~Qt.ItemIsSelectable)
                 for i, sym in enumerate(tmpl["symbols"]):
-                    atom_item = QTreeWidgetItem(mol_item, [f"{sym}  (atom {i})"])
-                    atom_item.setData(0, Qt.UserRole, ("atom", mol_type, i))
-                mol_item.setExpanded(True)
+                    atom_item = QTreeWidgetItem(atoms_item, [f"{sym}  (atom {i})"])
+                    atom_item.setData(0, Qt.UserRole, ("atom", tile, i))
             mol_root.setExpanded(True)
 
-        net_mols = self._viewer._net_molecules
-        if net_mols:
+        connections = self._viewer._connections
+        if connections and templates:
             conn_root = QTreeWidgetItem(self._sel_tree, ["Connections"])
             conn_root.setFlags(conn_root.flags() & ~Qt.ItemIsSelectable)
-            idx = 0
-            for mol in net_mols:
-                for intr in mol.interactions:
-                    label = f"{mol.label} → {intr.mol_type}  (r={intr.r:.1f} Å)"
-                    item = QTreeWidgetItem(conn_root, [label])
-                    item.setData(0, Qt.UserRole, ("conn", idx))
-                    idx += 1
-            conn_root.setExpanded(True)
+            for tile in sorted(connections):
+                for k, conn in enumerate(connections[tile]):
+                    item = QTreeWidgetItem(
+                        conn_root, [self._conn_item_label(tile, k, conn)]
+                    )
+                    item.setData(0, Qt.UserRole, ("conn", tile, k))
+            conn_root.setExpanded(False)
 
         self._sel_tree.blockSignals(False)
         self._update_tree_hidden_state()
+
+    def _expand_selection(self, ids: set) -> set:
+        """Expand tile-level ("moltype") IDs to all their cell instances."""
+        expanded: set = set()
+        cells = self._viewer.cells()
+        for item_id in ids:
+            if item_id[0] == "moltype":
+                expanded |= {("mol", item_id[1], cell) for cell in cells}
+            else:
+                expanded.add(item_id)
+        return expanded
 
     def _on_tree_selection_changed(self):
         ids: set = set()
@@ -870,7 +1260,7 @@ class UnitCellViewerDialog(QDialog):
             item_id = item.data(0, Qt.UserRole)
             if item_id is not None:
                 ids.add(item_id)
-        self._viewer.set_selected_ids(ids)
+        self._viewer.set_selected_ids(self._expand_selection(ids))
 
     def _on_hide_selected(self):
         self._viewer.hide_selected()
@@ -887,13 +1277,19 @@ class UnitCellViewerDialog(QDialog):
     def _update_tree_hidden_state(self):
         """Dim tree items that are currently hidden in the viewer."""
         hidden = self._viewer._hidden_ids
+        cells = self._viewer.cells()
         dim = QBrush(QColor(100, 100, 100))
         normal = QBrush(QColor(220, 220, 220))
 
+        def _is_hidden(item_id) -> bool:
+            if item_id is None:
+                return False
+            if item_id[0] == "moltype":
+                return all(("mol", item_id[1], cell) in hidden for cell in cells)
+            return item_id in hidden
+
         def _apply(item: QTreeWidgetItem):
-            item_id = item.data(0, Qt.UserRole)
-            brush = dim if (item_id is not None and item_id in hidden) else normal
-            item.setForeground(0, brush)
+            item.setForeground(0, dim if _is_hidden(item.data(0, Qt.UserRole)) else normal)
             for i in range(item.childCount()):
                 _apply(item.child(i))
 

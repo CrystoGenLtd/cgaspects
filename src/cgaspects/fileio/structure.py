@@ -1,6 +1,7 @@
 from pathlib import Path
 from dataclasses import dataclass, field
 import logging
+import re
 
 import numpy as np
 
@@ -14,6 +15,19 @@ logger = logging.getLogger("CGA:Structure")
 class MolAtom:
     symbol: str
     frac: np.ndarray  # fractional coordinates, shape (3,)
+
+
+@dataclass
+class TileConnection:
+    """One face connection from a tile (molecule) to a neighbouring tile.
+
+    ``target`` is the neighbour's tile number within the unit cell and
+    ``offset`` the (x, y, z) unit-cell translation of the neighbour relative
+    to the source tile's cell ((0, 0, 0) when within the same cell).
+    """
+
+    target: int
+    offset: tuple[int, int, int]
 
 
 @dataclass
@@ -32,6 +46,8 @@ class Structure:
     cell: Cell | None
     cryst: Crystallography | None
     templates: dict[int, MolTemplate] = field(default_factory=dict)
+    # tile number → face connections to neighbouring tiles (the crystal net)
+    connections: dict[int, list[TileConnection]] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, file_path: str | Path) -> "Structure":
@@ -53,13 +69,20 @@ class Structure:
         cell = _parse_cell(lines, non_prim_idx, file_path.name)
         cryst = Crystallography(cell) if cell is not None else None
         templates = _parse_templates(lines, non_prim_idx, file_path.name)
+        connections = _parse_connections(lines, non_prim_idx, file_path.name)
 
         if cryst is not None:
             for tmpl in templates.values():
                 if not tmpl.bonds:
                     tmpl.bonds = _infer_bonds(tmpl.atoms, cryst)
 
-        return cls(filepath=file_path, cell=cell, cryst=cryst, templates=templates)
+        return cls(
+            filepath=file_path,
+            cell=cell,
+            cryst=cryst,
+            templates=templates,
+            connections=connections,
+        )
 
     @property
     def n_tiles(self):
@@ -88,6 +111,81 @@ def _parse_cell(lines: list[str], non_prim_idx: int | None, filename: str = "") 
     except (ValueError, IndexError) as e:
         logger.warning("Could not parse lattice parameters from %s: %s", filename, e)
         return None
+
+
+# Tile header in the net section, e.g. "C16H10 1 (1,0) 13":
+# formula, tile number, one or more (n_vertices, Q) pairs, neighbour count.
+_TILE_HEADER_RE = re.compile(
+    r"^(\S+)\s+(\d+)((?:\s*\(\s*\d+\s*,\s*\d+\s*\))+)\s+(\d+)\s*$"
+)
+
+# Neighbour entry, e.g. "3(-1,1,-1)" or bare "3" (same unit cell).
+_NEIGHBOUR_RE = re.compile(
+    r"(\d+)(?:\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\))?"
+)
+
+
+def _parse_connections(
+    lines: list[str], non_prim_idx: int | None, filename: str = ""
+) -> dict[int, list[TileConnection]]:
+    """Parse the crystal net (tile → neighbour tile connectivity) block.
+
+    The net section precedes the lattice-parameter lines: for each tile in the
+    unit cell there is a header line ("FORMULA TILE_NUM (v,Q)... N_NEIGHBOURS")
+    followed by the list of neighbouring tiles through faces, each optionally
+    carrying a relative unit-cell offset.
+    """
+    end = non_prim_idx if non_prim_idx is not None else len(lines)
+    connections: dict[int, list[TileConnection]] = {}
+
+    i = 0
+    while i < end:
+        header = _TILE_HEADER_RE.match(lines[i].strip())
+        if header is None:
+            i += 1
+            continue
+
+        tile_num = int(header.group(2))
+        n_neighbours = int(header.group(4))
+        neighbours: list[TileConnection] = []
+        i += 1
+
+        # Collect neighbour entries from the following lines.  Neighbour lines
+        # start with a digit; vertex lines (e.g. "C 2[3] ...") start with an
+        # atom symbol and terminate the neighbour list.
+        while i < end and len(neighbours) < n_neighbours:
+            stripped = lines[i].strip()
+            if not stripped:
+                i += 1
+                continue
+            if not stripped[0].isdigit():
+                break
+            for m in _NEIGHBOUR_RE.finditer(stripped):
+                if len(neighbours) >= n_neighbours:
+                    break
+                offset = (
+                    (int(m.group(2)), int(m.group(3)), int(m.group(4)))
+                    if m.group(2) is not None
+                    else (0, 0, 0)
+                )
+                neighbours.append(TileConnection(target=int(m.group(1)), offset=offset))
+            i += 1
+
+        if len(neighbours) != n_neighbours:
+            logger.warning(
+                "Tile %d in %s: expected %d neighbours, parsed %d",
+                tile_num,
+                filename,
+                n_neighbours,
+                len(neighbours),
+            )
+        connections[tile_num] = neighbours
+
+    if connections:
+        logger.info(
+            "Parsed net connectivity for %d tile(s) from %s", len(connections), filename
+        )
+    return connections
 
 
 def _parse_templates(
