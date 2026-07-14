@@ -407,7 +407,7 @@ class CrystalCloud:
         crystallography,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> "CrystalCloud":
-        """Build a CrystalCloud from a CrystalGrower checkpoint file.
+        """Build a CrystalCloud from a CrystoGen checkpoint file.
 
         Occupied grid cells are converted to Cartesian Å via *crystallography*,
         centred, and stored as a single Frame so the rest of the visualisation
@@ -470,7 +470,7 @@ class CrystalCloud:
 
 @dataclass
 class DockingData:
-    """Docking site data from a CrystalGrower ``*_docking.XYZ`` file.
+    """Docking site data from a CrystoGen ``*_docking.XYZ`` file.
 
     Column layout (0-indexed in the raw array):
       0 : replicate index
@@ -521,7 +521,7 @@ class DockingData:
 
     @classmethod
     def from_file(cls, filepath: Path) -> "DockingData":
-        """Parse a CrystalGrower ``*_docking.XYZ`` file."""
+        """Parse a CrystoGen ``*_docking.XYZ`` file."""
         filepath = Path(filepath)
         with filepath.open("r", encoding="utf-8") as f:
             n_atoms = int(f.readline().strip())

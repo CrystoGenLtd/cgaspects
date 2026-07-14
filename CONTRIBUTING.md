@@ -1,6 +1,6 @@
 # Contributing to CGAspects
 
-We are thrilled that you are interested in contributing to CGAspects! As a scientific data analysis software, CGAspects aims to provide a reliable, efficient, and user-friendly tool for analysing data for all CrystalGrower users. Your contributions are important in achieving this goal.
+We are thrilled that you are interested in contributing to CGAspects! As a scientific data analysis software, CGAspects aims to provide a reliable, efficient, and user-friendly tool for analysing data for all CrystoGen users. Your contributions are important in achieving this goal.
 
 ## How to Contribute
 

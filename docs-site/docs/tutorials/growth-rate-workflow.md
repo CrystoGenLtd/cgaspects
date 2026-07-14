@@ -1,12 +1,12 @@
 # Growth Rate Analysis Walkthrough
 
-This tutorial demonstrates how to analyse how a crystal grows over time using CrystalGrower simulation output.
+This tutorial demonstrates how to analyse how a crystal grows over time using CrystoGen simulation output.
 
 ---
 
 ## Prerequisites
 
-- A folder of CrystalGrower output containing:
+- A folder of CrystoGen output containing:
   - Multiple XYZ files (one per time step, or a `size.csv` file)
   - A simulation parameters file listing crystallographic directions
 - CGAspects is open
@@ -35,7 +35,7 @@ This tutorial demonstrates how to analyse how a crystal grows over time using Cr
 
 ### Select Directions
 
-Check the directions you want to analyse from the scrollable list. These correspond to the crystallographic directions defined in your CrystalGrower simulation.
+Check the directions you want to analyse from the scrollable list. These correspond to the crystallographic directions defined in your CrystoGen simulation.
 
 For a first look, check all available directions.
 

@@ -1,6 +1,6 @@
 # CGAspects
 
-CGAspects is a CrystalGrower data analysis tool equipped with a PySide6 GUI. 
+CGAspects is a CrystoGen (formerly CrystalGrower) data analysis tool equipped with a PySide6 GUI. 
 
 ## Features
 

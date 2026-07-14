@@ -37,9 +37,9 @@ Enter each parameter directly into the number fields. Click **OK** or **Apply** 
 
 Click **Load CIF** and select a `.cif` (Crystallographic Information File). The lattice parameters are extracted automatically from the `_cell_length_*` and `_cell_angle_*` fields.
 
-### From CrystalGrower Structure File
+### From CrystoGen Structure File
 
-Click **Load Structure File** and select a CrystalGrower output structure file. The lattice parameters are extracted from the file header.
+Click **Load Structure File** and select a CrystoGen output structure file. The lattice parameters are extracted from the file header.
 
 ---
 

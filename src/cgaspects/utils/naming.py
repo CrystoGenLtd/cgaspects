@@ -1,4 +1,4 @@
-"""Helpers for deriving identifiers from CrystalGrower output file names."""
+"""Helpers for deriving identifiers from CrystoGen output file names."""
 
 import re
 from pathlib import Path

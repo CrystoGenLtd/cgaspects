@@ -231,7 +231,7 @@ def resolve_crystallography(cell_arg: list[str]) -> Crystallography:
     """Build a Crystallography from ``--cell``.
 
     Accepts either six lattice values ``a b c alpha beta gamma`` or a single
-    path to a CrystalGrower structure file, from which the cell is parsed with
+    path to a CrystoGen structure file, from which the cell is parsed with
     the same reader the GUI uses.
     """
     if len(cell_arg) == 1 and Path(cell_arg[0]).exists():

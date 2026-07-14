@@ -1,4 +1,4 @@
-"""Cluster analysis module using KDTree nearest-neighbour connectivity on CrystalGrower XYZ files."""
+"""Cluster analysis module using KDTree nearest-neighbour connectivity on CrystoGen XYZ files."""
 
 import logging
 from pathlib import Path
@@ -213,7 +213,7 @@ def radial_profile(
     """Radial profile of point density and site-metadata proportions.
 
     Points are binned into ``nbins`` shells by distance from *origin* (default
-    (0, 0, 0), the CrystalGrower nucleation seed). Coordination number and
+    (0, 0, 0), the CrystoGen nucleation seed). Coordination number and
     energy are looked up per point from the site-analysis metadata maps using
     the point's site number — the same mapping the checkpoint viewer uses to
     colour by coordination/energy.

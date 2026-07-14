@@ -89,4 +89,4 @@ CGAspects normally works in Cartesian coordinates, but can display axes in fract
 
 The external shape of a crystal is determined by which crystal planes (faces) grow slowest — these are the most stable faces that persist as the crystal grows. Fast-growing faces grow away and disappear; slow-growing faces dominate the final morphology.
 
-In CrystalGrower, each face is characterized by its Miller indices and its relative growth rate. CGAspects visualises these faces as planes and computes aspect ratios to quantify the resulting shape.
+In CrystoGen, each face is characterized by its Miller indices and its relative growth rate. CGAspects visualises these faces as planes and computes aspect ratios to quantify the resulting shape.

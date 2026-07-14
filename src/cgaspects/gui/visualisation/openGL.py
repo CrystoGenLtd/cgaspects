@@ -404,7 +404,7 @@ class VisualisationWidget(QOpenGLWidget):
                 self,
                 "No Molecular Data",
                 "No structure file was found.\n"
-                "Load a CrystalGrower simulation folder that includes a structure file.",
+                "Load a CrystoGen simulation folder that includes a structure file.",
             )
             return False
         self._atom_view[self.vis_mode] = enabled
@@ -1752,7 +1752,7 @@ class VisualisationWidget(QOpenGLWidget):
                     else np.zeros(vd.n_centroids, dtype=np.float32)
                 )
                 if vd.site_numbers is None:
-                    logger.warning("Old CrystalGrower version! %s not available.", self.color_by)
+                    logger.warning("Old CrystoGen version! %s not available.", self.color_by)
             elif col_idx == 7:
                 values = (
                     vd.energies.astype(np.float32)
@@ -1760,7 +1760,7 @@ class VisualisationWidget(QOpenGLWidget):
                     else np.zeros(vd.n_centroids, dtype=np.float32)
                 )
                 if vd.energies is None:
-                    logger.warning("Old CrystalGrower version! %s not available.", self.color_by)
+                    logger.warning("Old CrystoGen version! %s not available.", self.color_by)
             else:
                 values = np.arange(vd.n_centroids, dtype=np.float32)
 

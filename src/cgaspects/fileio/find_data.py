@@ -208,7 +208,7 @@ def find_info(path):
             None,
             "Missing Data",
             "No simulation parameter and size files found in the directory.\n"
-            "Please make sure you've selected a valid CrystalGrower output directory.",
+            "Please make sure you've selected a valid CrystoGen output directory.",
         )
 
     return file_info_tuple(
@@ -287,7 +287,7 @@ def summary_compare(summary_csv, aspect_csv=False, aspect_df=""):
     aspect_cols = aspect_df.columns
 
     # This allows backcompatibility with
-    # an older version of CrystalGrower
+    # an older version of CrystoGen
 
     search = str(summary_df.iloc[0, 0])
     search = search.split("_")
