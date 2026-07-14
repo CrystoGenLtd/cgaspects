@@ -154,6 +154,21 @@ def build_scene_from_widget(widget, width: int, height: int,
             radii = bonds[:, 9] * (ps / 6.0) * scale
             cylinders = np.column_stack(
                 [starts, ends, bonds[:, 6:9], radii]).astype(np.float32)
+
+        # Optional extra cylinder set (e.g. the unit cell viewer's energy-scaled
+        # interaction tubes) — absent on widgets that don't define it.
+        extra_renderer = getattr(widget, "conn_tube_renderer", None)
+        if extra_renderer is not None:
+            tubes = _reshape(getattr(extra_renderer, "instances", None), 10)
+            if len(tubes):
+                starts = bake_centers(tubes[:, 0:3])
+                ends = bake_centers(tubes[:, 3:6])
+                radii = tubes[:, 9] * (ps / 6.0) * scale
+                tube_cyl = np.column_stack(
+                    [starts, ends, tubes[:, 6:9], radii]).astype(np.float32)
+                cylinders = (
+                    np.vstack([cylinders, tube_cyl]) if len(cylinders) else tube_cyl
+                )
     else:
         raw = getattr(widget.sphere_renderer, "_raw_points", None) \
             if getattr(widget, "sphere_renderer", None) is not None else None

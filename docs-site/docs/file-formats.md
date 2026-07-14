@@ -46,11 +46,11 @@ CGAspects reads:
 
 ---
 
-### CrystalGrower Structure File
+### CrystoGen Structure File
 
-The simulation structure file produced by CrystalGrower. Contains lattice parameters and optionally crystallographic direction information.
+The simulation structure file produced by CrystoGen. Contains lattice parameters and optionally crystallographic direction information, plus — for each tile (molecule) in the unit cell — its atom positions and its **crystal net**: the list of neighbouring tiles it connects to through faces, each with the relative unit-cell offset of that neighbour.
 
-Auto-loaded if present in the data folder.
+Auto-loaded if present in the data folder. The molecule templates and net connectivity are what the [Unit Cell Viewer](features/unit-cell-viewer.md) displays; a separate CrystoGen net file can optionally be imported there to annotate each connection with its interaction distance and energy.
 
 ---
 
@@ -64,7 +64,7 @@ Contains crystal dimensions along each crystallographic direction at each time s
 
 ### Simulation Parameters File
 
-A text file (`.txt`) produced by CrystalGrower containing:
+A text file (`.txt`) produced by CrystoGen containing:
 - List of crystallographic directions used in the simulation
 - Supersaturation levels
 - Other simulation metadata

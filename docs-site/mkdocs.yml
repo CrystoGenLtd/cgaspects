@@ -1,6 +1,6 @@
 site_name: CGAspects Manual
 site_description: User manual for CGAspects — crystal growth simulation analysis and visualisation
-site_author: CrystalGrower Team
+site_author: CrystoGen Team
 site_url: https://crystalgrowerorg.github.io/cgaspects/
 repo_url: https://github.com/CrystalGrowerOrg/cgaspects
 repo_name: CrystalGrowerOrg/cgaspects
@@ -67,6 +67,7 @@ nav:
       - Slicing: features/slicing.md
       - Site Highlighting: features/site-highlighting.md
       - Lattice Parameters: features/lattice-parameters.md
+      - Unit Cell Viewer: features/unit-cell-viewer.md
   - Analysis:
       - Aspect Ratios: analysis/aspect-ratios.md
       - Growth Rates: analysis/growth-rates.md

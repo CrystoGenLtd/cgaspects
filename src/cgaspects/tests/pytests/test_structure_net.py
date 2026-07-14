@@ -1,4 +1,4 @@
-"""Tests for crystal net connectivity parsing from CrystalGrower structure files."""
+"""Tests for crystal net connectivity parsing from CrystoGen structure files."""
 
 from pathlib import Path
 

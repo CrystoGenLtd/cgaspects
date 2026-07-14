@@ -1,13 +1,13 @@
 """Unit Cell / Crystal Net viewer dialog.
 
-Opens as a standalone window from the Tools menu.  Shows:
+Opens as a standalone window from the Crystallography menu.  Shows:
   - The unit cell box (or a user-grown supercell grid).
   - Molecule templates from the structure file positioned at their
     fractional coordinates inside each cell of the supercell.
   - The crystal net parsed from the structure file itself: each tile
     (molecule) lists its face neighbours with relative unit-cell offsets,
     drawn as coloured line segments between molecule centroids.
-  - Optionally, a CrystalGrower net file imported on top to annotate each
+  - Optionally, a CrystoGen net file imported on top to annotate each
     connection with its interaction distance and energy.
 
 Molecule instances (a tile in a specific cell of the supercell), individual
@@ -19,24 +19,34 @@ All geometry is centred at the supercell centre so rotation always happens
 at the centre of mass, not the world origin.
 """
 
+import dataclasses
 import logging
 from pathlib import Path
 
 import numpy as np
-from OpenGL.GL import GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
-from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QMatrix4x4, QPainter, QVector2D
+from OpenGL.GL import GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
+from PySide6.QtCore import Qt, QPoint, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QImage,
+    QMatrix4x4,
+    QPainter,
+    QVector2D,
+)
+from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QDialog,
-    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -49,6 +59,8 @@ from PySide6.QtWidgets import (
 
 from ...fileio.cg_net import CGNet
 from ...fileio.structure import Structure, TileConnection
+from ..animation.keyframe import AnimationTimeline, Keyframe
+from ..animation.timeline_widget import KeyframeTimelineWidget
 from ..utils.crystallography import Crystallography
 from ..visualisation.atom_renderer import AtomRenderer
 from ..visualisation.bond_renderer import BondRenderer
@@ -61,6 +73,7 @@ from ..visualisation.unit_cell_renderer import (
     UnitCellRenderer,
 )
 from ..visualisation.visual_data import VisualData
+from .unit_cell_appearance_dialog import UnitCellAppearanceDialog
 
 logger = logging.getLogger("CGA:UnitCellViewer")
 
@@ -139,6 +152,14 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._atom_radius_scale: float = 1.0
         self._bond_radius: float = _BOND_RADIUS
         self._conn_radius_scale: float = 1.0
+        self._render_settings = RenderSettings()
+
+        # Compatibility surface for raytrace_export.build_scene_from_widget()
+        # and the keyframe/video-render pipeline, both written against the
+        # main VisualisationWidget's public attribute names.
+        self.is_atom_view = True
+        self.point_size = 6.0  # matches the fixed u_pointSize uniform below
+        self.backgroundColor = QColor.fromRgbF(0.12, 0.12, 0.12)
 
         # OpenGL resources (created in initializeGL)
         self._atom_renderer: AtomRenderer | None = None
@@ -180,6 +201,32 @@ class UnitCellViewerWidget(QOpenGLWidget):
     def resizeGL(self, w, h):
         self._aspect_ratio = w / max(h, 1)
 
+    # ------------------------------------------------------------------
+    # Compatibility properties (raytrace_export.build_scene_from_widget,
+    # the animation render worker) — mirror the main VisualisationWidget's
+    # public attribute names so those modules work unmodified.
+    # ------------------------------------------------------------------
+
+    @property
+    def camera(self):
+        return self._camera
+
+    @property
+    def atom_renderer(self):
+        return self._atom_renderer
+
+    @property
+    def bond_renderer(self):
+        return self._bond_renderer
+
+    @property
+    def conn_tube_renderer(self):
+        return self._conn_tube_renderer
+
+    @property
+    def render_settings(self):
+        return self._render_settings
+
     def paintGL(self):
         gl = self.context().extraFunctions()
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -192,7 +239,14 @@ class UnitCellViewerWidget(QOpenGLWidget):
             self._dirty = False
 
         uniforms = self._build_uniforms()
+        self._draw_scene(gl, uniforms)
 
+        if self._show_atom_labels or self._show_mol_labels:
+            self._draw_labels()
+
+    def _draw_scene(self, gl, uniforms: dict):
+        """Draw the cell box, molecules and connections. Shared by paintGL and
+        offscreen FBO rendering (image/video export)."""
         # Cell box(es)
         if self._show_cell and self._cell_renderer.numberOfVertices() > 0:
             self._cell_renderer.bind()
@@ -228,9 +282,6 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 )
                 self._conn_renderer.draw(gl)
                 self._conn_renderer.release()
-
-        if self._show_atom_labels or self._show_mol_labels:
-            self._draw_labels()
 
     # ------------------------------------------------------------------
     # Data setters
@@ -302,6 +353,13 @@ class UnitCellViewerWidget(QOpenGLWidget):
     def set_conn_tubes(self, enabled: bool):
         self._conn_tubes = enabled
         self._mark_dirty()
+
+    def set_render_settings(self, settings: RenderSettings):
+        """Apply material / lighting / ambient-occlusion settings from the dialog."""
+        self._render_settings = settings
+        if self._atom_renderer is not None:
+            self._atom_renderer.set_ao_enabled(settings.ao_enabled)
+        self.update()
 
     def reset_view(self):
         self._view_fitted = False
@@ -784,13 +842,100 @@ class UnitCellViewerWidget(QOpenGLWidget):
             "u_modelViewProjectionMat": mvp,
             "u_modelViewMat": model_view,
             "u_projectionMat": proj,
-            "u_pointSize": 6.0,
+            "u_pointSize": self.point_size,
             "u_screenSize": screen_size,
             "u_scale": self._camera.scale,
             "u_lineScale": 2.0,
             "u_axesMat": axes,
-            **RenderSettings().shader_uniforms(self._camera.perspectiveProjection),
+            **self._render_settings.shader_uniforms(self._camera.perspectiveProjection),
         }
+
+    # ------------------------------------------------------------------
+    # Camera keyframes (used by the embedded animation timeline)
+    # ------------------------------------------------------------------
+
+    def snapshot(self):
+        """Return a CameraSnapshot of the current view (for keyframe capture)."""
+        return dataclasses.replace(self._camera.snapshot(), point_size=self.point_size)
+
+    def apply_camera_snapshot(self, snap) -> None:
+        """Apply a CameraSnapshot and schedule a repaint (for keyframe preview/render)."""
+        self._camera.restore_snapshot(snap)
+        self.point_size = snap.point_size
+        self.update()
+
+    def render_animation_frame(self, scale: float = 1.0):
+        """Render the current view to a QImage (used by the animation render worker)."""
+        return self.renderToImage(scale)
+
+    # ------------------------------------------------------------------
+    # Image / ray-trace export
+    # ------------------------------------------------------------------
+
+    def renderToImage(self, scale: float = 1.0) -> QImage:
+        """Render the current view at ``scale`` × the viewport size to an off-screen FBO."""
+        self.makeCurrent()
+        w = max(1, int(self.width() * scale))
+        h = max(1, int(self.height() * scale))
+        gl = self.context().functions()
+        fbo = QOpenGLFramebufferObject(w, h, QOpenGLFramebufferObject.CombinedDepthStencil)
+
+        fbo.bind()
+        gl.glViewport(0, 0, w, h)
+        gl.glEnable(GL_DEPTH_TEST)
+        gl.glDisable(GL_BLEND)
+        gl.glClearColor(
+            self.backgroundColor.redF(), self.backgroundColor.greenF(),
+            self.backgroundColor.blueF(), 1.0,
+        )
+        gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        if self._dirty:
+            self._upload_geometry()
+            self._dirty = False
+        uniforms = self._build_uniforms()
+        self._draw_scene(gl, uniforms)
+
+        fbo.release()
+        result = fbo.toImage()
+        self.doneCurrent()
+        result.reinterpretAsFormat(QImage.Format_RGB32)
+        return result
+
+    def saveRender(self, file_name, resolution):
+        image = self.renderToImage(float(resolution[0]))
+        image.save(file_name)
+
+    def export_image_dialog(self):
+        """Save the current view as a PNG at 1x/2x/4x the viewport resolution."""
+        options = ["1x", "2x", "4x"]
+        resolution, ok = QInputDialog.getItem(
+            self, "Select Resolution", "Resolution:", options, 0, False
+        )
+        if not ok:
+            return
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Image", "", "Images (*.png)")
+        if not file_name:
+            return
+        self.saveRender(file_name, resolution)
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Image Saved")
+        msg_box.setText(f"Image saved to:\n{file_name}")
+        msg_box.setStandardButtons(QMessageBox.Open | QMessageBox.Cancel)
+        msg_box.setDefaultButton(QMessageBox.Open)
+        open_folder_button = msg_box.addButton("Open Folder", QMessageBox.ActionRole)
+        result = msg_box.exec_()
+        if result == QMessageBox.Open:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(file_name))
+        elif msg_box.clickedButton() == open_folder_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(file_name).parent)))
+
+    def export_raytrace_dialog(self):
+        """Open the POV-Ray / Tachyon ray-trace export dialog for this viewer."""
+        from .raytrace_dialog import RaytraceDialog
+
+        RaytraceDialog(self, parent=self).exec()
 
     # ------------------------------------------------------------------
     # Mouse / keyboard interaction
@@ -866,7 +1011,7 @@ class UnitCellViewerDialog(QDialog):
 
         self._import_btn = QPushButton("Import Net File…")
         self._import_btn.setToolTip(
-            "Overlay interaction distances and energies from a CrystalGrower net file"
+            "Overlay interaction distances and energies from a CrystoGen net file"
         )
         self._import_btn.clicked.connect(self._on_import_net)
 
@@ -905,20 +1050,30 @@ class UnitCellViewerDialog(QDialog):
         )
         self._show_neigh_cb.toggled.connect(self._viewer.set_show_neighbours)
 
-        self._conn_tubes_cb = QCheckBox("Connections as Tubes (by Energy)")
-        self._conn_tubes_cb.setChecked(False)
-        self._conn_tubes_cb.setEnabled(False)
-        self._conn_tubes_cb.setToolTip(
-            "Draw connections as cylinders whose radius scales with the "
-            "interaction energy magnitude (needs an imported net file)"
-        )
-        self._conn_tubes_cb.toggled.connect(self._viewer.set_conn_tubes)
-
         self._reset_btn = QPushButton("Reset View")
         self._reset_btn.clicked.connect(self._viewer.reset_view)
 
         self._status_label = QLabel("Load a simulation folder with a structure file to view molecules.")
         self._status_label.setWordWrap(True)
+
+        # --- Appearance & export (separate non-modal dialog) ---
+        self._appearance_dialog = UnitCellAppearanceDialog(self._viewer, parent=self)
+        self._appearance_btn = QPushButton("Appearance / Export…")
+        self._appearance_btn.clicked.connect(self._show_appearance_dialog)
+
+        # --- Animation (camera keyframes + video export) ---
+        self._render_worker = None
+        self._animation_timeline = AnimationTimeline()
+        self._timeline_widget = KeyframeTimelineWidget()
+        self._timeline_widget.set_timeline(self._animation_timeline)
+        self._timeline_widget.hide()
+        self._timeline_widget.keyframeAddRequested.connect(self._add_keyframe)
+        self._timeline_widget.previewRequested.connect(self._on_preview_tick)
+        self._timeline_widget.renderRequested.connect(self._open_render_dialog)
+
+        self._anim_toggle_btn = QPushButton("Show Animation Timeline")
+        self._anim_toggle_btn.setCheckable(True)
+        self._anim_toggle_btn.toggled.connect(self._on_toggle_timeline)
 
         # --- Layout ---
         net_group = QGroupBox("Interaction Energies (Net File)")
@@ -934,8 +1089,12 @@ class UnitCellViewerDialog(QDialog):
         display_layout.addWidget(self._show_mol_cb)
         display_layout.addWidget(self._show_conn_cb)
         display_layout.addWidget(self._show_neigh_cb)
-        display_layout.addWidget(self._conn_tubes_cb)
-        display_layout.addWidget(self._reset_btn)
+
+        view_group = QGroupBox("View")
+        view_layout = QVBoxLayout(view_group)
+        view_layout.addWidget(self._reset_btn)
+        view_layout.addWidget(self._appearance_btn)
+        view_layout.addWidget(self._anim_toggle_btn)
 
         # --- Selection panel ---
         sel_group = QGroupBox("Molecules / Connections")
@@ -972,50 +1131,23 @@ class UnitCellViewerDialog(QDialog):
 
         self._viewer.itemTreeChanged.connect(self._rebuild_item_list)
 
-        # --- Appearance ---
-        appearance_group = QGroupBox("Appearance")
-        appearance_form = QFormLayout(appearance_group)
-        self._atom_radius_sb = QDoubleSpinBox()
-        self._atom_radius_sb.setRange(0.1, 3.0)
-        self._atom_radius_sb.setSingleStep(0.05)
-        self._atom_radius_sb.setValue(1.0)
-        self._atom_radius_sb.setDecimals(2)
-        self._atom_radius_sb.setToolTip("Scale factor applied to all atom VdW radii")
-        self._atom_radius_sb.valueChanged.connect(self._viewer.set_atom_radius_scale)
-        appearance_form.addRow("Atom Radius Scale:", self._atom_radius_sb)
-        self._bond_radius_sb = QDoubleSpinBox()
-        self._bond_radius_sb.setRange(0.01, 1.0)
-        self._bond_radius_sb.setSingleStep(0.01)
-        self._bond_radius_sb.setValue(_BOND_RADIUS)
-        self._bond_radius_sb.setDecimals(2)
-        self._bond_radius_sb.setToolTip("Bond cylinder radius in Ångströms")
-        self._bond_radius_sb.valueChanged.connect(self._viewer.set_bond_radius)
-        appearance_form.addRow("Bond Radius (Å):", self._bond_radius_sb)
-        self._conn_radius_sb = QDoubleSpinBox()
-        self._conn_radius_sb.setRange(0.1, 5.0)
-        self._conn_radius_sb.setSingleStep(0.1)
-        self._conn_radius_sb.setValue(1.0)
-        self._conn_radius_sb.setDecimals(2)
-        self._conn_radius_sb.setToolTip(
-            "Scale factor applied to connection lines/tubes (tube radii keep "
-            "their relative energy scaling)"
-        )
-        self._conn_radius_sb.valueChanged.connect(self._viewer.set_conn_radius_scale)
-        appearance_form.addRow("Connection Radius Scale:", self._conn_radius_sb)
-
         ctrl_layout = QVBoxLayout()
         ctrl_layout.addWidget(supercell_group)
         ctrl_layout.addWidget(display_group)
+        ctrl_layout.addWidget(view_group)
         ctrl_layout.addWidget(self._sources_group)
         ctrl_layout.addWidget(sel_group)
         ctrl_layout.addWidget(net_group)
-        ctrl_layout.addWidget(appearance_group)
         ctrl_layout.addWidget(self._status_label)
         ctrl_layout.addStretch()
 
-        main_layout = QHBoxLayout(self)
-        main_layout.addLayout(ctrl_layout, 0)
-        main_layout.addWidget(self._viewer, 1)
+        content_row = QHBoxLayout()
+        content_row.addLayout(ctrl_layout, 0)
+        content_row.addWidget(self._viewer, 1)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.addLayout(content_row, 1)
+        main_layout.addWidget(self._timeline_widget)
 
     # ------------------------------------------------------------------
     # Public API (called from MainWindow)
@@ -1043,7 +1175,7 @@ class UnitCellViewerDialog(QDialog):
         self._show_mol_cb.setEnabled(has_templates)
         self._show_conn_cb.setEnabled(has_connections)
         self._show_neigh_cb.setEnabled(has_connections)
-        self._conn_tubes_cb.setEnabled(has_connections)
+        self._appearance_dialog.set_available(has_connections)
         self._populate_source_checkboxes(
             sorted(structure.connections) if has_connections else []
         )
@@ -1071,6 +1203,110 @@ class UnitCellViewerDialog(QDialog):
     def _on_supercell_changed(self):
         na, nb, nc = (sb.value() for sb in self._supercell_sbs)
         self._viewer.set_supercell(na, nb, nc)
+
+    def _show_appearance_dialog(self):
+        self._appearance_dialog.show()
+        self._appearance_dialog.raise_()
+        self._appearance_dialog.activateWindow()
+
+    # ------------------------------------------------------------------
+    # Animation: camera keyframes + video export
+    # ------------------------------------------------------------------
+
+    def _on_toggle_timeline(self, checked: bool):
+        self._timeline_widget.setVisible(checked)
+
+    def _add_keyframe(self):
+        """Capture the current camera view as a keyframe."""
+        snap = self._viewer.snapshot()
+        tl = self._animation_timeline
+        t = tl.keyframes[-1].time + 1.0 if tl.keyframes else 0.0
+        kf = Keyframe(time=t, camera=snap, data_frame=None)
+        tl.add_keyframe(kf)
+        self._timeline_widget.refresh()
+        if not self._timeline_widget.isVisible():
+            self._timeline_widget.show()
+            self._anim_toggle_btn.setChecked(True)
+
+    def _on_preview_tick(self, t: float):
+        """Apply the interpolated camera at time t (timeline preview/scrub)."""
+        tl = self._animation_timeline
+        if len(tl.keyframes) < 2:
+            return
+        try:
+            snapshot, _ = tl.get_state_at_time(t)
+        except ValueError:
+            return
+        self._viewer.apply_camera_snapshot(snapshot)
+
+    def _open_render_dialog(self):
+        """Open the render-to-video dialog for the current camera keyframes."""
+        from ..animation.render_dialog import RenderAnimationDialog
+
+        if len(self._animation_timeline.keyframes) < 2:
+            QMessageBox.information(
+                self,
+                "No Animation",
+                "Add at least 2 keyframes before rendering.\n"
+                "Use the Animation Timeline panel's “+ Add Keyframe” button to "
+                "capture the current view.",
+            )
+            return
+        dlg = RenderAnimationDialog(
+            timeline=self._animation_timeline,
+            viewport_width=self._viewer.width(),
+            viewport_height=self._viewer.height(),
+            parent=self,
+        )
+        dlg.renderStarted.connect(self._on_render_started)
+        dlg.exec()
+
+    def _on_render_started(self, worker):
+        """Bridge: connect the render worker's frameRequested to the main-thread slot."""
+        self._timeline_widget.stop_preview()
+        self._render_worker = worker
+        worker.frameRequested.connect(self._on_render_frame_requested)
+
+    def _on_render_frame_requested(self, frame_idx: int, snapshot, data_frame):
+        """Main-thread slot: render one frame and return the QImage to the worker."""
+        self._viewer.apply_camera_snapshot(snapshot)
+
+        worker = self._render_worker
+        backend = getattr(worker, "raytrace_backend", None) if worker else None
+        if backend:
+            img = self._raytrace_animation_frame(frame_idx, worker)
+        else:
+            img = self._viewer.render_animation_frame()
+        if worker is not None:
+            worker.frame_ready(img)
+
+    def _raytrace_animation_frame(self, frame_idx: int, worker):
+        """Render one animation frame via POV-Ray/Tachyon, reusing a scratch dir."""
+        from PySide6.QtGui import QImage
+
+        from ..visualisation import raytrace_export as rt
+
+        w, h = worker.resolution
+        scene = rt.build_scene_from_widget(self._viewer, w, h, photoreal=worker.photoreal)
+        if not len(scene.spheres) and not len(scene.cylinders):
+            return QImage()
+
+        scratch = getattr(worker, "_rt_scratch", None)
+        if scratch is None:
+            import tempfile
+
+            scratch = Path(tempfile.mkdtemp(prefix="cga_ucv_raytrace_"))
+            worker._rt_scratch = scratch
+
+        suffix = rt.SCENE_SUFFIX[worker.raytrace_backend]
+        scene_path = scratch / f"frame_{frame_idx:05d}{suffix}"
+        image_path = scratch / f"frame_{frame_idx:05d}.png"
+        try:
+            rt.render_scene(scene, worker.raytrace_backend, scene_path, image_path)
+        except Exception:
+            logger.exception("Ray-traced frame %d failed", frame_idx)
+            return QImage()
+        return QImage(str(image_path))
 
     def _on_import_net(self):
         if not (self._structure and self._structure.connections):

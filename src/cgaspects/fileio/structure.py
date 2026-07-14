@@ -40,7 +40,7 @@ class MolTemplate:
 
 @dataclass
 class Structure:
-    """All data parsed from a CrystalGrower structure file."""
+    """All data parsed from a CrystoGen structure file."""
 
     filepath: Path
     cell: Cell | None
@@ -51,7 +51,7 @@ class Structure:
 
     @classmethod
     def from_file(cls, file_path: str | Path) -> "Structure":
-        """Parse a CrystalGrower structure file, extracting all data in one pass."""
+        """Parse a CrystoGen structure file, extracting all data in one pass."""
         file_path = Path(file_path)
         if not file_path.exists():
             logger.warning("Structure file not found: %s", file_path)
