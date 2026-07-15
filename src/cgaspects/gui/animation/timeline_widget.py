@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QSize
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QIcon,
     QPainter,
     QPen,
     QPolygonF,
@@ -28,7 +30,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .keyframe import AnimationTimeline, Keyframe, INTERPOLATION_MODES
+from ..utils import qticons_rc  # noqa: F401 — registers the icon resources
+from .history import TimelineHistory
+from .keyframe import AnimationTimeline, INTERPOLATION_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +100,21 @@ class _KeyframeItem(QGraphicsItem):
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if self._view and self._dragging:
-            new_time = self._view._x_to_time(self.x())
-            self._view.keyframeMoved.emit(self._index, new_time)
+            # Dragging moves every selected keyframe; commit them all at once.
+            moves = [
+                (it.index, self._view._x_to_time(it.x()))
+                for it in self._view._items
+                if it.isSelected() or it is self
+            ]
+            self._view.keyframesMoved.emit(moves)
         self._dragging = False
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.modifiers() & Qt.ShiftModifier:
+            # Shift+click: select the range from the last-clicked keyframe to here
+            self._view.select_range_to(self._index)
+            event.accept()
+            return
         self._dragging = True
         super().mousePressEvent(event)
 
@@ -110,14 +124,31 @@ class _KeyframeItem(QGraphicsItem):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
+        # Right-click targets this keyframe; if it is part of the current
+        # multi-selection, delete/duplicate act on the whole selection.
+        selection = self._view.selected_indices()
+        targets = selection if self._index in selection else [self._index]
+        many = len(targets) > 1
+
         menu = QMenu()
-        delete_action = menu.addAction("Delete Keyframe")
-        duplicate_action = menu.addAction("Duplicate Keyframe")
+        edit_action = menu.addAction("Update Keyframe (capture current view)")
+        duplicate_action = menu.addAction(
+            f"Duplicate {len(targets)} Keyframes" if many else "Duplicate Keyframe")
+        delete_action = menu.addAction(
+            f"Delete {len(targets)} Keyframes" if many else "Delete Keyframe")
+        menu.addSeparator()
+        space_action = menu.addAction(
+            "Space Selected Evenly" if len(selection) >= 2 else "Space All Evenly")
+
         chosen = menu.exec(event.screenPos())
-        if chosen == delete_action:
-            self._view.keyframeRemoved.emit(self._index)
+        if chosen == edit_action:
+            self._view.keyframeEditRequested.emit(self._index)
+        elif chosen == delete_action:
+            self._view.keyframesRemoved.emit(list(targets))
         elif chosen == duplicate_action:
-            self._view.keyframeDuplicated.emit(self._index)
+            self._view.keyframesDuplicated.emit(list(targets))
+        elif chosen == space_action:
+            self._view.spaceEvenlyRequested.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +208,13 @@ class _PlayheadItem(QGraphicsItem):
 class _TimelineView(QGraphicsView):
     """Custom graphics view rendering the ruler, keyframe diamonds, and segment labels."""
 
-    keyframeMoved = Signal(int, float)      # (index, new_time)
-    keyframeRemoved = Signal(int)
-    keyframeDuplicated = Signal(int)
-    keyframeSelected = Signal(int)          # index clicked
+    keyframesMoved = Signal(list)           # [(index, new_time), ...]
+    keyframesRemoved = Signal(list)         # [index, ...]
+    keyframesDuplicated = Signal(list)      # [index, ...]
+    keyframeEditRequested = Signal(int)     # re-capture current view into keyframe
+    selectionChanged = Signal(list)         # sorted selected indices
     keyframeDoubleClicked = Signal(int)     # index double-clicked → seek to keyframe
+    spaceEvenlyRequested = Signal()
     timelineClicked = Signal(float)         # bare click on ruler → preview seek
     playheadMoved = Signal(float)           # user dragged the playhead
 
@@ -194,8 +227,10 @@ class _TimelineView(QGraphicsView):
         self._items: list[_KeyframeItem] = []
         self._playhead_time: float = 0.0
         self._playhead_item: Optional[_PlayheadItem] = None
+        self._rebuilding = False
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
+        self._scene.selectionChanged.connect(self._on_scene_selection_changed)
         self.setRenderHint(QPainter.Antialiasing)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -219,10 +254,44 @@ class _TimelineView(QGraphicsView):
         return max(0.0, min(self._timeline.duration, (x - margin) / usable * self._timeline.duration))
 
     # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def selected_indices(self) -> list[int]:
+        return sorted(it.index for it in self._items if it.isSelected())
+
+    def _on_scene_selection_changed(self):
+        if not self._rebuilding:
+            self.selectionChanged.emit(self.selected_indices())
+
+    def select_range_to(self, index: int) -> None:
+        """Select the range between the first already-selected keyframe and index."""
+        current = self.selected_indices()
+        a, b = sorted((current[0], index)) if current else (index, index)
+        self._rebuilding = True
+        try:
+            for it in self._items:
+                it.setSelected(a <= it.index <= b)
+        finally:
+            self._rebuilding = False
+        self.selectionChanged.emit(self.selected_indices())
+
+    # ------------------------------------------------------------------
     # Rebuild scene from timeline data
     # ------------------------------------------------------------------
 
-    def rebuild(self):
+    def rebuild(self, selected=None):
+        """Rebuild the scene; `selected` is the set of indices to re-select
+        (None preserves the current selection, e.g. across a resize)."""
+        selected = set(self.selected_indices()) if selected is None else set(selected)
+        self._rebuilding = True
+        try:
+            self._rebuild_scene(selected)
+        finally:
+            self._rebuilding = False
+        self.selectionChanged.emit(self.selected_indices())
+
+    def _rebuild_scene(self, selected: set):
         self._scene.clear()
         self._items.clear()
         tl = self._timeline
@@ -255,6 +324,7 @@ class _TimelineView(QGraphicsView):
             item = _KeyframeItem(i, x, total_h, self)
             item.setPos(x, track_y)
             self._scene.addItem(item)
+            item.setSelected(i in selected)
             self._items.append(item)
 
         # Draw playhead
@@ -317,25 +387,24 @@ class _TimelineView(QGraphicsView):
     def mousePressEvent(self, event):
         item = self.itemAt(event.pos())
         if item is None and event.button() == Qt.LeftButton:
+            self._scene.clearSelection()
             t = self._x_to_time(self.mapToScene(event.pos()).x())
             self.timelineClicked.emit(t)
         else:
             super().mousePressEvent(event)
-            # Emit selection signal
-            for it in self._items:
-                if it.isSelected():
-                    self.keyframeSelected.emit(it.index)
-                    break
 
     def keyPressEvent(self, event):
-        selected = [it for it in self._items if it.isSelected()]
+        selected = self.selected_indices()
         if selected:
-            idx = selected[0].index
+            if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                self.keyframesRemoved.emit(selected)
+                event.accept()
+                return
             if event.key() == Qt.Key_D:
                 if event.modifiers() & Qt.ShiftModifier:
-                    self.keyframeDuplicated.emit(idx)
+                    self.keyframesDuplicated.emit(selected)
                 else:
-                    self.keyframeRemoved.emit(idx)
+                    self.keyframesRemoved.emit(selected)
                 event.accept()
                 return
         super().keyPressEvent(event)
@@ -350,11 +419,7 @@ class KeyframeTimelineWidget(QWidget):
 
     # Signals consumed by MainWindow
     keyframeAddRequested = Signal()
-    keyframeRemoved = Signal(int)
-    keyframeMoved = Signal(int, float)
-    keyframeDuplicated = Signal(int)
-    keyframeSelected = Signal(int)
-    interpolationChanged = Signal(int, str)
+    keyframeEditRequested = Signal(int)  # re-capture current view into keyframe
     previewRequested = Signal(float)   # time position for preview tick
     previewStopped = Signal()
     renderRequested = Signal()
@@ -366,7 +431,8 @@ class KeyframeTimelineWidget(QWidget):
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._on_preview_tick)
         self._preview_time: float = 0.0
-        self._selected_kf_index: Optional[int] = None
+        self._selected_indices: list[int] = []
+        self._history = TimelineHistory()  # in-memory until init_history() is called
 
         self._build_ui()
 
@@ -381,11 +447,52 @@ class KeyframeTimelineWidget(QWidget):
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(6)
 
-        self._btn_add = QPushButton("+ Add Keyframe")
-        self._btn_add.setToolTip("Capture current view as a keyframe (shortcut: K)")
+        def icon_button(icon_name: str, tooltip: str) -> QPushButton:
+            btn = QPushButton()
+            btn.setIcon(QIcon(f":/material_icons/material_icons/png/{icon_name}.png"))
+            btn.setToolTip(tooltip)
+            btn.setFixedSize(32, 32)
+            btn.setIconSize(QSize(22, 22))
+            btn.setStyleSheet("""
+                QPushButton {
+                    border: 1px solid rgba(128, 128, 128, 0.35);
+                    border-radius: 8px;
+                    background: rgba(128, 128, 128, 0.12);
+                }
+                QPushButton:hover { background: rgba(128, 128, 128, 0.25); }
+                QPushButton:pressed, QPushButton:checked { background: rgba(128, 128, 128, 0.40); }
+                QPushButton:disabled { background: transparent; }
+            """)
+            return btn
+
+        self._btn_add = icon_button(
+            "add", "Capture current view as a keyframe (shortcut: K)")
         self._btn_add.clicked.connect(self.keyframeAddRequested)
 
-        self._btn_preview = QPushButton("▶ Preview")
+        self._btn_edit = icon_button(
+            "modify", "Update the selected keyframe from the current view")
+        self._btn_edit.setEnabled(False)
+        self._btn_edit.clicked.connect(self._on_edit_clicked)
+
+        self._btn_delete = icon_button("bin", "Delete the selected keyframe(s)")
+        self._btn_delete.setEnabled(False)
+        self._btn_delete.clicked.connect(
+            lambda: self._on_kfs_removed(list(self._selected_indices)))
+
+        self._btn_duplicate = icon_button(
+            "duplicate", "Duplicate the selected keyframe(s)")
+        self._btn_duplicate.setEnabled(False)
+        self._btn_duplicate.clicked.connect(
+            lambda: self._on_kfs_duplicated(list(self._selected_indices)))
+
+        self._btn_space = icon_button(
+            "distribute",
+            "Distribute keyframes evenly — the selection if two or more are "
+            "selected, otherwise all keyframes across the full duration")
+        self._btn_space.setEnabled(False)
+        self._btn_space.clicked.connect(self._space_evenly)
+
+        self._btn_preview = icon_button("preview", "Preview the animation")
         self._btn_preview.setCheckable(True)
         self._btn_preview.clicked.connect(self._toggle_preview)
 
@@ -404,10 +511,14 @@ class KeyframeTimelineWidget(QWidget):
         self._spin_fps.setFixedWidth(55)
         self._spin_fps.valueChanged.connect(self._on_fps_changed)
 
-        self._btn_render = QPushButton("Render…")
+        self._btn_render = icon_button("render", "Render the animation…")
         self._btn_render.clicked.connect(self.renderRequested)
 
         toolbar_layout.addWidget(self._btn_add)
+        toolbar_layout.addWidget(self._btn_edit)
+        toolbar_layout.addWidget(self._btn_delete)
+        toolbar_layout.addWidget(self._btn_duplicate)
+        toolbar_layout.addWidget(self._btn_space)
         toolbar_layout.addWidget(self._btn_preview)
         toolbar_layout.addStretch()
         toolbar_layout.addWidget(lbl_dur)
@@ -418,11 +529,13 @@ class KeyframeTimelineWidget(QWidget):
 
         # --- Timeline view ---
         self._timeline_view = _TimelineView(AnimationTimeline())
-        self._timeline_view.keyframeMoved.connect(self._on_kf_moved)
-        self._timeline_view.keyframeRemoved.connect(self._on_kf_removed)
-        self._timeline_view.keyframeDuplicated.connect(self._on_kf_duplicated)
-        self._timeline_view.keyframeSelected.connect(self._on_kf_selected)
+        self._timeline_view.keyframesMoved.connect(self._on_kfs_moved)
+        self._timeline_view.keyframesRemoved.connect(self._on_kfs_removed)
+        self._timeline_view.keyframesDuplicated.connect(self._on_kfs_duplicated)
+        self._timeline_view.keyframeEditRequested.connect(self.keyframeEditRequested)
+        self._timeline_view.selectionChanged.connect(self._on_selection_changed)
         self._timeline_view.keyframeDoubleClicked.connect(self._on_kf_double_clicked)
+        self._timeline_view.spaceEvenlyRequested.connect(self._space_evenly)
         self._timeline_view.timelineClicked.connect(self._on_timeline_click)
         self._timeline_view.playheadMoved.connect(self._on_playhead_moved)
 
@@ -470,17 +583,56 @@ class KeyframeTimelineWidget(QWidget):
     def set_timeline(self, tl: AnimationTimeline) -> None:
         self._timeline = tl
         self._timeline_view._timeline = tl
-        self._spin_duration.blockSignals(True)
-        self._spin_duration.setValue(tl.duration)
-        self._spin_duration.blockSignals(False)
-        self._spin_fps.blockSignals(True)
-        self._spin_fps.setValue(tl.fps)
-        self._spin_fps.blockSignals(False)
-        self._timeline_view.rebuild()
+        self._sync_spins()
+        self._timeline_view.rebuild(set())
+
+    def init_history(self, path) -> None:
+        """Autosave the current timeline state to `path` on every change.
+
+        The undo/redo stack itself is session-only; the autosave file is only
+        a crash-recovery copy (loadable via "Load Animation…").
+        """
+        self._history = TimelineHistory(path)
+        if self._timeline is not None:
+            # Baseline for undo; skip the autosave so a previous session's
+            # crash-recovery file survives until the first real edit.
+            self._history.push(self._timeline.to_dict(), autosave=False)
 
     def refresh(self) -> None:
-        """Rebuild the graphics view to reflect current timeline state."""
-        self._timeline_view.rebuild()
+        """Rebuild the graphics view and record the state for undo."""
+        self._timeline_view.rebuild(set())
+        self._push_history()
+
+    def _sync_spins(self) -> None:
+        if self._timeline is None:
+            return
+        self._spin_duration.blockSignals(True)
+        self._spin_duration.setValue(self._timeline.duration)
+        self._spin_duration.blockSignals(False)
+        self._spin_fps.blockSignals(True)
+        self._spin_fps.setValue(self._timeline.fps)
+        self._spin_fps.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Undo / redo
+    # ------------------------------------------------------------------
+
+    def _push_history(self) -> None:
+        if self._timeline is not None:
+            self._history.push(self._timeline.to_dict())
+
+    def undo(self) -> None:
+        self._apply_history_state(self._history.undo())
+
+    def redo(self) -> None:
+        self._apply_history_state(self._history.redo())
+
+    def _apply_history_state(self, state) -> None:
+        if state is None or self._timeline is None:
+            return
+        self._timeline.restore(state)
+        self._sync_spins()
+        self._timeline_view.rebuild(set())
 
     # ------------------------------------------------------------------
     # Preview
@@ -498,11 +650,13 @@ class KeyframeTimelineWidget(QWidget):
             return
         self._preview_time = self._timeline.keyframes[0].time
         fps = self._timeline.fps or 24
+        self._btn_preview.setIcon(QIcon(":/material_icons/material_icons/png/pause-preview.png"))
         self._preview_timer.start(max(1, 1000 // fps))
 
     def _stop_preview(self):
         self._preview_timer.stop()
         self._btn_preview.setChecked(False)
+        self._btn_preview.setIcon(QIcon(":/material_icons/material_icons/png/preview.png"))
         self.previewStopped.emit()
 
     def stop_preview(self) -> None:
@@ -523,37 +677,84 @@ class KeyframeTimelineWidget(QWidget):
     # Timeline view signal handlers
     # ------------------------------------------------------------------
 
-    def _on_kf_moved(self, index: int, new_time: float):
+    def _on_selection_changed(self, indices: list):
+        self._selected_indices = list(indices)
+        self._update_buttons()
+        self._update_inspector()
+
+    def _update_buttons(self):
+        n = len(self._selected_indices)
+        self._btn_edit.setEnabled(n == 1)
+        self._btn_delete.setEnabled(n >= 1)
+        self._btn_duplicate.setEnabled(n >= 1)
+        self._btn_space.setEnabled(
+            self._timeline is not None and len(self._timeline.keyframes) >= 2)
+
+    def _on_edit_clicked(self):
+        if len(self._selected_indices) == 1:
+            self.keyframeEditRequested.emit(self._selected_indices[0])
+
+    def _rebuild_reselect(self, kf_objs: list):
+        """Rebuild the view, re-selecting the given Keyframe objects wherever
+        they ended up after a re-sort."""
         if self._timeline is None:
             return
-        self._timeline.move_keyframe(index, new_time)
+        ids = {id(k) for k in kf_objs}
+        indices = {i for i, k in enumerate(self._timeline.keyframes) if id(k) in ids}
+        self._timeline_view.rebuild(indices)
+
+    def _selected_keyframe_objs(self) -> list:
+        if self._timeline is None:
+            return []
+        n = len(self._timeline.keyframes)
+        return [self._timeline.keyframes[i] for i in self._selected_indices if i < n]
+
+    def _on_kfs_moved(self, moves: list):
+        if self._timeline is None:
+            return
+        n = len(self._timeline.keyframes)
+        moves = [(i, t) for i, t in moves
+                 if 0 <= i < n and abs(self._timeline.keyframes[i].time - t) > 1e-9]
+        if not moves:
+            return
+        selected = self._selected_keyframe_objs()
+        self._timeline.move_keyframes(moves)
+        self._push_history()
         # Defer rebuild so we don't delete the item while still inside its mouseReleaseEvent
-        QTimer.singleShot(0, self._timeline_view.rebuild)
-        self.keyframeMoved.emit(index, new_time)
+        QTimer.singleShot(0, lambda: self._rebuild_reselect(selected))
 
-    def _on_kf_removed(self, index: int):
-        if self._timeline is None:
+    def _on_kfs_removed(self, indices: list):
+        if self._timeline is None or not indices:
             return
-        self._timeline.remove_keyframe(index)
-        self._selected_kf_index = None
-        self._update_inspector(None)
-        self._timeline_view.rebuild()
-        self.keyframeRemoved.emit(index)
+        for i in sorted(set(indices), reverse=True):
+            self._timeline.remove_keyframe(i)
+        self._push_history()
+        # Defer: may be called from a keyframe item's own context menu event
+        QTimer.singleShot(0, lambda: self._timeline_view.rebuild(set()))
 
-    def _on_kf_duplicated(self, index: int):
-        if self._timeline is None:
+    def _on_kfs_duplicated(self, indices: list):
+        if self._timeline is None or not indices:
             return
-        from copy import deepcopy
-        kf = deepcopy(self._timeline.keyframes[index])
-        kf.time += 0.5
-        self._timeline.add_keyframe(kf)
-        self._timeline_view.rebuild()
-        self.keyframeDuplicated.emit(index)
+        n = len(self._timeline.keyframes)
+        copies = []
+        for i in sorted(set(indices)):
+            if 0 <= i < n:
+                kf = deepcopy(self._timeline.keyframes[i])
+                kf.time += 0.5
+                copies.append(kf)
+        for kf in copies:
+            self._timeline.add_keyframe(kf)
+        self._push_history()
+        QTimer.singleShot(0, lambda: self._rebuild_reselect(copies))
 
-    def _on_kf_selected(self, index: int):
-        self._selected_kf_index = index
-        self._update_inspector(index)
-        self.keyframeSelected.emit(index)
+    def _space_evenly(self):
+        if self._timeline is None or len(self._timeline.keyframes) < 2:
+            return
+        selected = self._selected_keyframe_objs()
+        indices = list(self._selected_indices) if len(self._selected_indices) >= 2 else None
+        self._timeline.space_evenly(indices)
+        self._push_history()
+        QTimer.singleShot(0, lambda: self._rebuild_reselect(selected))
 
     def _on_kf_double_clicked(self, index: int):
         """Seek the viewport to the exact time of the double-clicked keyframe."""
@@ -577,65 +778,79 @@ class KeyframeTimelineWidget(QWidget):
     # Inspector
     # ------------------------------------------------------------------
 
-    def _update_inspector(self, index: Optional[int]):
-        has = index is not None and self._timeline is not None and index < len(self._timeline.keyframes)
-        self._spin_kf_time.setEnabled(has)
-        self._spin_data_frame.setEnabled(has)
+    def _update_inspector(self):
+        tl = self._timeline
+        sel = self._selected_indices
+        single = tl is not None and len(sel) == 1 and sel[0] < len(tl.keyframes)
+        self._spin_kf_time.setEnabled(single)
+        self._spin_data_frame.setEnabled(single)
 
-        # Segment interpolation: enabled if there is a next keyframe
-        has_next = has and index < len(self._timeline.keyframes) - 1
-        self._combo_interp.setEnabled(has_next)
+        # Segment interpolation: enabled if any selected keyframe has a next segment
+        seg_indices = [] if tl is None else [i for i in sel if i < len(tl.interpolation)]
+        self._combo_interp.setEnabled(bool(seg_indices))
 
-        if not has:
+        if not single:
             self._spin_kf_time.blockSignals(True)
             self._spin_kf_time.setValue(0)
             self._spin_kf_time.blockSignals(False)
             self._spin_data_frame.blockSignals(True)
             self._spin_data_frame.setValue(-1)
             self._spin_data_frame.blockSignals(False)
-            return
+        else:
+            kf = tl.keyframes[sel[0]]
+            self._spin_kf_time.blockSignals(True)
+            self._spin_kf_time.setValue(kf.time)
+            self._spin_kf_time.blockSignals(False)
+            self._spin_data_frame.blockSignals(True)
+            self._spin_data_frame.setValue(-1 if kf.data_frame is None else kf.data_frame)
+            self._spin_data_frame.blockSignals(False)
 
-        kf = self._timeline.keyframes[index]
-        self._spin_kf_time.blockSignals(True)
-        self._spin_kf_time.setValue(kf.time)
-        self._spin_kf_time.blockSignals(False)
-        self._spin_data_frame.blockSignals(True)
-        self._spin_data_frame.setValue(-1 if kf.data_frame is None else kf.data_frame)
-        self._spin_data_frame.blockSignals(False)
-
-        if has_next and index < len(self._timeline.interpolation):
-            mode = self._timeline.interpolation[index]
+        if seg_indices:
+            # Show the first selected segment's mode
+            mode = tl.interpolation[seg_indices[0]]
             self._combo_interp.blockSignals(True)
             idx = INTERPOLATION_MODES.index(mode) if mode in INTERPOLATION_MODES else 0
             self._combo_interp.setCurrentIndex(idx)
             self._combo_interp.blockSignals(False)
 
     def _on_inspector_time_changed(self, val: float):
-        if self._selected_kf_index is None or self._timeline is None:
+        if len(self._selected_indices) != 1 or self._timeline is None:
             return
-        self._timeline.move_keyframe(self._selected_kf_index, val)
-        self._timeline_view.rebuild()
+        idx = self._selected_indices[0]
+        if idx >= len(self._timeline.keyframes):
+            return
+        kf = self._timeline.keyframes[idx]
+        self._timeline.move_keyframe(idx, val)
+        self._push_history()
+        self._rebuild_reselect([kf])
 
     def _on_inspector_data_frame_changed(self, val: int):
-        if self._selected_kf_index is None or self._timeline is None:
+        if len(self._selected_indices) != 1 or self._timeline is None:
             return
-        idx = self._selected_kf_index
+        idx = self._selected_indices[0]
         if idx < len(self._timeline.keyframes):
             self._timeline.keyframes[idx].data_frame = None if val == -1 else val
+            self._push_history()
 
     def _on_interp_changed(self, mode: str):
-        if self._selected_kf_index is None or self._timeline is None:
+        if self._timeline is None:
             return
-        seg_idx = self._selected_kf_index
-        self._timeline.set_interpolation(seg_idx, mode)
-        self._timeline_view.rebuild()
-        self.interpolationChanged.emit(seg_idx, mode)
+        # Apply to the segment after every selected keyframe
+        seg_indices = [i for i in self._selected_indices if i < len(self._timeline.interpolation)]
+        if not seg_indices:
+            return
+        for i in seg_indices:
+            self._timeline.set_interpolation(i, mode)
+        self._push_history()
+        self._timeline_view.rebuild(set(self._selected_indices))
 
     def _on_duration_changed(self, val: float):
         if self._timeline is not None:
             self._timeline.duration = val
+            self._push_history()
             self._timeline_view.rebuild()
 
     def _on_fps_changed(self, val: int):
         if self._timeline is not None:
             self._timeline.fps = val
+            self._push_history()

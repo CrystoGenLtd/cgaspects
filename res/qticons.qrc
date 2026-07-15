@@ -35,6 +35,14 @@
         <file>material_icons/png/folder-sync.png</file>
         <file>material_icons/png/pause-box.png</file>
         <file>material_icons/png/play-box.png</file>
+        <file>material_icons/png/add.png</file>
+        <file>material_icons/png/bin.png</file>
+        <file>material_icons/png/distribute.png</file>
+        <file>material_icons/png/duplicate.png</file>
+        <file>material_icons/png/modify.png</file>
+        <file>material_icons/png/pause-preview.png</file>
+        <file>material_icons/png/preview.png</file>
+        <file>material_icons/png/render.png</file>
         <file>app_icons/CGAspects.icns</file>
     </qresource>
     <qresource prefix="/app_icons">

@@ -213,17 +213,37 @@ class AnimationTimeline:
 
     def move_keyframe(self, index: int, new_time: float) -> None:
         """Move a keyframe to new_time, keeping the list sorted."""
-        if index < 0 or index >= len(self.keyframes):
-            return
-        kf = self.keyframes[index]
-        kf.time = new_time
-        # Re-sort by removing and re-inserting
-        self.keyframes.pop(index)
-        if self.interpolation and index < len(self.interpolation):
-            self.interpolation.pop(index)
-        elif self.interpolation and index > 0:
-            self.interpolation.pop(index - 1)
-        self.add_keyframe(kf)
+        self.move_keyframes([(index, new_time)])
+
+    def move_keyframes(self, moves: list[tuple[int, float]]) -> None:
+        """Move several keyframes at once ([(index, new_time), ...]), then re-sort."""
+        for index, new_time in moves:
+            if 0 <= index < len(self.keyframes):
+                self.keyframes[index].time = new_time
+        self.keyframes.sort(key=lambda k: k.time)
+
+    def space_evenly(self, indices: Optional[list[int]] = None) -> None:
+        """Distribute keyframes evenly in time.
+
+        With two or more indices, the selected keyframes are spread between the
+        first and last selected times. Otherwise all keyframes are spread
+        across the full timeline duration.
+        """
+        if indices is not None and len(indices) >= 2:
+            idxs = sorted(i for i in set(indices) if 0 <= i < len(self.keyframes))
+            if len(idxs) < 2:
+                return
+            t0 = self.keyframes[idxs[0]].time
+            span = self.keyframes[idxs[-1]].time - t0
+            for pos, i in enumerate(idxs):
+                self.keyframes[i].time = t0 + span * pos / (len(idxs) - 1)
+        else:
+            n = len(self.keyframes)
+            if n < 2:
+                return
+            for pos, kf in enumerate(self.keyframes):
+                kf.time = self.duration * pos / (n - 1)
+        self.keyframes.sort(key=lambda k: k.time)
 
     def set_interpolation(self, segment_index: int, mode: str) -> None:
         if 0 <= segment_index < len(self.interpolation):
@@ -297,8 +317,12 @@ class AnimationTimeline:
     @classmethod
     def from_dict(cls, d: dict) -> "AnimationTimeline":
         tl = cls()
-        tl.fps = int(d.get("fps", 24))
-        tl.duration = float(d.get("duration", 10.0))
-        tl.interpolation = list(d.get("interpolation", []))
-        tl.keyframes = [Keyframe.from_dict(kfd) for kfd in d.get("keyframes", [])]
+        tl.restore(d)
         return tl
+
+    def restore(self, d: dict) -> None:
+        """Load a serialized state into this instance (used by undo/redo)."""
+        self.fps = int(d.get("fps", 24))
+        self.duration = float(d.get("duration", 10.0))
+        self.interpolation = list(d.get("interpolation", []))
+        self.keyframes = [Keyframe.from_dict(kfd) for kfd in d.get("keyframes", [])]

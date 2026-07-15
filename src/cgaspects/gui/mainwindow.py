@@ -11,7 +11,7 @@ import pandas as pd
 from natsort import natsorted
 from PySide6 import QtWidgets
 from PySide6.QtCore import QObject, QSignalBlocker, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QIcon, Qt
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -280,9 +280,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # Timeline signals
         self._timeline_dock.keyframeAddRequested.connect(self._add_keyframe)
+        self._timeline_dock.keyframeEditRequested.connect(self._edit_keyframe)
         self._timeline_dock.previewRequested.connect(self._on_preview_tick)
         self._timeline_dock.previewStopped.connect(self._on_preview_stopped)
         self._timeline_dock.renderRequested.connect(self._open_render_dialog)
+        # Session undo/redo; current state autosaved to the cgaspects home dir
+        self._timeline_dock.init_history(Path.home() / ".cgaspects" / "timeline_autosave.json")
 
         self._setup_analysis_button_grid()
         self.setup_button_connections()
@@ -639,7 +642,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionToggleTimeline.setObjectName("actionToggleTimeline")
         self.actionToggleTimeline.setShortcut("Ctrl+T")
         self.actionToggleTimeline.setCheckable(True)
-        self.actionToggleTimeline.setChecked(False)
+        self.actionToggleTimeline.setChecked(self._timeline_dock.isVisible())
         self.actionToggleTimeline.triggered.connect(self._toggle_timeline_dock)
         self.menuAnimation.addAction(self.actionToggleTimeline)
 
@@ -653,6 +656,20 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.actionRenderAnimation.setObjectName("actionRenderAnimation")
         self.actionRenderAnimation.triggered.connect(self._open_render_dialog)
         self.menuAnimation.addAction(self.actionRenderAnimation)
+
+        self.menuAnimation.addSeparator()
+
+        self.actionUndoTimeline = QAction("Undo Timeline Edit", self)
+        self.actionUndoTimeline.setObjectName("actionUndoTimeline")
+        self.actionUndoTimeline.setShortcut(QKeySequence.Undo)
+        self.actionUndoTimeline.triggered.connect(self._timeline_dock.undo)
+        self.menuAnimation.addAction(self.actionUndoTimeline)
+
+        self.actionRedoTimeline = QAction("Redo Timeline Edit", self)
+        self.actionRedoTimeline.setObjectName("actionRedoTimeline")
+        self.actionRedoTimeline.setShortcut(QKeySequence.Redo)
+        self.actionRedoTimeline.triggered.connect(self._timeline_dock.redo)
+        self.menuAnimation.addAction(self.actionRedoTimeline)
 
         self.menuAnimation.addSeparator()
 
@@ -2427,8 +2444,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     def _toggle_timeline_dock(self, checked: bool):
         self._timeline_dock.setVisible(checked)
 
-    def _add_keyframe(self):
-        """Capture the current viewport state as a keyframe."""
+    def _capture_view_snapshot(self):
+        """Capture the current viewport state (camera, style, planes, directions)."""
         snap = self.openglwidget.snapshot()
 
         # Capture style / colour settings
@@ -2439,7 +2456,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         else:
             sc = (0.5, 0.5, 0.5, 1.0)
 
-        snap = dataclasses.replace(
+        return dataclasses.replace(
             snap,
             style=settings.get("Style", self.openglwidget.render_option),
             color_by=settings.get("Color By", self.openglwidget.color_by),
@@ -2449,6 +2466,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             directions=list(self.openglwidget._raw_directions),
         )
 
+    def _add_keyframe(self):
+        """Capture the current viewport state as a keyframe."""
+        snap = self._capture_view_snapshot()
         tl = self._animation_timeline
         # Place at end of timeline + 1 second
         t = tl.keyframes[-1].time + 1.0 if tl.keyframes else 0.0
@@ -2460,6 +2480,17 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if not self._timeline_dock.isVisible():
             self._timeline_dock.show()
             self.actionToggleTimeline.setChecked(True)
+
+    def _edit_keyframe(self, index: int):
+        """Re-capture the current viewport state into an existing keyframe."""
+        tl = self._animation_timeline
+        if not (0 <= index < len(tl.keyframes)):
+            return
+        kf = tl.keyframes[index]
+        kf.camera = self._capture_view_snapshot()
+        kf.data_frame = self.frame if self.frame_list else None
+        self._timeline_dock.refresh()
+        self.update_statusbar(f"Keyframe {index + 1} updated from current view")
 
     def _apply_snapshot_view_state(self, snapshot) -> None:
         """Apply style, colour, planes, and directions from a snapshot to the viewport."""
@@ -2622,6 +2653,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 data = json.load(f)
             self._animation_timeline = AnimationTimeline.from_dict(data)
             self._timeline_dock.set_timeline(self._animation_timeline)
+            self._timeline_dock.refresh()  # record the loaded state for undo
             self._timeline_dock.show()
             self.actionToggleTimeline.setChecked(True)
         except Exception as exc:
