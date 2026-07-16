@@ -451,12 +451,12 @@ class KeyframeTimelineWidget(QWidget):
             btn = QPushButton()
             btn.setIcon(QIcon(f":/material_icons/material_icons/png/{icon_name}.png"))
             btn.setToolTip(tooltip)
-            btn.setFixedSize(32, 32)
-            btn.setIconSize(QSize(22, 22))
+            btn.setFixedSize(24, 24)
+            btn.setIconSize(QSize(18, 18))
             btn.setStyleSheet("""
                 QPushButton {
                     border: 1px solid rgba(128, 128, 128, 0.35);
-                    border-radius: 8px;
+                    border-radius: 6px;
                     background: rgba(128, 128, 128, 0.12);
                 }
                 QPushButton:hover { background: rgba(128, 128, 128, 0.25); }
