@@ -54,6 +54,7 @@ class _KeyframeItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setZValue(1)
         self._dragging = False
+        self._range_select = False
 
     @property
     def index(self) -> int:
@@ -98,6 +99,13 @@ class _KeyframeItem(QGraphicsItem):
         return super().itemChange(change, value)
 
     def mouseReleaseEvent(self, event):
+        if self._range_select:
+            # Swallow the release of a shift+click: QGraphicsItem's default
+            # handler would collapse the fresh range selection back to just
+            # this item (it does so whenever the mouse didn't move).
+            self._range_select = False
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         if self._view and self._dragging:
             # Dragging moves every selected keyframe; commit them all at once.
@@ -111,8 +119,9 @@ class _KeyframeItem(QGraphicsItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and event.modifiers() & Qt.ShiftModifier:
-            # Shift+click: select the range from the last-clicked keyframe to here
+            # Shift+click: select the range from the first selected keyframe to here
             self._view.select_range_to(self._index)
+            self._range_select = True
             event.accept()
             return
         self._dragging = True
@@ -466,33 +475,32 @@ class KeyframeTimelineWidget(QWidget):
             return btn
 
         self._btn_add = icon_button(
-            "add", "Capture current view as a keyframe (shortcut: K)")
+            "add", "Add keyframe (shortcut: K)")
         self._btn_add.clicked.connect(self.keyframeAddRequested)
 
         self._btn_edit = icon_button(
-            "modify", "Update the selected keyframe from the current view")
+            "modify", "Modify keyframe")
         self._btn_edit.setEnabled(False)
         self._btn_edit.clicked.connect(self._on_edit_clicked)
 
-        self._btn_delete = icon_button("bin", "Delete the selected keyframe(s)")
+        self._btn_delete = icon_button("bin", "Delete keyframe(s)")
         self._btn_delete.setEnabled(False)
         self._btn_delete.clicked.connect(
             lambda: self._on_kfs_removed(list(self._selected_indices)))
 
         self._btn_duplicate = icon_button(
-            "duplicate", "Duplicate the selected keyframe(s)")
+            "duplicate", "Duplicate keyframe(s)")
         self._btn_duplicate.setEnabled(False)
         self._btn_duplicate.clicked.connect(
             lambda: self._on_kfs_duplicated(list(self._selected_indices)))
 
         self._btn_space = icon_button(
             "distribute",
-            "Distribute keyframes evenly — the selection if two or more are "
-            "selected, otherwise all keyframes across the full duration")
+            "Distribute keyframes")
         self._btn_space.setEnabled(False)
         self._btn_space.clicked.connect(self._space_evenly)
 
-        self._btn_preview = icon_button("preview", "Preview the animation")
+        self._btn_preview = icon_button("preview", "Preview")
         self._btn_preview.setCheckable(True)
         self._btn_preview.clicked.connect(self._toggle_preview)
 
@@ -511,7 +519,7 @@ class KeyframeTimelineWidget(QWidget):
         self._spin_fps.setFixedWidth(55)
         self._spin_fps.valueChanged.connect(self._on_fps_changed)
 
-        self._btn_render = icon_button("render", "Render the animation…")
+        self._btn_render = icon_button("render", "Render")
         self._btn_render.clicked.connect(self.renderRequested)
 
         toolbar_layout.addWidget(self._btn_add)
@@ -564,7 +572,7 @@ class KeyframeTimelineWidget(QWidget):
         self._spin_data_frame.valueChanged.connect(self._on_inspector_data_frame_changed)
 
         inspector_layout.addWidget(self._spin_data_frame)
-        inspector_layout.addWidget(QLabel("Interpolation to next:"))
+        inspector_layout.addWidget(QLabel("Interpolation:"))
         self._combo_interp = QComboBox()
         self._combo_interp.addItems(INTERPOLATION_MODES)
         self._combo_interp.setEnabled(False)
