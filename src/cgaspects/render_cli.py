@@ -413,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Imports deferred past --help so argparse stays snappy; keyframe/raytrace
     # modules use PySide6 value types only — no display or QApplication needed.
-    from .fileio.xyz_file import read_XYZ
+    from .fileio.xyz_file import CrystalCloud
     from .gui.animation.keyframe import AnimationTimeline
     from .gui.visualisation import raytrace_export as rt
     from .gui.visualisation.shading import MATERIAL_PRESETS, RenderSettings
@@ -435,19 +435,23 @@ def main(argv: list[str] | None = None) -> int:
 
     frame_ids = _parse_frames(args.frames, total) if args.frames else list(range(total))
 
-    logger.info("Reading XYZ: %s", args.xyz)
-    xyz, xyz_movie = read_XYZ(args.xyz)
-    if xyz is None or not isinstance(xyz, np.ndarray):
-        raise SystemExit(f"{args.xyz}: not a readable XYZ point file")
-    movie = xyz_movie if xyz_movie else {0: xyz}
+    # Lazy index, like the GUI: one readline pass records byte offsets; frame
+    # data is parsed from disk only when a rendered frame actually needs it.
+    logger.info("Indexing XYZ: %s", args.xyz)
+    movie = CrystalCloud.parse_xyz_file(args.xyz)
     n_movie = len(movie)
-    logger.info("XYZ loaded: %d movie frame(s), %d points in frame 0",
-                n_movie, len(movie[0]))
+    if n_movie == 0:
+        raise SystemExit(f"{args.xyz}: no readable XYZ frames")
+    logger.info("XYZ indexed: %d movie frame(s)", n_movie)
 
-    if args.coord_scale != 1.0:
-        movie = {i: arr.copy() for i, arr in movie.items()}
-        for arr in movie.values():
-            arr[:, 3:6] *= args.coord_scale
+    def movie_frame(idx: int) -> np.ndarray | None:
+        raw = movie.get_raw_coords(idx)
+        if raw is None or raw.ndim != 2 or raw.shape[1] < 6:
+            return None
+        if args.coord_scale != 1.0:
+            raw = raw.copy()
+            raw[:, 3:6] *= args.coord_scale
+        return raw
 
     rs = RenderSettings()
     if args.material:
@@ -476,8 +480,13 @@ def main(argv: list[str] | None = None) -> int:
         snapshot, data_frame = timeline.get_state_at_time(t)
         movie_idx = args.default_frame if data_frame is None else data_frame
         movie_idx = max(0, min(movie_idx, n_movie - 1))
+        arr = movie_frame(movie_idx)
+        if arr is None:
+            logger.warning("Frame %d: XYZ movie frame %d has no point data — "
+                           "skipping", i, movie_idx)
+            continue
         scene = build_scene_from_snapshot(
-            movie[movie_idx], snapshot, args.width, args.height,
+            arr, snapshot, args.width, args.height,
             render_settings=rs, photoreal=photoreal, background=background,
             fov_deg=args.fov, ortho_size=args.ortho_size,
         )
