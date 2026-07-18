@@ -468,28 +468,37 @@ def write_scene(scene: RTScene, backend: str, path: str | Path) -> Path:
     raise ValueError(f"Unknown ray-trace backend: {backend!r}")
 
 
-def render_scene(scene: RTScene, backend: str, scene_path: str | Path,
-                 image_path: str | Path, timeout: float = 600.0) -> Path:
-    """Write the scene file and run the backend to produce ``image_path`` (PNG).
+def render_scene_file(backend: str, scene_path: str | Path, image_path: str | Path,
+                      width: int, height: int, *, antialiasing: int = 4,
+                      timeout: float = 600.0,
+                      extra_args: list[str] | None = None) -> Path:
+    """Run an already-written scene file through the backend to produce a PNG.
 
-    Raises RuntimeError if the backend is missing or exits non-zero.
+    ``extra_args`` are appended verbatim to the renderer command line (e.g.
+    ``["+WT4"]`` to cap POV-Ray's thread count when rendering frames in
+    parallel). Raises RuntimeError if the backend is missing or exits non-zero.
+    Used both by :func:`render_scene` and by the headless batch CLI
+    (``cgaspects-render``).
     """
     exe = find_renderer(backend)
     if exe is None:
         raise RuntimeError(
             f"{backend} was not found on PATH. Install it, or use 'Export scene "
             f"file only' and render elsewhere.")
-    scene_path = write_scene(scene, backend, scene_path)
+    scene_path = Path(scene_path)
     image_path = Path(image_path)
-    aa = scene.photoreal.antialiasing if scene.photoreal else 4
 
     if backend == "povray":
         cmd = [exe, f"+I{scene_path}", f"+O{image_path}",
-               f"+W{scene.width}", f"+H{scene.height}",
-               "+FN", "+A", f"+Q{min(max(aa, 1), 11)}", "-D", "-P"]
-    else:  # tachyon
+               f"+W{width}", f"+H{height}",
+               "+FN", "+A", f"+Q{min(max(antialiasing, 1), 11)}", "-D", "-P"]
+    elif backend == "tachyon":
         cmd = [exe, str(scene_path), "-o", str(image_path),
-               "-res", str(scene.width), str(scene.height), "-format", "PNG"]
+               "-res", str(width), str(height), "-format", "PNG"]
+    else:
+        raise ValueError(f"Unknown ray-trace backend: {backend!r}")
+    if extra_args:
+        cmd += list(extra_args)
 
     logger.info("Running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -499,3 +508,16 @@ def render_scene(scene: RTScene, backend: str, scene_path: str | Path,
     if not image_path.exists():
         raise RuntimeError(f"{backend} reported success but produced no image.")
     return image_path
+
+
+def render_scene(scene: RTScene, backend: str, scene_path: str | Path,
+                 image_path: str | Path, timeout: float = 600.0) -> Path:
+    """Write the scene file and run the backend to produce ``image_path`` (PNG).
+
+    Raises RuntimeError if the backend is missing or exits non-zero.
+    """
+    scene_path = write_scene(scene, backend, scene_path)
+    aa = scene.photoreal.antialiasing if scene.photoreal else 4
+    return render_scene_file(backend, scene_path, image_path,
+                             scene.width, scene.height,
+                             antialiasing=aa, timeout=timeout)
