@@ -65,6 +65,10 @@ from ..utils.crystallography import Crystallography
 from ..visualisation.atom_renderer import AtomRenderer
 from ..visualisation.bond_renderer import BondRenderer
 from ..visualisation.camera import Camera
+from ..visualisation.multicolor_sphere_renderer import (
+    MAX_SECTIONS,
+    MultiColorSphereRenderer,
+)
 from ..visualisation.shading import RenderSettings
 from ..visualisation.unit_cell_renderer import (
     _AXIS_COLORS,
@@ -79,6 +83,10 @@ logger = logging.getLogger("CGA:UnitCellViewer")
 
 _BOND_RADIUS = 0.15
 _MAX_SUPERCELL = 6
+
+# Atoms whose positions round to the same value at this many decimals (Å) are
+# treated as occupying the same lattice site and drawn as one sectioned sphere.
+_OVERLAP_DECIMALS = 2
 
 # Distinct colours for interaction groups (cycled when more groups than entries)
 _SHELL_COLORS = np.array(
@@ -163,6 +171,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
 
         # OpenGL resources (created in initializeGL)
         self._atom_renderer: AtomRenderer | None = None
+        self._multi_atom_renderer: MultiColorSphereRenderer | None = None
         self._bond_renderer: BondRenderer | None = None
         self._cell_renderer: UnitCellRenderer | None = None
         self._conn_renderer: UnitCellRenderer | None = None
@@ -189,6 +198,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
     def initializeGL(self):
         gl = self.context().extraFunctions()
         self._atom_renderer = AtomRenderer(gl)
+        self._multi_atom_renderer = MultiColorSphereRenderer(gl)
         self._bond_renderer = BondRenderer(gl)
         self._cell_renderer = UnitCellRenderer(gl)
         self._conn_renderer = UnitCellRenderer(gl)
@@ -261,6 +271,11 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 self._atom_renderer.setUniforms(**uniforms)
                 self._atom_renderer.draw(gl)
                 self._atom_renderer.release()
+            if self._multi_atom_renderer.numberOfInstances() > 0:
+                self._multi_atom_renderer.bind(gl)
+                self._multi_atom_renderer.setUniforms(**uniforms)
+                self._multi_atom_renderer.draw(gl)
+                self._multi_atom_renderer.release()
             if self._bond_renderer.numberOfInstances() > 0:
                 self._bond_renderer.bind(gl)
                 self._bond_renderer.setUniforms(**uniforms)
@@ -359,6 +374,8 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._render_settings = settings
         if self._atom_renderer is not None:
             self._atom_renderer.set_ao_enabled(settings.ao_enabled)
+        if self._multi_atom_renderer is not None:
+            self._multi_atom_renderer.set_ao_enabled(settings.ao_enabled)
         self.update()
 
     def reset_view(self):
@@ -481,6 +498,45 @@ class UnitCellViewerWidget(QOpenGLWidget):
             np.array(cell, dtype=np.float64)
         ).astype(np.float32)
 
+    def _supercell_centre(self) -> np.ndarray:
+        na, nb, nc = self._supercell
+        return self._crystallography.frac_to_cart(
+            np.array([na * 0.5, nb * 0.5, nc * 0.5], dtype=np.float64)
+        ).astype(np.float32)
+
+    def _visible_geometry_centre(self, cells: list) -> np.ndarray:
+        """Bounding-box centre of the currently visible molecule atoms.
+
+        Used as the geometry offset so rotation pivots at the centre of what is
+        actually shown.  Falls back to the supercell centre when no molecule is
+        visible (e.g. cell-edges-only view).
+        """
+        if not self._templates:
+            return self._supercell_centre()
+
+        lo = None
+        hi = None
+        for cell in cells:
+            cell_cart = self._cell_cart(cell)
+            for tile, tmpl in self._templates.items():
+                if ("mol", tile, cell) in self._hidden_ids:
+                    continue
+                vis = [
+                    i
+                    for i in range(len(tmpl["cart"]))
+                    if ("atom", tile, i) not in self._hidden_ids
+                ]
+                if not vis:
+                    continue
+                pts = tmpl["cart"][vis] + cell_cart
+                pmin, pmax = pts.min(axis=0), pts.max(axis=0)
+                lo = pmin if lo is None else np.minimum(lo, pmin)
+                hi = pmax if hi is None else np.maximum(hi, pmax)
+
+        if lo is None:
+            return self._supercell_centre()
+        return ((lo + hi) * 0.5).astype(np.float32)
+
     def _conn_group_values(self) -> dict:
         """(tile, conn_idx) → value used to colour-group connections.
 
@@ -576,9 +632,12 @@ class UnitCellViewerWidget(QOpenGLWidget):
         cells = self.cells()
         cell_set = set(cells)
 
-        scene_centre = self._crystallography.frac_to_cart(
-            np.array([na * 0.5, nb * 0.5, nc * 0.5], dtype=np.float64)
-        ).astype(np.float32)
+        # Centre all geometry on the currently visible molecules so rotation
+        # pivots at their centre of geometry; this recomputes on every rebuild
+        # (isolate / show-all / supercell expansion), moving the pivot with the
+        # visible object.  Falls back to the supercell centre when nothing is
+        # visible (cell-edges-only view).
+        scene_centre = self._visible_geometry_centre(cells)
         self._scene_centre = scene_centre
 
         self._cell_renderer.set_lines(self._build_cell_lines(cells))
@@ -739,12 +798,19 @@ class UnitCellViewerWidget(QOpenGLWidget):
 
         if atom_blocks:
             atom_arr = np.vstack(atom_blocks).astype(np.float32)
-            self._atom_renderer.setPoints(atom_arr)
+            # Atoms sharing a lattice site are merged into one sphere split
+            # into coloured sections; the rest draw as ordinary spheres.
+            singles, sectioned = self._partition_overlaps(atom_arr)
+            self._atom_renderer.setPoints(singles)
+            self._multi_atom_renderer.setPoints(sectioned)
             if not self._view_fitted:
                 self._camera.fitToObject(atom_arr[:, :3])
                 self._view_fitted = True
         else:
             self._atom_renderer.setPoints(np.empty((0, 8), dtype=np.float32))
+            self._multi_atom_renderer.setPoints(
+                np.empty((0, self._multi_atom_renderer._in_floats), dtype=np.float32)
+            )
             if not self._view_fitted:
                 corners = [
                     self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32)
@@ -768,6 +834,57 @@ class UnitCellViewerWidget(QOpenGLWidget):
             if conn_vertices
             else np.array([], dtype=np.float32)
         )
+
+    def _partition_overlaps(self, atom_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Split atoms into non-overlapping and coincident-site groups.
+
+        ``atom_arr`` has one row per atom: position[3], color[3], selected[1],
+        radius[1].  Atoms whose positions coincide (to ``_OVERLAP_DECIMALS``)
+        are merged into a single sectioned-sphere instance so the overlap is
+        visible as coloured wedges; every other atom stays a plain sphere.
+
+        Returns ``(singles, sectioned)`` — shapes ``(N, 8)`` and ``(M, 18)``.
+        """
+        n_multi_floats = self._multi_atom_renderer._in_floats
+        if len(atom_arr) == 0:
+            return atom_arr, np.empty((0, n_multi_floats), dtype=np.float32)
+
+        keys = np.round(atom_arr[:, :3], _OVERLAP_DECIMALS)
+        groups: dict = {}
+        for i, key in enumerate(map(tuple, keys)):
+            groups.setdefault(key, []).append(i)
+
+        singles: list = []
+        sectioned: list = []
+        for idxs in groups.values():
+            if len(idxs) == 1:
+                singles.append(atom_arr[idxs[0]])
+                continue
+            rows = atom_arr[idxs]
+            position = rows[:, :3].mean(axis=0)
+            radius = rows[:, 7].max()
+            selected = rows[:, 6].max()
+            count = min(len(idxs), MAX_SECTIONS)
+            colors = np.zeros((MAX_SECTIONS, 3), dtype=np.float32)
+            for j in range(count):
+                colors[j] = rows[j, 3:6]
+            sectioned.append(
+                np.concatenate(
+                    [position, [radius, selected, float(count)], colors.ravel()]
+                )
+            )
+
+        singles_arr = (
+            np.array(singles, dtype=np.float32)
+            if singles
+            else np.empty((0, 8), dtype=np.float32)
+        )
+        sectioned_arr = (
+            np.array(sectioned, dtype=np.float32)
+            if sectioned
+            else np.empty((0, n_multi_floats), dtype=np.float32)
+        )
+        return singles_arr, sectioned_arr
 
     def _build_cell_lines(self, cells: list) -> np.ndarray:
         """Build edge vertex array for every cell of the supercell."""
@@ -955,7 +1072,9 @@ class UnitCellViewerWidget(QOpenGLWidget):
         dy = pos.y() - self._last_mouse_pos.y()
         self._last_mouse_pos = pos
         if event.buttons() & Qt.LeftButton:
-            self._camera.rotate_model(dx * 0.5, dy * 0.5)
+            # Same quaternion object-rotation as the main viewer's object mode
+            # (Camera.rotate_model at full rotationSpeed) so drags feel identical.
+            self._camera.rotate_model(dx, dy)
             self.update()
 
     def wheelEvent(self, event):
@@ -1090,8 +1209,15 @@ class UnitCellViewerDialog(QDialog):
         display_layout.addWidget(self._show_conn_cb)
         display_layout.addWidget(self._show_neigh_cb)
 
+        self._import_struct_btn = QPushButton("Import Structure File…")
+        self._import_struct_btn.setToolTip(
+            "Load molecules and net connectivity from a CrystoGen structure file"
+        )
+        self._import_struct_btn.clicked.connect(self._on_import_structure)
+
         view_group = QGroupBox("View")
         view_layout = QVBoxLayout(view_group)
+        view_layout.addWidget(self._import_struct_btn)
         view_layout.addWidget(self._reset_btn)
         view_layout.addWidget(self._appearance_btn)
         view_layout.addWidget(self._anim_toggle_btn)
@@ -1307,6 +1433,34 @@ class UnitCellViewerDialog(QDialog):
             logger.exception("Ray-traced frame %d failed", frame_idx)
             return QImage()
         return QImage(str(image_path))
+
+    def _on_import_structure(self):
+        """Load a structure file directly when one wasn't auto-loaded from a folder."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Structure File",
+            "",
+            "Structure Files (*.txt *.dat);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            structure = Structure.from_file(path)
+        except Exception as exc:
+            logger.exception("Failed to load structure file: %s", exc)
+            QMessageBox.warning(self, "Error", f"Failed to load structure file:\n{exc}")
+            return
+
+        if structure.cryst is None and not structure.templates:
+            QMessageBox.warning(
+                self,
+                "Invalid Structure",
+                "No lattice parameters or molecule templates could be parsed "
+                "from that file.",
+            )
+            return
+
+        self.set_structure(structure, structure.cryst)
 
     def _on_import_net(self):
         if not (self._structure and self._structure.connections):
@@ -1532,3 +1686,46 @@ class UnitCellViewerDialog(QDialog):
         root = self._sel_tree.invisibleRootItem()
         for i in range(root.childCount()):
             _apply(root.child(i))
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point (``cgaspects-uc``)
+# ---------------------------------------------------------------------------
+
+
+def main():
+    """Launch the Unit Cell Viewer as a standalone window (``cgaspects-uc``)."""
+    import argparse
+    import sys
+
+    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtWidgets import QApplication
+
+    parser = argparse.ArgumentParser(
+        description="Open the CGAspects Unit Cell / Crystal Net viewer."
+    )
+    parser.add_argument(
+        "structure",
+        nargs="?",
+        help="Optional CrystoGen structure file to load on startup.",
+    )
+    args = parser.parse_args()
+
+    fmt = QSurfaceFormat()
+    fmt.setVersion(3, 3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("CGAspects Unit Cell Viewer")
+
+    dialog = UnitCellViewerDialog()
+    if args.structure:
+        structure = Structure.from_file(args.structure)
+        dialog.set_structure(structure, structure.cryst)
+    dialog.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

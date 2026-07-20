@@ -43,6 +43,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -318,6 +319,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(e.g. a SLURM array task id); default: all frames")
     p.add_argument("--export-only", action="store_true",
                    help="write scene files only; do not invoke the renderer")
+    p.add_argument("--stream", action="store_true",
+                   help="render each frame right after writing its scene file, then "
+                        "delete the scene file, so the (large) scene files never all "
+                        "pile up on disk; frames whose PNG already exists are skipped "
+                        "without writing a scene at all")
+    p.add_argument("--keep-scenes", action="store_true",
+                   help="with --stream, keep each scene file instead of deleting it "
+                        "once its PNG is rendered")
     p.add_argument("--overwrite", action="store_true",
                    help="re-render frames whose PNG already exists")
 
@@ -468,38 +477,49 @@ def main(argv: list[str] | None = None) -> int:
             antialiasing=args.aa,
         )
 
+    if args.export_only and args.stream:
+        raise SystemExit("--export-only and --stream are mutually exclusive: the "
+                         "first writes scene files without rendering, the second "
+                         "renders and then removes them.")
+
     background = _parse_color(args.background)
     out_dir = args.output
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = rt.SCENE_SUFFIX[args.backend]
 
-    # ---------------------------------------------------------------- export
-    scene_paths: dict[int, Path] = {}
-    for i in frame_ids:
-        t = timeline.time_at_frame(i)
-        snapshot, data_frame = timeline.get_state_at_time(t)
+    # Serialises just the lazy-movie disk read and cache mutation, so scenes can
+    # be built inside worker threads while the heavy render runs unlocked.
+    movie_lock = threading.Lock()
+
+    def frame_scene(i: int):
+        """Build the RTScene for animation frame *i*, or (None, reason) to skip."""
+        snapshot, data_frame = timeline.get_state_at_time(timeline.time_at_frame(i))
         movie_idx = args.default_frame if data_frame is None else data_frame
         movie_idx = max(0, min(movie_idx, n_movie - 1))
-        arr = movie_frame(movie_idx)
+        with movie_lock:
+            arr = movie_frame(movie_idx)
         if arr is None:
-            logger.warning("Frame %d: XYZ movie frame %d has no point data — "
-                           "skipping", i, movie_idx)
-            continue
+            return None, f"XYZ movie frame {movie_idx} has no point data"
         scene = build_scene_from_snapshot(
             arr, snapshot, args.width, args.height,
             render_settings=rs, photoreal=photoreal, background=background,
             fov_deg=args.fov, ortho_size=args.ortho_size,
         )
         if not len(scene.spheres):
-            logger.warning("Frame %d: no visible points (slice planes removed "
-                           "everything?) — skipping", i)
-            continue
-        scene_path = out_dir / f"frame_{i:05d}{suffix}"
-        rt.write_scene(scene, args.backend, scene_path)
-        scene_paths[i] = scene_path
+            return None, "no visible points (slice planes removed everything?)"
+        return scene, None
 
-    print(f"Wrote {len(scene_paths)} scene file(s) to {out_dir}/")
+    # ------------------------------------------------------------- export only
     if args.export_only:
+        written = 0
+        for i in frame_ids:
+            scene, reason = frame_scene(i)
+            if scene is None:
+                logger.warning("Frame %d: %s — skipping", i, reason)
+                continue
+            rt.write_scene(scene, args.backend, out_dir / f"frame_{i:05d}{suffix}")
+            written += 1
+        print(f"Wrote {written} scene file(s) to {out_dir}/")
         print(f"Render elsewhere with e.g.:\n"
               f"  ls {out_dir}/*{suffix} | parallel -j 8 povray +I{{}} +O{{.}}.png "
               f"+W{args.width} +H{args.height} +FN +A -D -P +WT8")
@@ -516,35 +536,60 @@ def main(argv: list[str] | None = None) -> int:
         extra = [f"+WT{threads}"]
     else:
         extra = ["-numthreads", str(threads)]
-    logger.info("Rendering %d frame(s): %d concurrent, %d threads each",
-                len(scene_paths), jobs, threads)
+
+    def render_frame(i: int) -> tuple[str, str | None]:
+        """Full per-frame pipeline: skip-if-done, build, write, render, clean up.
+
+        Runs in a worker thread. The PNG check comes first so a frame that is
+        already rendered never writes a scene file, and in stream mode the scene
+        file is removed as soon as its PNG exists — so at most ``jobs`` of them
+        are on disk at any moment instead of one per frame.
+        """
+        image_path = out_dir / f"frame_{i:05d}.png"
+        if image_path.exists() and not args.overwrite:
+            return "skipped", "PNG exists"
+        scene, reason = frame_scene(i)
+        if scene is None:
+            return "skipped", reason
+        scene_path = out_dir / f"frame_{i:05d}{suffix}"
+        rt.write_scene(scene, args.backend, scene_path)
+        try:
+            _render_one(args.backend, scene_path, image_path,
+                        args.width, args.height, args.aa, args.timeout, extra)
+        finally:
+            if args.stream and not args.keep_scenes:
+                scene_path.unlink(missing_ok=True)
+        return "done", None
+
+    logger.info("Rendering %d frame(s), %s: %d concurrent, %d threads each",
+                len(frame_ids),
+                "streaming (scene files removed after render)" if args.stream
+                else "scene files kept",
+                jobs, threads)
 
     failed: list[int] = []
-    done = 0
+    done = skipped = 0
+    total = len(frame_ids)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = {}
-        for i, scene_path in scene_paths.items():
-            image_path = out_dir / f"frame_{i:05d}.png"
-            if image_path.exists() and not args.overwrite:
-                logger.info("frame %05d: exists, skipping (use --overwrite)", i)
-                done += 1
-                continue
-            fut = pool.submit(_render_one, args.backend, scene_path, image_path,
-                              args.width, args.height, args.aa, args.timeout, extra)
-            futures[fut] = i
+        futures = {pool.submit(render_frame, i): i for i in frame_ids}
         for fut in as_completed(futures):
             i = futures[fut]
             try:
-                fut.result()
-                done += 1
-                print(f"frame {i:05d} done ({done}/{len(scene_paths)})")
+                status, reason = fut.result()
+                if status == "done":
+                    done += 1
+                    print(f"frame {i:05d} done ({done + skipped}/{total})")
+                else:
+                    skipped += 1
+                    logger.info("frame %05d: skipped (%s)", i, reason)
             except Exception as exc:
                 failed.append(i)
                 logger.error("frame %05d FAILED: %s", i, exc)
 
     if failed:
         raise SystemExit(f"{len(failed)} frame(s) failed: {sorted(failed)}")
-    print(f"Rendered {done} frame(s) to {out_dir}/")
+    print(f"Rendered {done} frame(s) to {out_dir}/"
+          + (f" ({skipped} already present)" if skipped else ""))
 
     if args.video:
         _stitch_video(out_dir, args.video, timeline.fps)

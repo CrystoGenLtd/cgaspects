@@ -55,6 +55,7 @@ documentation = "https://crystalgrowerorg.github.io/cgaspects/"
 [project.scripts]
 cgaspects = "cgaspects.gui.mainwindow:main"
 cgaspects-render = "cgaspects.render_cli:main"
+cgaspects-uc = "cgaspects.gui.dialogs.unit_cell_viewer_dialog:main"
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]
