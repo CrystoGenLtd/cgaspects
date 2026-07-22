@@ -255,6 +255,31 @@ class Frames:
             return self[idx].raw
         return None
 
+    # --- lazy index (de)serialization ---
+    def lazy_index_records(self) -> Optional[list[tuple[int, int, str]]]:
+        """The (data_offset, n_atoms, comment) index for a lazy container.
+
+        Returns None for eager containers (which have no on-disk index). Lets a
+        caller persist the index so a later run can rebuild the container without
+        re-scanning the whole XYZ file.
+        """
+        return list(self._lazy_index) if self._lazy else None
+
+    @classmethod
+    def from_lazy_index(
+        cls, filepath: Path, records: Iterable[tuple[int, int, str]]
+    ) -> "Frames":
+        """Rebuild a lazy container from a previously saved index.
+
+        The caller must confirm ``filepath`` is unchanged since the index was
+        built (e.g. via size/mtime); a stale index would seek to wrong byte
+        offsets.
+        """
+        return cls(
+            _filepath=Path(filepath),
+            _lazy_index=[(int(o), int(n), str(c)) for o, n, c in records],
+        )
+
 
 @dataclass
 class CrystalCloud:

@@ -297,6 +297,70 @@ def _parse_color(spec: str) -> tuple:
     return tuple(parts)
 
 
+# Sentinel: --index-cache given with no path → derive one next to the XYZ.
+_INDEX_CACHE_AUTO = "\0auto"
+_INDEX_CACHE_VERSION = 1
+
+
+def _index_cache_path(xyz: Path, spec: str | None) -> Path | None:
+    """Resolve the --index-cache spec to a concrete path, or None if disabled."""
+    if spec is None:
+        return None
+    if spec == _INDEX_CACHE_AUTO:
+        return xyz.with_name(xyz.name + ".cgidx.json")
+    return Path(spec)
+
+
+def _load_movie_index(xyz: Path, cache_spec: str | None):
+    """Return a lazily-indexed Frames for *xyz*, using a sidecar cache if enabled.
+
+    The cache stores the byte-offset index keyed on the XYZ's size and mtime, so
+    repeated runs (e.g. every task of a SLURM array) skip the full-file scan. A
+    changed XYZ invalidates the cache automatically. Writes are atomic (temp +
+    rename), so concurrent array tasks can't read a half-written cache.
+    """
+    from .fileio.xyz_file import CrystalCloud, Frames
+
+    cache = _index_cache_path(xyz, cache_spec)
+    st = xyz.stat()
+
+    if cache is not None and cache.exists():
+        try:
+            data = json.loads(cache.read_text())
+            fresh = (data.get("version") == _INDEX_CACHE_VERSION
+                     and data.get("size") == st.st_size
+                     and data.get("mtime_ns") == st.st_mtime_ns)
+            if fresh:
+                movie = Frames.from_lazy_index(xyz, data["index"])
+                logger.info("Loaded frame index from cache: %s (%d frames)",
+                            cache, len(movie))
+                return movie
+            logger.info("Index cache %s is stale (XYZ changed) — reindexing", cache)
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("Ignoring unreadable index cache %s: %s", cache, exc)
+
+    logger.info("Indexing XYZ: %s", xyz)
+    movie = CrystalCloud.parse_xyz_file(xyz)
+
+    if cache is not None:
+        records = movie.lazy_index_records()
+        if records is None:
+            logger.warning("XYZ produced a non-lazy container; not caching index")
+        else:
+            payload = {"version": _INDEX_CACHE_VERSION, "size": st.st_size,
+                       "mtime_ns": st.st_mtime_ns, "xyz": xyz.name, "index": records}
+            tmp = cache.with_name(f"{cache.name}.tmp{os.getpid()}")
+            try:
+                tmp.write_text(json.dumps(payload))
+                tmp.replace(cache)
+                logger.info("Wrote frame index cache: %s (%d frames)",
+                            cache, len(records))
+            except OSError as exc:
+                logger.warning("Could not write index cache %s: %s", cache, exc)
+                tmp.unlink(missing_ok=True)
+    return movie
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cgaspects-render",
@@ -308,6 +372,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("animation", type=Path, help="animation.json saved from the GUI timeline")
     p.add_argument("-o", "--output", type=Path, default=Path("render_frames"),
                    help="output directory for scene files and PNGs")
+    p.add_argument("--index-cache", nargs="?", const=_INDEX_CACHE_AUTO, default=None,
+                   metavar="PATH",
+                   help="cache the XYZ frame index so later runs skip the "
+                        "full-file scan (e.g. every task of a SLURM array). Bare "
+                        "flag writes <xyz>.cgidx.json next to the XYZ; or give a "
+                        "path. Auto-invalidated when the XYZ changes.")
     p.add_argument("--info", action="store_true",
                    help="print timeline info (frame count, fps, duration) and exit")
 
@@ -361,6 +431,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--video", type=Path, default=None,
                    help="stitch rendered frames into this file with ffmpeg")
+    p.add_argument("--video-scale", metavar="WxH|FACTOR", default=None,
+                   help="downscale (or upscale) the stitched video: an explicit "
+                        "size like 1920x1080 (use -2 for a dimension to keep "
+                        "aspect, e.g. 1280x-2), or a factor like 0.5. Renders can "
+                        "be done at high resolution for supersampled AA, then "
+                        "scaled down here.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -396,15 +472,47 @@ def _pick_h264_encoder(ffmpeg: str) -> list[str]:
         "ffmpeg with libx264) and re-run with --video.")
 
 
-def _stitch_video(out_dir: Path, video: Path, fps: int) -> None:
+def _scale_filter(spec: str) -> str:
+    """Translate a --video-scale value into an ffmpeg ``scale`` filter.
+
+    Accepts an explicit size ('1920x1080' or '1920:1080'; use -2 for a dimension
+    to preserve aspect ratio, e.g. '1280x-2'), or a bare factor ('0.5') that
+    scales both dimensions. Output dimensions are forced even, as yuv420p H.264
+    requires.
+    """
+    s = spec.replace("x", ":").replace("X", ":")
+    if ":" in s:
+        w_str, h_str = s.split(":", 1)
+        try:
+            w, h = int(w_str), int(h_str)
+        except ValueError:
+            raise SystemExit(f"--video-scale {spec!r}: use 'WxH' (e.g. 1920x1080) "
+                             f"or a factor (e.g. 0.5)")
+        # Round positive explicit sizes down to even; leave -1/-2 aspect flags.
+        w = w - (w % 2) if w > 0 else w
+        h = h - (h % 2) if h > 0 else h
+        return f"scale={w}:{h}"
+    try:
+        factor = float(spec)
+    except ValueError:
+        raise SystemExit(f"--video-scale {spec!r}: use 'WxH' (e.g. 1920x1080) "
+                         f"or a factor (e.g. 0.5)")
+    if factor <= 0:
+        raise SystemExit(f"--video-scale {spec!r}: factor must be positive")
+    return f"scale=trunc(iw*{factor}/2)*2:trunc(ih*{factor}/2)*2"
+
+
+def _stitch_video(out_dir: Path, video: Path, fps: int, scale: str | None = None) -> None:
     ffmpeg = shutil.which("ffmpeg")
     pattern = str(out_dir / "frame_%05d.png")
+    vf = ["-vf", _scale_filter(scale)] if scale else []
     if ffmpeg is None:
         raise SystemExit("ffmpeg not found on PATH. Frames are rendered; stitch "
                          "them with:\n  ffmpeg -y -framerate " + str(fps) +
-                         f" -i {pattern} -c:v libx264 -pix_fmt yuv420p {video}")
+                         f" -i {pattern} {' '.join(vf)} "
+                         f"-c:v libx264 -pix_fmt yuv420p {video}")
     cmd = [ffmpeg, "-y", "-framerate", str(fps), "-i", pattern,
-           *_pick_h264_encoder(ffmpeg), "-pix_fmt", "yuv420p", str(video)]
+           *vf, *_pick_h264_encoder(ffmpeg), "-pix_fmt", "yuv420p", str(video)]
     logger.info("Stitching video: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -422,7 +530,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # Imports deferred past --help so argparse stays snappy; keyframe/raytrace
     # modules use PySide6 value types only — no display or QApplication needed.
-    from .fileio.xyz_file import CrystalCloud
     from .gui.animation.keyframe import AnimationTimeline
     from .gui.visualisation import raytrace_export as rt
     from .gui.visualisation.shading import MATERIAL_PRESETS, RenderSettings
@@ -446,8 +553,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Lazy index, like the GUI: one readline pass records byte offsets; frame
     # data is parsed from disk only when a rendered frame actually needs it.
-    logger.info("Indexing XYZ: %s", args.xyz)
-    movie = CrystalCloud.parse_xyz_file(args.xyz)
+    # With --index-cache the offsets are saved so later runs skip the scan.
+    movie = _load_movie_index(args.xyz, args.index_cache)
     n_movie = len(movie)
     if n_movie == 0:
         raise SystemExit(f"{args.xyz}: no readable XYZ frames")
@@ -592,7 +699,7 @@ def main(argv: list[str] | None = None) -> int:
           + (f" ({skipped} already present)" if skipped else ""))
 
     if args.video:
-        _stitch_video(out_dir, args.video, timeline.fps)
+        _stitch_video(out_dir, args.video, timeline.fps, scale=args.video_scale)
     return 0
 
 
