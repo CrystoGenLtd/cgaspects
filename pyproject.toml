@@ -1,6 +1,6 @@
 [project]
 name = "cgaspects"
-version = "0.9.11"
+version = "0.9.12"
 requires-python = ">=3.10"
 description = "An analysis tool and companion for CrystoGen (formerly CrystalGrower)"
 

@@ -203,19 +203,80 @@ class TestShapeAnalyser(unittest.TestCase):
         np.testing.assert_almost_equal(sa_vol_ratio[1], expected_vol, decimal=5)
         np.testing.assert_almost_equal(sa_vol_ratio[2], expected_ratio, decimal=5)
 
-    def test_shape_info_basic(self):
-        """Test basic shape information calculation."""
+    def test_shape_info_cube(self):
+        """A 2x2x2 cube classifies as a Block with unit aspect ratios."""
         # Create a simple cube
-        xyz = np.array([[0, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 2]])
+        xyz = np.array([
+                [0, 0, 0], [2, 0, 0], [0, 2, 0], [2, 2, 0],
+                [0, 0, 2], [2, 0, 2], [0, 2, 2], [2, 2, 2],
+            ]
+        )
+
+        shape_metrics = self.analyser.shape_info(xyz, get_sa_vol=False)
+
+        # A perfect cube has three equal PCA eigenvalues, so the principal axes
+        # are degenerate and the reported extents are along an arbitrary rotated
+        # basis (2*sqrt(2) on two axes). Aspect ratios and shape stay stable.
+        self.assertAlmostEqual(shape_metrics.x, 2.0 * np.sqrt(2), places=5)
+        self.assertAlmostEqual(shape_metrics.y, 2.0, places=5)
+        self.assertAlmostEqual(shape_metrics.z, 2.0 * np.sqrt(2), places=5)
+        self.assertAlmostEqual(shape_metrics.aspect1, 1.0, places=1)
+        self.assertAlmostEqual(shape_metrics.aspect2, 1.0, places=1)
+        self.assertEqual(shape_metrics.shape, "Block")
+
+    def test_shape_info_plate(self):
+        """A 2x2x1 slab classifies as a Plate."""
+        # Create a simple plate
+        xyz = np.array([
+                [0, 0, 0], [2, 0, 0], [0, 2, 0], [2, 2, 0],
+                [0, 0, 1], [2, 0, 1], [0, 2, 1], [2, 2, 1],
+            ]
+        )
 
         shape_metrics = self.analyser.shape_info(xyz, get_sa_vol=False)
 
         self.assertAlmostEqual(shape_metrics.x, 2.0, places=5)
         self.assertAlmostEqual(shape_metrics.y, 2.0, places=5)
+        self.assertAlmostEqual(shape_metrics.z, 1.0, places=5)
+        self.assertAlmostEqual(shape_metrics.aspect1, 0.5, places=1)
+        self.assertAlmostEqual(shape_metrics.aspect2, 1.0, places=1)
+        self.assertEqual(shape_metrics.shape, "Plate")
+
+    def test_shape_info_needle(self):
+        """A 2x2x5 rod classifies as a Needle."""
+        # Create a simple needle
+        xyz = np.array([
+                [0, 0, 0], [2, 0, 0], [0, 2, 0], [2, 2, 0],
+                [0, 0, 5], [2, 0, 5], [0, 2, 5], [2, 2, 5],
+            ]
+        )
+
+        shape_metrics = self.analyser.shape_info(xyz, get_sa_vol=False)
+
+        self.assertAlmostEqual(shape_metrics.x, 5.0, places=5)
+        self.assertAlmostEqual(shape_metrics.y, 2.0, places=5)
         self.assertAlmostEqual(shape_metrics.z, 2.0, places=5)
         self.assertAlmostEqual(shape_metrics.aspect1, 1.0, places=1)
-        self.assertAlmostEqual(shape_metrics.aspect2, 1.0, places=1)
-        self.assertEqual(shape_metrics.shape, "Block")
+        self.assertAlmostEqual(shape_metrics.aspect2, 0.4, places=1)
+        self.assertEqual(shape_metrics.shape, "Needle")
+
+    def test_shape_info_lath(self):
+        """A 2x5x1 elongated slab classifies as a Lath."""
+        # Create a simple lath
+        xyz = np.array([
+                [0, 0, 0], [2, 0, 0], [0, 5, 0], [2, 5, 0],
+                [0, 0, 1], [2, 0, 1], [0, 5, 1], [2, 5, 1],
+            ]
+        )
+
+        shape_metrics = self.analyser.shape_info(xyz, get_sa_vol=False)
+
+        self.assertAlmostEqual(shape_metrics.x, 5.0, places=5)
+        self.assertAlmostEqual(shape_metrics.y, 2.0, places=5)
+        self.assertAlmostEqual(shape_metrics.z, 1.0, places=5)
+        self.assertAlmostEqual(shape_metrics.aspect1, 0.5, places=1)
+        self.assertAlmostEqual(shape_metrics.aspect2, 0.4, places=1)
+        self.assertEqual(shape_metrics.shape, "Lath")
 
     def test_shape_info_with_sa_vol(self):
         """Test shape information with surface area and volume."""
@@ -246,7 +307,7 @@ class TestShapeAnalyser(unittest.TestCase):
         self.assertIn(0, self.analyser.frame_metrics)
         metrics = self.analyser.get_frame_metrics(0)
         self.assertIsNotNone(metrics)
-        self.assertEqual(metrics.shape, "Block")
+        self.assertEqual(metrics.shape, "Plate")
 
     def test_analyse_crystal_all_frames(self):
         """Test analysing all frames of a crystal."""

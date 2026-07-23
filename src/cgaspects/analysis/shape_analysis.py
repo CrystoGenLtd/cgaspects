@@ -97,6 +97,8 @@ class ShapeAnalyser:
         if xyz_vals is None or len(xyz_vals) < 3:
             return None
 
+        xyz_vals = xyz_vals - xyz_vals.mean(axis=0)
+
         # Perform PCA via SVD
         _, s, vh = np.linalg.svd(xyz_vals, full_matrices=False)
 
