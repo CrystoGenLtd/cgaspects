@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -33,7 +33,7 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -1863,6 +1863,18 @@
 
 <h1 id="shape-metrics">Shape Metrics<a class="headerlink" href="#shape-metrics" title="Permanent link">&para;</a></h1>
 <p>This page explains the quantitative shape metrics computed by CGAspects.</p>
+<div class="admonition warning">
+<p class="admonition-title">Length units are scaled by the unit-cell <em>a</em> length</p>
+<p>The coordinates in a CrystoGen <code>.XYZ</code> file are in Ångströms, but they
+are <strong>scaled by the unit-cell <em>a</em> lattice parameter</strong> — i.e. they are
+expressed in units of <em>a</em>, not raw Å. CGAspects performs <strong>no</strong> rescaling by default:
+every length-valued metric below (L/M/S dimensions, surface area, volume,
+SA:Vol) is reported in whatever units the input file uses. The "Å"-based
+units in the table are therefore only literally correct when the <em>a</em> length
+is 1 Å; otherwise multiply by <em>a</em> (or <em>a</em>², <em>a</em>³, 1/<em>a</em> as appropriate) to
+recover physical Ångström values. Dimensionless quantities (aspect ratios,
+shape class) are unaffected.</p>
+</div>
 <hr />
 <h2 id="principal-component-analysis-pca">Principal Component Analysis (PCA)<a class="headerlink" href="#principal-component-analysis-pca" title="Permanent link">&para;</a></h2>
 <p>CGAspects uses <strong>Principal Component Analysis (PCA)</strong> to find the three principal dimensions of a crystal point cloud. PCA is performed via Singular Value Decomposition (SVD) of the centered coordinate matrix.</p>
@@ -1912,8 +1924,15 @@
 <p>Both ratios range from 0 to 1. See <a href="../zingg-classification/">Zingg Classification</a> for how these ratios map to crystal shape classes.</p>
 <hr />
 <h2 id="crystal-extent-along-directions">Crystal Extent Along Directions<a class="headerlink" href="#crystal-extent-along-directions" title="Permanent link">&para;</a></h2>
-<p>When <strong>Crystallographic Direction Analysis (CDA)</strong> is enabled in <a href="../../analysis/aspect-ratios/">Aspect Ratio Analysis</a>, CGAspects additionally computes the extent of the crystal along each selected crystallographic direction.</p>
-<p>For a direction vector <strong>d</strong> (unit vector), the extent is:</p>
+<p><strong>Crystallographic Direction Analysis (CDA)</strong> describes the extent of the crystal along selected crystallographic directions.</p>
+<div class="admonition note">
+<p class="admonition-title">CDA is currently read from simulation output, not computed</p>
+<p>At present CGAspects does <strong>not</strong> measure CDA itself. The per-direction
+values used in <a href="../../analysis/aspect-ratios/">Aspect Ratio Analysis</a> are
+<strong>read from the CrystoGen <code>simulation_parameters.txt</code> output</strong>. The
+in-code projection described below is planned but not yet implemented.</p>
+</div>
+<p>Once computed in-code, the extent along a direction vector <strong>d</strong> (unit vector) will be:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>extent = max(points · d) - min(points · d)
 </code></pre></div>
 <p>where the dot product projects each point onto the direction. This gives the crystal's "width" in that specific crystallographic direction, regardless of orientation.</p>
@@ -1970,7 +1989,7 @@
 <tr>
 <td>S, M, L dimensions</td>
 <td>PCA / SVD</td>
-<td>Å</td>
+<td>Å*</td>
 </tr>
 <tr>
 <td>S:M aspect ratio</td>
@@ -1985,17 +2004,17 @@
 <tr>
 <td>Surface area</td>
 <td>Convex hull</td>
-<td>Å²</td>
+<td>Å²*</td>
 </tr>
 <tr>
 <td>Volume</td>
 <td>Convex hull</td>
-<td>Å³</td>
+<td>Å³*</td>
 </tr>
 <tr>
 <td>SA:Vol ratio</td>
 <td>Convex hull</td>
-<td>Å⁻¹</td>
+<td>Å⁻¹*</td>
 </tr>
 <tr>
 <td>Shape class</td>
@@ -2004,11 +2023,12 @@
 </tr>
 <tr>
 <td>Direction extent</td>
-<td>Dot product projection</td>
-<td>Å</td>
+<td>Read from <code>simulation_parameters.txt</code> (in-code projection planned)</td>
+<td>Å*</td>
 </tr>
 </tbody>
 </table>
+<p>* Scaled by the unit-cell <em>a</em> length — see the warning at the top of this page.</p>
 
 
 
@@ -2069,7 +2089,7 @@
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.tabs.link"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
