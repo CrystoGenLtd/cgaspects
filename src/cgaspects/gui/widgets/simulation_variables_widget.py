@@ -23,12 +23,6 @@ class SimulationVariablesWidget(QWidget):
 
         self.setLayout(layout)
 
-    def _calculate_step(self, index):
-        if index < len(self.values) - 1:
-            return self.values[index + 1] - self.values[index]
-        else:
-            return self.values[index] - self.values[index - 1]
-
     def variableNames(self):
         return tuple(x[0] for x in self.sliders)
 
