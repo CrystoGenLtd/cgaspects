@@ -1545,26 +1545,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.log_message(f"{len(self.xyz_files)} XYZ files set to visualiser!", "info")
 
     def init_crystal(self):
-        self.movie_controls_frame.hide()
         logger.debug("Initializing crystal!")
         self.openglwidget.pass_XYZ(self.crystal.get_raw_frame_coords(0))
-
-        if len(self.crystal) > 1:
-            self.playingState = False
-            self.frame_timer.stop()
-            self.movie_controls_frame.show()
-            self.frame_list = list(range(1, len(self.crystal) + 1))
-            self.frame = 0
-            logger.debug("Frames: %s", self.frame_list)
-
-            num_frames = len(self.frame_list)
-
-            self.frame_slider.setMinimum(0)
-            self.frame_slider.setMaximum(num_frames - 1)
-
-            self.frame_spinBox.setMinimum(0)
-            self.frame_spinBox.setMaximum(num_frames - 1)
-            self.frameMaxLabel.setText(f"{num_frames - 1}")
+        self._sync_movie_controls(preserve_frame=False)
 
         try:
             self.openglwidget.initGeometry()
@@ -1605,17 +1588,21 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
             return self.crystal
 
+    def clear_XYZ_info(self):
+        """Blank the crystal info panel — no data to describe."""
+        self.crystal_info.aspectRatio1 = None
+        self.crystal_info.aspectRatio2 = None
+        self.crystal_info.shapeClass = "N/A"
+        self.crystal_info.surfaceAreaVolumeRatio = None
+        self.crystal_info.surfaceArea = None
+        self.crystal_info.volume = None
+        self.crystal_info.pointCount = None
+        self.crystalInfoChanged.emit(self.crystal_info)
+
     def update_XYZ_info(self):
         vd = self.openglwidget._visual_data
         if vd is None or vd.n_centroids == 0:
-            self.crystal_info.aspectRatio1 = None
-            self.crystal_info.aspectRatio2 = None
-            self.crystal_info.shapeClass = "N/A"
-            self.crystal_info.surfaceAreaVolumeRatio = None
-            self.crystal_info.surfaceArea = None
-            self.crystal_info.volume = None
-            self.crystal_info.pointCount = None
-            self.crystalInfoChanged.emit(self.crystal_info)
+            self.clear_XYZ_info()
             return
 
         if self.openglwidget.is_atom_view and vd.templates:
@@ -1630,13 +1617,58 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         worker_xyz.signals.message.connect(self.update_statusbar)
         self.threadpool.start(worker_xyz)
 
+    def _sync_movie_controls(self, preserve_frame=True):
+        """Match the frame controls to the crystal that is currently loaded.
+
+        Called whenever the loaded simulation changes, so the slider and spin box
+        never advertise a frame other than the one being displayed. Returns the
+        frame that should be shown, or None when the crystal isn't a movie.
+        """
+        num_frames = len(self.crystal) if self.crystal is not None else 0
+
+        if num_frames <= 1:
+            self.frame_list = []
+            self.frame = 0
+            self.stop_movie()
+            self.movie_controls_frame.hide()
+            return None
+
+        self.frame_list = list(range(1, num_frames + 1))
+        logger.debug("Frames: %s", self.frame_list)
+
+        if preserve_frame:
+            frame = min(self.frame, num_frames - 1)
+        else:
+            frame = 0
+            self.stop_movie()
+        self.frame = frame
+
+        # block to prevent the range/value changes triggering another update
+        with QSignalBlocker(self.frame_slider):
+            self.frame_slider.setMinimum(0)
+            self.frame_slider.setMaximum(num_frames - 1)
+            self.frame_slider.setValue(frame)
+        with QSignalBlocker(self.frame_spinBox):
+            self.frame_spinBox.setMinimum(0)
+            self.frame_spinBox.setMaximum(num_frames - 1)
+            self.frame_spinBox.setValue(frame)
+        self.frameMaxLabel.setText(f"{num_frames - 1}")
+
+        self.movie_controls_frame.show()
+        return frame
+
+    def stop_movie(self):
+        self.frame_timer.stop()
+        self.playingState = False
+        self.playPauseButton.setIcon(self.playIcon)
+
     def update_movie(self, frame):
         if frame != self.frame:
             self.update_frame(frame)
             # block to prevent double updates
             with QSignalBlocker(self.frame_slider):
                 self.frame_slider.setValue(frame)
-            with QSignalBlocker(self.xyz_spinBox):
+            with QSignalBlocker(self.frame_spinBox):
                 self.frame_spinBox.setValue(frame)
 
     def next_frame(self):
@@ -1666,9 +1698,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         if self.playingState:
             # pause playing
-            self.playPauseButton.setIcon(self.playIcon)
-            self.frame_timer.stop()
-            self.playingState = False
+            self.stop_movie()
         else:
             # play movie
             self.playPauseButton.setIcon(self.pauseIcon)
@@ -2024,21 +2054,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self._apply_coord_colours(self._active_colour_cmap)
         if self.openglwidget.crystal is not None:
             self.crystal = self.openglwidget.crystal
-        self.movie_controls_frame.hide()
 
         if self.crystal is not None and self.crystal.empty:
-            self.update_XYZ_info(None)
+            self.movie_controls_frame.hide()
+            self.clear_XYZ_info()
             return
 
-        if self.crystal is not None and len(self.crystal) > 1:
-            self.movie_controls_frame.show()
-            self.frame_list = list(range(1, len(self.crystal) + 1))
-            num_frames = len(self.frame_list)
-            self.frame_slider.setMinimum(0)
-            self.frame_slider.setMaximum(num_frames - 1)
-            self.frame_spinBox.setMinimum(0)
-            self.frame_spinBox.setMaximum(num_frames - 1)
-            self.frameMaxLabel.setText(f"{num_frames - 1}")
+        # Keep the movie on the frame the slider is showing; the GL widget always
+        # loads frame 0 for a newly selected simulation.
+        frame = self._sync_movie_controls()
 
         # block to prevent double updates
         with QSignalBlocker(self.xyzFilenameListWidget):
@@ -2046,7 +2070,10 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         with QSignalBlocker(self.xyz_spinBox):
             self.xyz_spinBox.setValue(value)
 
-        self.update_XYZ_info()
+        if frame:
+            self.update_frame(frame)  # also refreshes the XYZ info
+        else:
+            self.update_XYZ_info()
 
         self._update_vis_mode_availability()
         self._update_docking_for_current_xyz()
