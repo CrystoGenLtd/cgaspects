@@ -13,6 +13,11 @@ model matrix (camera zoom scale · object rotation) and every radius scaled by
 The default material maps the live :class:`RenderSettings` one-to-one; the
 optional :class:`PhotorealOptions` layers on radiosity/ambient-occlusion, soft
 shadows, reflection and focal blur for publication-quality stills.
+
+Colours are the same 0-1 values the GL shader writes straight to the
+framebuffer — display-referred, not linear — so the scene gamma is declared to
+match the renderer's output gamma. Getting that wrong is the difference
+between a faithful "Match GL" render and one roughly 50% too bright.
 """
 
 from __future__ import annotations
@@ -87,6 +92,9 @@ class RTScene:
     height: int
     material: RTMaterial
     photoreal: PhotorealOptions | None = None   # None => "Match GL"
+    # Per-sphere AO multiplier in [0, 1] (1 = unoccluded), mirroring the GL
+    # shader's ``1 - ao_strength * occlusion``. None when AO is off.
+    ao: np.ndarray | None = None
 
     @property
     def aspect(self) -> float:
@@ -122,10 +130,27 @@ def _reshape(raw, cols):
     return arr
 
 
+def _ao_factors(renderer, rs) -> np.ndarray | None:
+    """The GL shader's per-sphere AO multiplier, or None when AO is disabled.
+
+    Occlusion is the last column of the renderer's instance buffer, computed
+    once when AO was switched on; reading it back means the ray-traced image
+    darkens exactly the spheres the viewport darkens.
+    """
+    if not rs.ao_enabled:
+        return None
+    inst = getattr(renderer, "instances", None)
+    if inst is None:
+        return None
+    occ = np.asarray(inst, dtype=np.float32).reshape(-1, renderer._gpu_floats)[:, -1]
+    return np.clip(1.0 - float(rs.ao_strength) * occ, 0.0, 1.0).astype(np.float32)
+
+
 def build_scene_from_widget(widget, width: int, height: int,
                             photoreal: PhotorealOptions | None = None) -> RTScene:
     """Snapshot the widget's current geometry, camera and material into an RTScene."""
     cam = widget.camera
+    rs = widget.render_settings
     model = cam.modelMatrix()               # scale · object-rotation
     scale = float(cam.scale)
     ps = float(widget.point_size)
@@ -139,6 +164,7 @@ def build_scene_from_widget(widget, width: int, height: int,
 
     spheres = np.zeros((0, 7), dtype=np.float32)
     cylinders = np.zeros((0, 10), dtype=np.float32)
+    ao = None
 
     if getattr(widget, "is_atom_view", False) and widget.atom_renderer is not None:
         atoms = _reshape(getattr(widget.atom_renderer, "_raw_points", None), 8)
@@ -146,6 +172,7 @@ def build_scene_from_widget(widget, width: int, height: int,
             centers = bake_centers(atoms[:, :3])
             radii = atoms[:, 7] * (ps / 6.0) * scale
             spheres = np.column_stack([centers, atoms[:, 3:6], radii]).astype(np.float32)
+            ao = _ao_factors(widget.atom_renderer, rs)
         bonds = _reshape(getattr(widget.bond_renderer, "instances", None), 10) \
             if getattr(widget, "bond_renderer", None) is not None else np.zeros((0, 10), np.float32)
         if len(bonds):
@@ -173,14 +200,22 @@ def build_scene_from_widget(widget, width: int, height: int,
         raw = getattr(widget.sphere_renderer, "_raw_points", None) \
             if getattr(widget, "sphere_renderer", None) is not None else None
         pts = _reshape(raw, 7)
+        from_spheres = bool(len(pts))
         if not len(pts) and getattr(widget, "point_cloud_renderer", None) is not None:
             pts = _reshape(getattr(widget.point_cloud_renderer, "points", None), 7)
         if len(pts):
             centers = bake_centers(pts[:, :3])
             radii = np.full(len(pts), ps * 0.2 * scale, dtype=np.float32)
             spheres = np.column_stack([centers, pts[:, 3:6], radii]).astype(np.float32)
+            # The point-cloud fallback is flat-shaded in GL, so it has no AO.
+            if from_spheres:
+                ao = _ao_factors(widget.sphere_renderer, rs)
 
-    rs = widget.render_settings
+    if rs.toon_levels:
+        logger.warning(
+            "Toon shading (%d bands) has no ray-tracer equivalent — the export "
+            "will use smooth shading.", rs.toon_levels)
+
     material = RTMaterial(
         ambient=rs.ambient, diffuse=rs.diffuse, specular=rs.specular,
         shininess=rs.shininess, specular_tint=rs.specular_tint,
@@ -213,6 +248,7 @@ def build_scene_from_widget(widget, width: int, height: int,
         height=int(height),
         material=material,
         photoreal=photoreal,
+        ao=ao,
     )
 
 
@@ -235,10 +271,15 @@ def write_povray(scene: RTScene, path: str | Path) -> Path:
 
     lines: list[str] = ["#version 3.7;", ""]
 
-    if pr and pr.ambient_occlusion:
+    # Colours here are the same sRGB-ish 0-1 values the GL shader writes
+    # straight to the framebuffer, so the scene gamma must match POV's output
+    # gamma (sRGB for PNG). With assumed_gamma 1.0 POV would treat them as
+    # linear and sRGB-encode on output, lifting a 0.5 grey to 0.74.
+    radiosity = bool(pr and pr.ambient_occlusion)
+    if radiosity:
         lines += [
             "global_settings {",
-            "  assumed_gamma 1.0",
+            "  assumed_gamma srgb",
             "  radiosity {",
             f"    count {max(pr.ao_samples, 20)}",
             "    nearest_count 10  error_bound 0.4  recursion_limit 2",
@@ -247,7 +288,7 @@ def write_povray(scene: RTScene, path: str | Path) -> Path:
             "}",
         ]
     else:
-        lines += ["global_settings { assumed_gamma 1.0 }"]
+        lines += ["global_settings { assumed_gamma srgb }"]
 
     lines += ["", f"background {{ color rgb {_v(scene.background)} }}", ""]
 
@@ -286,6 +327,9 @@ def write_povray(scene: RTScene, path: str | Path) -> Path:
     lines += ["}", ""]
 
     # Light — placed far along the world light direction from the scene centre.
+    # This is the *only* light: POV's `finish { ambient }` already reproduces
+    # the GL shader's flat ambient term, so an extra fill light would add it a
+    # second time and wash out every shadowed surface.
     light_pos = center + np.array(scene.light.direction) * extent * 6.0
     if pr and pr.soft_shadows:
         a = pr.shadow_softness * extent * 0.15
@@ -297,41 +341,57 @@ def write_povray(scene: RTScene, path: str | Path) -> Path:
             "",
         ]
     else:
+        # `parallel` makes this a true directional light, like the GL headlight;
+        # a plain point light at a finite distance visibly darkens the limbs.
         lines += [
             "light_source {",
             f"  {_v(light_pos)} color rgb {_v([m.brightness]*3)}",
+            f"  parallel point_at {_v(center)}",
             "}",
             "",
         ]
-    # A soft fill so shadowed sides aren't pure black (mirrors the GL ambient).
-    fill_pos = center - np.array(scene.light.direction) * extent * 6.0
-    lines += [
-        "light_source {",
-        f"  {_v(fill_pos)} color rgb {_v([m.ambient * m.brightness]*3)} shadowless",
-        "}",
-        "",
-    ]
 
-    finish = (f"finish {{ ambient {m.ambient:.4g} diffuse {m.diffuse:.4g}"
-              f" phong {m.specular:.4g} phong_size {max(m.shininess, 1):.4g}")
-    if m.specular_tint > 0:
-        # Tints the specular highlight toward the surface colour (metal look).
-        finish += f" metallic {m.specular_tint:.4g}"
-    if pr and pr.reflection > 0:
-        refl = f"reflection {{ {pr.reflection:.4g}"
+    def finish_for(ao: float) -> str:
+        """GL's ``(ambient + diffuse*lambert) * ao * albedo * brightness``.
+
+        The key light's colour carries ``brightness`` into the diffuse and
+        phong terms, so only the ambient term needs scaling by hand. Under
+        radiosity the bounce light *is* the ambient term, and POV would double
+        it if the finish supplied one as well.
+        """
+        amb = 0.0 if radiosity else m.ambient * m.brightness * ao
+        out = (f"finish {{ ambient {amb:.4g} diffuse {m.diffuse * ao:.4g}"
+               f" phong {m.specular * ao:.4g} phong_size {max(m.shininess, 1):.4g}")
         if m.specular_tint > 0:
-            refl += " metallic"
-        refl += " }"
-        finish += " " + refl
-    finish += " }"
+            # Tints the specular highlight toward the surface colour (metal look).
+            out += f" metallic {m.specular_tint:.4g}"
+        if pr and pr.reflection > 0:
+            refl = f"reflection {{ {pr.reflection:.4g}"
+            if m.specular_tint > 0:
+                refl += " metallic"
+            refl += " }"
+            out += " " + refl
+        return out + " }"
+
+    finish = finish_for(1.0)
+    # AO varies per sphere; quantise so at most ~100 distinct finish strings
+    # are built rather than one per sphere.
+    finish_cache: dict[int, str] = {}
 
     # Geometry. Group into unions so POV parses large scenes efficiently.
     if len(scene.spheres):
         lines.append("union {")
-        for x, y, z, r, g, b, rad in scene.spheres:
+        for i, (x, y, z, r, g, b, rad) in enumerate(scene.spheres):
+            if scene.ao is None:
+                fin = finish
+            else:
+                key = round(float(scene.ao[i]) * 100)
+                fin = finish_cache.get(key)
+                if fin is None:
+                    fin = finish_cache[key] = finish_for(key / 100.0)
             lines.append(
                 f"  sphere {{ <{x:.5g},{y:.5g},{z:.5g}>, {rad:.5g}"
-                f" pigment {{ rgb <{r:.4g},{g:.4g},{b:.4g}> }} {finish} }}")
+                f" pigment {{ rgb <{r:.4g},{g:.4g},{b:.4g}> }} {fin} }}")
         lines += ["}", ""]
 
     if len(scene.cylinders):
@@ -354,15 +414,18 @@ def write_povray(scene: RTScene, path: str | Path) -> Path:
 # --------------------------------------------------------------------------- #
 # Tachyon writer
 # --------------------------------------------------------------------------- #
-def _tex(m: RTMaterial, pr: PhotorealOptions | None, rgb) -> list[str]:
+def _tex(m: RTMaterial, pr: PhotorealOptions | None, rgb, ao: float = 1.0) -> list[str]:
     r, g, b = rgb
     refl = pr.reflection if pr else 0.0
     # A tinted highlight reads as metal; Tachyon exposes this as the phong type.
     phong_type = "Metal" if m.specular_tint > 0.5 else "Plastic"
+    # As in the POV writer: brightness rides the light colour for the diffuse
+    # and phong terms, so only ambient is scaled here.
     return [
-        f"  Texture Ambient {m.ambient:.4g} Diffuse {m.diffuse:.4g}"
-        f" Specular {refl:.4g} Opacity 1",
-        f"    Phong {phong_type} {m.specular:.4g} Phong_size {max(m.shininess, 1):.4g}"
+        f"  Texture Ambient {m.ambient * m.brightness * ao:.4g}"
+        f" Diffuse {m.diffuse * ao:.4g} Specular {refl:.4g} Opacity 1",
+        f"    Phong {phong_type} {m.specular * ao:.4g}"
+        f" Phong_size {max(m.shininess, 1):.4g}"
         f" Color {r:.4g} {g:.4g} {b:.4g} TexFunc 0",
     ]
 
@@ -411,19 +474,19 @@ def write_tachyon(scene: RTScene, path: str | Path) -> Path:
 
     light_pos = center + np.array(scene.light.direction) * extent * 6.0
     lb = m.brightness
+    # One light only — the texture's Ambient term already supplies the GL
+    # ambient, so a second light would double the scene's illumination.
     lines += [
-        f"Directional_Light Direction {-scene.light.direction[0]:.6g}"
-        f" {-scene.light.direction[1]:.6g} {-scene.light.direction[2]:.6g}"
-        f" Color {lb:.4g} {lb:.4g} {lb:.4g}",
         f"Light Center {light_pos[0]:.6g} {light_pos[1]:.6g} {light_pos[2]:.6g}"
         f" Rad {max(extent * 0.02, 0.1):.4g} Color {lb:.4g} {lb:.4g} {lb:.4g}",
         f"Background {scene.background[0]:.4g} {scene.background[1]:.4g}"
         f" {scene.background[2]:.4g}",
     ]
 
-    for x, y, z, r, g, b, rad in scene.spheres:
+    for i, (x, y, z, r, g, b, rad) in enumerate(scene.spheres):
         lines.append(f"Sphere Center {x:.5g} {y:.5g} {z:.5g} Rad {rad:.5g}")
-        lines += _tex(m, pr, (r, g, b))
+        lines += _tex(m, pr, (r, g, b),
+                      1.0 if scene.ao is None else float(scene.ao[i]))
     for x0, y0, z0, x1, y1, z1, r, g, b, rad in scene.cylinders:
         if abs(x0 - x1) < 1e-6 and abs(y0 - y1) < 1e-6 and abs(z0 - z1) < 1e-6:
             continue
