@@ -1,28 +1,43 @@
 #!/usr/bin/env python3
-"""Radial open / enclosed porosity of CrystoGen XYZ point clouds via S₂(r).
+"""Radial open / enclosed porosity, pore width and pore extent of CrystoGen XYZ point clouds.
 
-Runs the same two-point-correlation analysis as the Clusters → Radial Profile
-→ S₂ option in the GUI, outside the GUI, on one or more XYZ files:
+Runs the same analysis as the Clusters → Radial Profile → S₂ option in the GUI,
+outside the GUI, on one or more XYZ files:
 
 * the points are voxelised (auto voxel = 1.5× median nearest-neighbour spacing);
 * empty voxels are split by flooding from the outside: *enclosed* pores are
   sealed off by solid, *open* pores are reached by the flood but lie inside the
   crystal outline (closing + hole filling); everything else is ignored;
-* for each radial shell (distance from the origin (0, 0, 0)) S₂(r) is
-  computed for both pore definitions, giving porosity = 1 − S₂(0) and a
-  correlation length ξ (where the normalised S₂ first drops below 1/e).
+* for each radial shell (distance from the origin (0, 0, 0)):
+    - porosity = pore-voxel fraction of the shell (a plain count);
+    - pore diameter = volume-weighted mean local thickness, the width of the
+      largest sphere that fits in the pore and covers the voxel (what gas
+      adsorption or Hg intrusion would see);
+    - pore extent = S₂ correlation length ξ, the separation where the
+      normalised two-point correlation first drops below 1/e. For slit-like
+      pores this runs *along* the slit, so it is a length, not a width.
+* over the whole crystal, the local thickness gives a pore size distribution.
 
 Units: XYZ coordinates are in units of the lattice a-axis. With --a-length (Å)
-every length (r, voxel, max lag, lags, ξ) is converted to nm (XYZ × a / 10),
+every length (r, voxel, max lag, lags, ξ, D) is converted to nm (XYZ × a / 10),
 and --voxel / --max-lag are read in nm. Without it lengths stay in XYZ units.
 
 Outputs (in --out-dir):
 
-    s2_radial.csv       one row per (file, shell): density and both porosities / ξ
+    s2_radial.csv       one row per (file, shell): density, porosity, mean pore
+                        diameter and ξ for both pore definitions
     s2_curves.csv       full S₂ curves per (file, pore definition, shell, lag)
+    s2_psd.csv          per (file, pore diameter): volume-weighted pore size
+                        distribution (local thickness) of enclosed and open pores
     s2_summary.csv      per file: core porosity (unweighted and site-weighted)
                         and peak enclosed / open porosity with its radius
-    <label>_profile.png stacked enclosed + open porosity and ξ versus radius
+    <label>_porosity_stacked.png  enclosed + open porosity stacked versus radius
+    <label>_porosity_overlay.png  total, enclosed and open as overlapping areas
+    <label>_pore_diameter.png     mean pore diameter (local thickness) versus radius
+    <label>_pore_extent.png       pore extent (correlation length ξ) versus radius
+    <label>_psd.png               pore size distribution histogram
+                                  (all but the stacked plot: the lower-peaked of
+                                  enclosed / open on its own right-hand axis)
     comparison.png      core and peak porosity for every file side by side
 
 Usage:
@@ -46,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from cgaspects.analysis.cluster_analysis import (  # noqa: E402
     _auto_voxel,
+    pore_size_distribution,
     radial_profile,
     two_point_profile,
     xyz_length_scale,
@@ -87,7 +103,7 @@ PLOT_STYLE = {
 
 def analyse_file(path: Path, frame: int, nbins: int, voxel: float, max_lag: float,
                  length_scale: float):
-    """Return (radial DataFrame, curves DataFrame, voxel, max_lag) for one XYZ file."""
+    """Return (radial, curves, psd DataFrames, voxel, max_lag) for one XYZ file."""
     coords = CrystalCloud.parse_xyz_file(path)[frame].coords * length_scale
     voxel = voxel or _auto_voxel(coords)
     max_lag = max_lag or 20 * voxel
@@ -95,7 +111,8 @@ def analyse_file(path: Path, frame: int, nbins: int, voxel: float, max_lag: floa
     prof = radial_profile(coords, None, None, nbins)
     edges = np.append(prof["r_lo"].to_numpy(), prof["r_hi"].iloc[-1])
     summary, curves = two_point_profile(coords, edges, voxel, max_lag)
-    return pd.concat([prof, summary], axis=1), curves, voxel, max_lag
+    psd, widths = pore_size_distribution(coords, voxel, edges)
+    return pd.concat([prof, summary, widths], axis=1), curves, psd, voxel, max_lag
 
 
 def summarise(label: str, radial: pd.DataFrame, core_frac: float) -> dict:
@@ -120,44 +137,135 @@ def summarise(label: str, radial: pd.DataFrame, core_frac: float) -> dict:
     return row
 
 
-def plot_profile(label: str, radial: pd.DataFrame, rmax_frac: float, unit: str,
-                 path: Path) -> None:
-    """Stacked enclosed + open porosity and ξ versus radius (slide-6 style)."""
+def _save(fig, ax, path: Path, y_from_zero: bool = True) -> None:
+    """Shared finish for the profile figures: y from 0, legend, offset spines, save."""
+    import matplotlib.pyplot as plt
+
+    # After plotting: setting a limit earlier would freeze autoscaling at (0, 1).
+    if y_from_zero:
+        for a in fig.axes:
+            a.set_ylim(bottom=0)
+    ax.spines[["left", "bottom"]].set_position(("outward", 6))
+    fig.legend(loc="upper right", ncols=3, handlelength=1.2)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_profile(radial: pd.DataFrame, rmax_frac: float, unit: str, max_lag: float,
+                 stem: Path) -> None:
+    """Porosity (stacked and overlaid), pore diameter and pore extent versus radius.
+
+    One figure each: ``<stem>_porosity_stacked.png``,
+    ``<stem>_porosity_overlay.png``, ``<stem>_pore_diameter.png`` (mean local
+    thickness) and ``<stem>_pore_extent.png`` (S₂ correlation length ξ; a
+    dashed line at ``max_lag`` marks shells with pores whose ξ exceeds it).
+    """
     import matplotlib.pyplot as plt
 
     d = radial[radial["r_mid"] <= rmax_frac * radial["r_mid"].max()]
     r = d["r_mid"].to_numpy()
     enc = 100 * d["s2_enclosed_porosity"].fillna(0).to_numpy()
     opn = 100 * d["s2_open_porosity"].fillna(0).to_numpy()
+    xlabel = f"distance from origin r ({unit})"
 
     with plt.rc_context(PLOT_STYLE):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.8))
-        ax1.stackplot(r, enc, opn, labels=["Enclosed", "Open"], colors=[ENCLOSED, OPEN],
-                      edgecolor=SURFACE, linewidth=1.5)
-        ax1.plot(r, enc + opn, color=INK, lw=1, alpha=0.6)
-        ax1.set_title("Porosity, stacked = total")
-        ax1.set_ylabel("porosity (%)")
-        ax1.set_ylim(bottom=0)
+        fig, ax = plt.subplots(figsize=(6, 4.6))
+        ax.stackplot(r, enc, opn, labels=["Enclosed", "Open"], colors=[ENCLOSED, OPEN],
+                     edgecolor=SURFACE, linewidth=1.5)
+        ax.plot(r, enc + opn, color=INK, lw=1, alpha=0.6)
+        ax.set(xlabel=xlabel, ylabel="porosity (%)", xlim=(r.min(), r.max()))
+        _save(fig, ax, stem.with_name(f"{stem.name}_porosity_stacked.png"))
 
-        for col, colour, name in (("s2_enclosed_corr_length", ENCLOSED, "Enclosed"),
-                                  ("s2_open_corr_length", OPEN, "Open")):
-            ax2.plot(r, d[col], color=colour, lw=2, label=name, solid_capstyle="round")
-        ax2.set_title("Correlation length ξ")
-        ax2.set_ylabel(f"ξ ({unit})")
-        ax2.set_ylim(bottom=0)
+        fig, ax = plt.subplots(figsize=(6.4, 4.6))
+        ax_enc, ax_opn = _split_axes(ax, enc, opn, "porosity (%)", with_total=True)
+        _area(ax, r, enc + opn, INK_MUTED, "Total", alpha=0.18)
+        _area(ax_enc, r, enc, ENCLOSED, "Enclosed")
+        _area(ax_opn, r, opn, OPEN, "Open")
+        ax.set(xlabel=xlabel, xlim=(r.min(), r.max()))
+        _save(fig, ax, stem.with_name(f"{stem.name}_porosity_overlay.png"))
 
-        for ax in (ax1, ax2):
-            ax.set_xlabel(f"distance from origin r ({unit})")
-            ax.set_xlim(r.min(), r.max())
-            ax.spines[["left", "bottom"]].set_position(("outward", 6))
-        # Title on its own strip above the legend so it can be cropped off cleanly.
-        fig.suptitle(label, x=0.01, y=0.99, ha="left", va="top", fontsize=14,
-                     fontweight="bold")
-        fig.legend(*ax1.get_legend_handles_labels(), loc="upper right", ncols=2,
-                   bbox_to_anchor=(0.98, 0.935), handlelength=1.2)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
+        for suffix, col, ylabel in (
+            ("pore_diameter", "{}_pore_diameter", f"pore diameter D ({unit})"),
+            ("pore_extent", "s2_{}_corr_length", f"pore extent ξ ({unit})"),
+        ):
+            fig, ax = plt.subplots(figsize=(6.4, 4.6))
+            y_enc = d[col.format("enclosed")].to_numpy()
+            y_opn = d[col.format("open")].to_numpy()
+            ax_enc, ax_opn = _split_axes(ax, y_enc, y_opn, ylabel, with_total=False)
+            for target, y, colour, name in ((ax_enc, y_enc, ENCLOSED, "Enclosed"),
+                                            (ax_opn, y_opn, OPEN, "Open")):
+                target.plot(r, y, color=colour, lw=2, label=name, solid_capstyle="round")
+                if suffix == "pore_extent":
+                    # Pores present but S₂ never fell below 1/e within max lag:
+                    # ξ > max lag, unlike the gaps where the shell has no pores.
+                    beyond = (d[f"s2_{name.lower()}_porosity"] > 0).to_numpy() & np.isnan(y)
+                    if beyond.any():
+                        target.hlines(np.full(beyond.sum(), max_lag),
+                                      d["r_lo"][beyond], d["r_hi"][beyond],
+                                      colors=colour, linestyles=(0, (4, 3)), lw=1.5,
+                                      label=f"{name}, ξ > max lag ({max_lag:.3g} {unit})")
+            ax.set(xlabel=xlabel, xlim=(r.min(), r.max()))
+            # Widths sit in a narrow band well above 0; let that axis autoscale.
+            _save(fig, ax, stem.with_name(f"{stem.name}_{suffix}.png"),
+                  y_from_zero=suffix != "pore_diameter")
+
+
+def _split_axes(ax, enc, opn, ylabel: str, with_total: bool):
+    """Give enclosed and open their own y-axes; return ``(ax_enc, ax_opn)``.
+
+    Whichever peaks higher stays on ``ax`` (left, shared with the total when
+    ``with_total``); the other moves to a twin right axis drawn in its colour,
+    so it is not flattened by the larger one.
+    """
+    twin = ax.twinx()
+    enc_small = np.nanmax(enc) < np.nanmax(opn)
+    small, big = ("enclosed", "open") if enc_small else ("open", "enclosed")
+    colour = ENCLOSED if enc_small else OPEN
+
+    ax.set_ylabel(f"{ylabel}, {big}{' and total' if with_total else ''}")
+    twin.set_ylabel(f"{ylabel}, {small}", color=colour)
+    twin.spines[["left", "bottom", "top"]].set_visible(False)
+    twin.spines["right"].set_visible(True)
+    twin.spines["right"].set_position(("outward", 6))
+    twin.spines["right"].set_color(colour)
+    twin.tick_params(axis="y", colors=colour, labelcolor=colour)
+    return (twin, ax) if enc_small else (ax, twin)
+
+
+def _area(ax, x, y, colour: str, name: str, alpha: float = 0.4) -> None:
+    """Translucent filled area with a solid outline (NMR-deconvolution style)."""
+    ax.fill_between(x, y, color=colour, alpha=alpha, lw=0, label=name)
+    ax.plot(x, y, color=colour, lw=1.5)
+
+
+def _bars(ax, edges, y, colour: str, name: str, alpha: float = 0.4) -> None:
+    """Translucent histogram with a solid outline."""
+    ax.stairs(y, edges, fill=True, color=colour, alpha=alpha, lw=0, label=name)
+    ax.stairs(y, edges, color=colour, lw=1.5)
+
+
+def plot_psd(psd: pd.DataFrame, unit: str, path: Path) -> None:
+    """Volume-weighted pore size distribution histogram: total, enclosed and open.
+
+    Bars are dφ/dD, so each histogram's area is that pore type's whole-crystal
+    porosity. Enclosed and open get their own y-axes (see ``_split_axes``).
+    """
+    import matplotlib.pyplot as plt
+
+    edges = np.r_[psd["bin_lo"].to_numpy(), psd["bin_hi"].iloc[-1]]
+    width = (psd["bin_hi"] - psd["bin_lo"]).to_numpy()
+    enc = 100 * psd["enclosed_fraction"].to_numpy() / width
+    opn = 100 * psd["open_fraction"].to_numpy() / width
+
+    with plt.rc_context(PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(6.4, 4.6))
+        ax_enc, ax_opn = _split_axes(ax, enc, opn, f"dφ/dD (% per {unit})", with_total=True)
+        _bars(ax, edges, enc + opn, INK_MUTED, "Total", alpha=0.18)
+        _bars(ax_enc, edges, enc, ENCLOSED, "Enclosed")
+        _bars(ax_opn, edges, opn, OPEN, "Open")
+        ax.set(xlabel=f"pore diameter D ({unit})", xlim=(0, edges[-1]))
+        _save(fig, ax, path)
 
 
 def plot_comparison(summary: pd.DataFrame, core_frac: float, path: Path) -> None:
@@ -186,7 +294,7 @@ def plot_comparison(summary: pd.DataFrame, core_frac: float, path: Path) -> None
         ax.spines["left"].set_position(("outward", 6))
         fig.legend(loc="lower center", ncols=len(series), handlelength=1.2)
         fig.tight_layout(rect=(0, 0.07, 1, 1))
-        fig.savefig(path, dpi=150)
+        fig.savefig(path)
         plt.close(fig)
 
 
@@ -218,7 +326,10 @@ def main() -> int:
                              "surface-dominated outer shells (default: 1.0, all)")
     parser.add_argument("--no-plots", action="store_true", dest="no_plots",
                         help="Write the CSVs only")
+    parser.add_argument("--dpi", type=int, default=300,
+                        help="Resolution of the PNG plots (default: 300)")
     args = parser.parse_args()
+    PLOT_STYLE["savefig.dpi"] = args.dpi
 
     if args.labels is not None and len(args.labels) != len(args.files):
         parser.error(f"--labels needs one name per file ({len(args.files)} files given)")
@@ -228,7 +339,7 @@ def main() -> int:
     if unit != "nm":
         print("warning: no --a-length given, lengths are in XYZ units, not nm", file=sys.stderr)
 
-    radial_frames, curve_frames, summary_rows = [], [], []
+    radial_frames, curve_frames, psd_frames, summary_rows = [], [], [], []
     bar = tqdm(list(zip(args.files, labels)), desc="files", unit="file")
     for path, label in bar:
         if not path.exists():
@@ -236,7 +347,7 @@ def main() -> int:
             continue
         bar.set_postfix_str(path.name)
         try:
-            radial, curves, voxel, max_lag = analyse_file(
+            radial, curves, psd, voxel, max_lag = analyse_file(
                 path, args.frame, args.bins, args.voxel, args.max_lag, length_scale)
         except Exception as exc:  # noqa: BLE001 - keep going through the batch
             bar.write(f"skip ({exc}): {path}")
@@ -249,6 +360,7 @@ def main() -> int:
         curves.insert(1, "length_unit", unit)
         radial_frames.append(radial)
         curve_frames.append(curves)
+        psd_frames.append(psd.assign(label=label, length_unit=unit))
         row = summarise(label, radial, args.core_frac)
         row.update(file=str(path), length_unit=unit, a_length_angstrom=args.a_length or None,
                    voxel=voxel, max_lag=max_lag)
@@ -263,8 +375,9 @@ def main() -> int:
             import matplotlib
 
             matplotlib.use("Agg")
-            plot_profile(label, radial, args.plot_rmax_frac, unit,
-                         args.out_dir / f"{label.replace(' ', '_')}_profile.png")
+            stem = args.out_dir / label.replace(" ", "_")
+            plot_profile(radial, args.plot_rmax_frac, unit, max_lag, stem)
+            plot_psd(psd, unit, stem.with_name(f"{stem.name}_psd.png"))
     bar.close()
 
     if not summary_rows:
@@ -273,11 +386,15 @@ def main() -> int:
     summary = pd.DataFrame(summary_rows)
     pd.concat(radial_frames, ignore_index=True).to_csv(args.out_dir / "s2_radial.csv", index=False)
     pd.concat(curve_frames, ignore_index=True).to_csv(args.out_dir / "s2_curves.csv", index=False)
+    psd_cols = ["label", "length_unit", "pore_diameter", "bin_lo", "bin_hi",
+                "enclosed_fraction", "open_fraction"]
+    pd.concat(psd_frames, ignore_index=True)[psd_cols].to_csv(args.out_dir / "s2_psd.csv",
+                                                              index=False)
     summary.to_csv(args.out_dir / "s2_summary.csv", index=False)
     if not args.no_plots:
         plot_comparison(summary, args.core_frac, args.out_dir / "comparison.png")
 
-    print(f"\nWrote s2_radial.csv, s2_curves.csv, s2_summary.csv"
+    print(f"\nWrote s2_radial.csv, s2_curves.csv, s2_psd.csv, s2_summary.csv"
           f"{' and plots' if not args.no_plots else ''} to {args.out_dir}")
     return 0
 

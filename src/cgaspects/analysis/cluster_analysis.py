@@ -390,6 +390,107 @@ def _write_voxel_xyz(
     )
 
 
+def _voxel_grids(
+    coords: np.ndarray, voxel: float, pad: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Voxelise ``coords`` into (solid, filled, envelope, lo), padded by ``pad`` voxels.
+
+    ``solid`` marks voxels holding a point, ``filled`` adds the voids sealed off
+    by solid (hole filling) and ``envelope`` is the crystal outline (closing,
+    then hole filling). ``lo`` is the coordinate minimum the grid is built from.
+    """
+    from scipy import ndimage
+
+    lo = coords.min(axis=0)
+    idx = np.floor((coords - lo) / voxel).astype(np.int64) + pad
+    shape = tuple(idx.max(axis=0) + 1 + pad)
+    solid = np.zeros(shape, dtype=bool)
+    solid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    filled = ndimage.binary_fill_holes(solid)
+    envelope = ndimage.binary_fill_holes(ndimage.binary_closing(solid, iterations=2))
+    return solid, filled, envelope, lo
+
+
+def _voxel_shells(
+    lo: np.ndarray, shape: tuple[int, ...], pad: int, voxel: float, edges: np.ndarray
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Radial shell index (``edges``, from the origin) of every voxel centre.
+
+    Returns ``(shell, axes)``, ``axes`` being the voxel-centre coordinates along
+    each grid axis. Voxels beyond the last edge fall into the outermost shell.
+    """
+    axes = [lo[d] + (np.arange(shape[d]) - pad + 0.5) * voxel for d in range(3)]
+    r = np.sqrt(
+        axes[0][:, None, None] ** 2 + axes[1][None, :, None] ** 2 + axes[2][None, None, :] ** 2
+    )
+    shell = np.clip(np.digitize(r, edges) - 1, 0, len(edges) - 2).astype(np.int16)
+    return shell, axes
+
+
+def _local_thickness(pore: np.ndarray) -> np.ndarray:
+    """Local thickness radius (in voxels) of every voxel in ``pore``.
+
+    Each pore voxel gets the radius R of the largest ball that fits inside the
+    pore and still covers it: balls of radius R are centred on voxels at least
+    R from the pore wall, and larger R overwrite smaller ones. R runs over the
+    exact distance-transform values (1, √2, √3, 2, …), not just whole voxels.
+    """
+    from scipy import ndimage
+
+    dt = ndimage.distance_transform_edt(pore).astype(np.float32)
+    thick = np.zeros(pore.shape, dtype=np.float32)
+    for radius in np.unique(dt[pore]):
+        covered = ndimage.distance_transform_edt(dt < radius) < radius
+        thick[covered & pore] = radius
+    return thick
+
+
+def pore_size_distribution(
+    coords: np.ndarray, voxel: float, edges: np.ndarray
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pore width of enclosed and open pores: whole-crystal histogram and per shell.
+
+    Uses the same voxel classes as ``two_point_profile``. Pore diameter is the
+    local thickness (see ``_local_thickness``), D = (2R − 1) voxels, as R
+    reaches the centre of the wall voxel: a one-voxel gap is one voxel wide.
+
+    Returns ``(psd, widths)``. ``psd`` has one row per distinct D, with a
+    histogram bin ``bin_lo``–``bin_hi`` reaching halfway to its neighbours; its
+    ``<def>_fraction`` columns are that bin's pore volume as a fraction of the
+    envelope volume, so each sums to that pore type's whole-crystal porosity.
+    ``widths`` has one row per radial shell (``edges``, from the origin) and
+    ``<def>_pore_diameter``, the volume-weighted mean D of that shell's pore
+    voxels (NaN where the shell has none).
+    """
+    pad = 2
+    solid, filled, envelope, lo = _voxel_grids(coords, voxel, pad)
+    shell, _ = _voxel_shells(lo, solid.shape, pad, voxel, edges)
+    nbins = len(edges) - 1
+    n_envelope = envelope.sum()
+
+    counts, widths = {}, pd.DataFrame(index=range(nbins))
+    for name, pore in (("enclosed", filled & ~solid), ("open", envelope & ~filled)):
+        diameter = (2 * _local_thickness(pore)[pore] - 1) * voxel
+        values, n = np.unique(diameter, return_counts=True)
+        counts[name] = pd.Series(n, index=values)
+        in_shell = shell[pore]
+        n_shell = np.bincount(in_shell, minlength=nbins)
+        widths[f"{name}_pore_diameter"] = np.divide(
+            np.bincount(in_shell, weights=diameter, minlength=nbins), n_shell,
+            out=np.full(nbins, np.nan), where=n_shell > 0,
+        )
+    table = pd.DataFrame(counts).fillna(0).sort_index()
+
+    diameter = table.index.to_numpy(dtype=float)
+    mids = 0.5 * (diameter[1:] + diameter[:-1])
+    bin_lo = np.r_[diameter[0] - 0.5 * voxel, mids]
+    bin_hi = np.r_[mids, diameter[-1] + (diameter[-1] - mids[-1] if len(mids) else 0.5 * voxel)]
+    psd = pd.DataFrame({"pore_diameter": diameter, "bin_lo": bin_lo, "bin_hi": bin_hi})
+    for name in counts:
+        psd[f"{name}_fraction"] = table[name].to_numpy() / n_envelope
+    return psd, widths
+
+
 def two_point_profile(
     coords: np.ndarray,
     edges: np.ndarray,
@@ -416,32 +517,24 @@ def two_point_profile(
     where the normalised correlation (S₂ − φ²)/(φ − φ²) first drops below 1/e;
     ``curves`` is long format with one row per (definition, shell, lag).
 
+    The porosity is simply the pore-voxel fraction of the shell's region (a
+    count; S₂ at zero lag adds nothing). What S₂ adds is ξ: how far a pore stays
+    correlated, i.e. pore *extent* — along a slit, not across it. For pore width
+    use ``pore_size_distribution``.
+
     If ``voxel_xyz`` is given, the voxels inside the envelope are written there
     as a CrystoGen-style XYZ (see ``_write_voxel_xyz``) to inspect what S₂ saw.
     """
-    from scipy import ndimage
     from scipy.fft import irfftn, next_fast_len, rfftn
 
     nbins = len(edges) - 1
     lag_vox = max(1, int(np.ceil(max_lag / voxel)))
 
-    # Solid grid, padded by lag_vox so circular correlation never wraps
-    # within the lags we keep (and the closing has room at the border).
-    lo = coords.min(axis=0)
-    idx = np.floor((coords - lo) / voxel).astype(np.int64) + lag_vox
-    shape = tuple(idx.max(axis=0) + 1 + lag_vox)
-    solid = np.zeros(shape, dtype=bool)
-    solid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
-    filled = ndimage.binary_fill_holes(solid)
-    envelope = ndimage.binary_fill_holes(ndimage.binary_closing(solid, iterations=2))
-
-    # Shell index of each voxel centre (distance from the origin).
-    axes = [lo[d] + (np.arange(shape[d]) - lag_vox + 0.5) * voxel for d in range(3)]
-    r = np.sqrt(
-        axes[0][:, None, None] ** 2 + axes[1][None, :, None] ** 2 + axes[2][None, None, :] ** 2
-    )
-    shell = np.clip(np.digitize(r, edges) - 1, 0, nbins - 1).astype(np.int16)
-    del r
+    # Padded by lag_vox so circular correlation never wraps within the lags we
+    # keep (and the closing has room at the border).
+    solid, filled, envelope, lo = _voxel_grids(coords, voxel, lag_vox)
+    shape = solid.shape
+    shell, axes = _voxel_shells(lo, shape, lag_vox, voxel, edges)
 
     if voxel_xyz is not None:
         _write_voxel_xyz(voxel_xyz, solid, filled, envelope, shell, axes, voxel)
