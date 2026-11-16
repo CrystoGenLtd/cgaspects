@@ -429,11 +429,8 @@ class VisualisationWidget(QOpenGLWidget):
     def recentre_view(self):
         """Fit the camera to the current geometry.  Used as a menu action (F)
         and called automatically when entering Docking style."""
-        coords = (
-            self._visual_data.centroids
-            if self._visual_data is not None and self._visual_data.n_centroids > 0
-            else None
-        )
+        vd = self._active_visual_data()
+        coords = vd.centroids if vd is not None and vd.n_centroids > 0 else None
 
         if coords is not None and len(coords) > 0:
             self.camera.fitToObject(coords)

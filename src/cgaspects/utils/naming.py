@@ -6,7 +6,7 @@ from pathlib import Path
 # Suffixes appended to file stems by the toolchain. Ordered longest-first so the
 # more specific tag is stripped before its shorter substring (e.g.
 # ``_ovito_CGVisualiser`` before ``_CGVisualiser``).
-_KNOWN_SUFFIXES = ("_ovito_CGVisualiser", "_CGVisualiser", "_CGAspects")
+_KNOWN_SUFFIXES = ("_ovito_CGVisualiser", "_CGVisualiser", "_CGAspects", "_size")
 
 
 def simulation_id_from_path(path) -> str:

@@ -1049,7 +1049,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         if gl is None or gl._docking_data is None or gl._docking_data.empty:
             QMessageBox.warning(self, "Export Docking PDB", "No docking data loaded.")
             return
-        if not gl._mol_cart_templates:
+        vd = gl._docking_visual_data
+        if vd is None or not vd.templates:
             QMessageBox.warning(
                 self,
                 "Export Docking PDB",
@@ -1067,8 +1068,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             out = write_docking_pdb(
                 filepath=path,
                 docking_data=gl._docking_data,
-                mol_cart_templates=gl._mol_cart_templates,
-                a_axis=gl._a_axis(),
+                mol_cart_templates=vd.templates,
+                a_axis=float(gl._mol_crystallography.cell.a),
                 crystallography=gl._mol_crystallography,
             )
             self.log_message(f"Docking PDB exported: {out}", "info")

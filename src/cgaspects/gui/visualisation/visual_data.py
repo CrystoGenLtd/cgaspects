@@ -191,7 +191,8 @@ class VisualData:
         """Build from DockingData.
 
         Docking coords are stored in XYZ units; the a-axis from crystallography
-        converts them to Cartesian Å.
+        converts them to Cartesian Å. Unlike the crystal XYZ output, docking
+        sites are absolute lattice positions, so they are centred here.
         """
         templates = (
             cls._build_cart_templates(mol_templates, crystallography)
@@ -199,9 +200,10 @@ class VisualData:
             else None
         )
         a = float(crystallography.cell.a) if crystallography and crystallography.cell else 1.0
-        coords = (docking_data.coords.astype(np.float64) * a).astype(np.float32)
+        coords = docking_data.coords.astype(np.float64) * a
+        coords -= coords.mean(axis=0)
         return cls(
-            centroids=coords,
+            centroids=coords.astype(np.float32),
             mol_types=docking_data.mol_types.copy(),
             source="docking",
             templates=templates,
