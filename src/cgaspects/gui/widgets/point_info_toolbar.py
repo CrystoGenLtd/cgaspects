@@ -19,6 +19,9 @@ class PointInfoToolbar(QWidget):
     """A collapsible side panel that displays point information and selection controls."""
 
     deleteSelectedRequested = Signal()  # Emitted when delete button is clicked
+    hideSelectedRequested = Signal()  # Emitted when hide button is clicked
+    showHiddenRequested = Signal()  # Emitted when show hidden button is clicked
+    invertSelectionRequested = Signal()  # Emitted when invert selection is clicked
     clearSelectionRequested = Signal()  # Emitted when clear selection is clicked
     exportXYZRequested = Signal()  # Emitted when export XYZ is requested
     unselectCurrentRequested = Signal(int)  # Emitted with index to remove from selection
@@ -157,6 +160,23 @@ class PointInfoToolbar(QWidget):
         self._clear_btn.clicked.connect(self.clearSelectionRequested.emit)
         content_layout.addWidget(self._clear_btn)
 
+        self._invert_btn = QPushButton("Invert Selection")
+        self._invert_btn.setToolTip("Select all visible points that are not currently selected")
+        self._invert_btn.clicked.connect(self.invertSelectionRequested.emit)
+        content_layout.addWidget(self._invert_btn)
+
+        self._hide_btn = QPushButton("Hide")
+        self._hide_btn.setToolTip("Hide the selected points from the view and exports")
+        self._hide_btn.setEnabled(False)
+        self._hide_btn.clicked.connect(self.hideSelectedRequested.emit)
+        content_layout.addWidget(self._hide_btn)
+
+        self._show_hidden_btn = QPushButton("Show Hidden")
+        self._show_hidden_btn.setToolTip("Show all hidden points again")
+        self._show_hidden_btn.setEnabled(False)
+        self._show_hidden_btn.clicked.connect(self.showHiddenRequested.emit)
+        content_layout.addWidget(self._show_hidden_btn)
+
         self._delete_btn = QPushButton("Delete")
         self._delete_btn.setEnabled(False)
         self._delete_btn.clicked.connect(self.deleteSelectedRequested.emit)
@@ -254,6 +274,7 @@ class PointInfoToolbar(QWidget):
             self._next_btn.setEnabled(False)
             self._unselect_current_btn.setEnabled(False)
             self._clear_btn.setEnabled(False)
+            self._hide_btn.setEnabled(False)
             self._delete_btn.setEnabled(False)
         else:
             self._selected_ordered = sorted(selected_indices)
@@ -267,7 +288,13 @@ class PointInfoToolbar(QWidget):
             self._refresh_selected_display()
             self._unselect_current_btn.setEnabled(True)
             self._clear_btn.setEnabled(True)
+            self._hide_btn.setEnabled(True)
             self._delete_btn.setEnabled(True)
+
+    def update_hidden_count(self, count: int):
+        """Update the show hidden button for the number of hidden points."""
+        self._show_hidden_btn.setText(f"Show Hidden ({count})" if count else "Show Hidden")
+        self._show_hidden_btn.setEnabled(count > 0)
 
     def _refresh_selected_display(self):
         """Refresh the browse position label and selected point info."""

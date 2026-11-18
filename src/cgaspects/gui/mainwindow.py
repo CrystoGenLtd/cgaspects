@@ -197,6 +197,9 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         # Connect toolbar signals
         self.pointInfoToolbar.deleteSelectedRequested.connect(self.delete_selected_points)
+        self.pointInfoToolbar.hideSelectedRequested.connect(self.hide_selected_points)
+        self.pointInfoToolbar.showHiddenRequested.connect(self.show_hidden_points)
+        self.pointInfoToolbar.invertSelectionRequested.connect(self.invert_point_selection)
         self.pointInfoToolbar.clearSelectionRequested.connect(self.clear_point_selection)
         self.pointInfoToolbar.unselectCurrentRequested.connect(self.unselect_point)
         self.pointInfoToolbar.exportXYZRequested.connect(self.export_xyz)
@@ -204,6 +207,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # Connect OpenGL widget signals to toolbar
         self.openglwidget.pointHovered.connect(self.pointInfoToolbar.update_hover_info)
         self.openglwidget.selectionChanged.connect(self.pointInfoToolbar.update_selection_info)
+        self.openglwidget.hiddenCountChanged.connect(self.pointInfoToolbar.update_hidden_count)
         # Keep the Crystal Information point count in sync with what is actually rendered
         # (e.g. after the colour-legend filter hides some points).
         self.openglwidget.renderedCountChanged.connect(self._handle_rendered_count)
@@ -1028,6 +1032,22 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             count = self.openglwidget.delete_selected_points()
             if count > 0:
                 self.log_message(f"Deleted {count} point(s)", "info")
+
+    def hide_selected_points(self):
+        """Hide the currently selected points in the visualization."""
+        count = self.openglwidget.hide_selected_points()
+        if count > 0:
+            self.log_message(f"Hid {count} point(s)", "info")
+
+    def show_hidden_points(self):
+        """Show all hidden points in the visualization."""
+        count = self.openglwidget.show_hidden_points()
+        self.log_message(f"Showed {count} hidden point(s)", "info")
+
+    def invert_point_selection(self):
+        """Invert the current point selection."""
+        count = self.openglwidget.invert_selection()
+        self.log_message(f"Selection inverted: {count} point(s) selected", "info")
 
     def clear_point_selection(self):
         """Clear the current point selection."""

@@ -76,6 +76,7 @@ class VisualisationWidget(QOpenGLWidget):
     pointHovered = Signal(object, object)  # (point_index, point_data) or (None, None)
     selectionChanged = Signal(set, object)  # (selected_indices, last_selected_index)
     pointsDeleted = Signal(int)  # Number of points deleted
+    hiddenCountChanged = Signal(int)  # Total number of points currently hidden
     pointSizeChanged = Signal(int)  # Emitted when point size changes (integer value)
     legendChanged = Signal(dict)  # Emitted when the colour legend data changes
     # Emitted when the visualisation mode, atom/centroid toggle, or render option changes.
@@ -103,6 +104,7 @@ class VisualisationWidget(QOpenGLWidget):
         self._last_selected_index = None  # For shift-click range selection
         self._pick_radius = 0.1  # Picking radius in normalized coordinates
         self._deleted_points = set()  # Set of deleted point indices
+        self._hidden_points = set()  # Set of hidden point indices (restorable via Show Hidden)
 
         self._raw_planes = []
         self._planes_crystallography = None
@@ -724,7 +726,7 @@ class VisualisationWidget(QOpenGLWidget):
                     self.exportXYZ(file_name, active_xyz)
                     msg += f"Points exported: {len(active_xyz)}"
                 if omitted > 0:
-                    msg += f"\nPoints omitted (deleted or outside slice): {omitted}"
+                    msg += f"\nPoints omitted (deleted, hidden or outside slice): {omitted}"
 
                 msgBox = QMessageBox(self)
                 msgBox.setWindowTitle("XYZ Exported")
@@ -1202,10 +1204,10 @@ class VisualisationWidget(QOpenGLWidget):
         # Only consider points in front of the camera
         valid_mask = projections > 0
 
-        # Exclude deleted points
-        for idx in self._deleted_points:
-            if idx < len(valid_mask):
-                valid_mask[idx] = False
+        # Exclude deleted and hidden points
+        hide_mask = self._hide_mask(len(valid_mask))
+        if hide_mask is not None:
+            valid_mask &= ~hide_mask
 
         if not np.any(valid_mask):
             return None, None
@@ -1272,8 +1274,8 @@ class VisualisationWidget(QOpenGLWidget):
         distances = np.linalg.norm(diffs, axis=1)
 
         within = set(np.where(distances <= self._sphere_sel_radius)[0].tolist())
-        # Remove deleted points from the candidate set
-        within -= self._deleted_points
+        # Remove deleted and hidden points from the candidate set
+        within -= self._deleted_points | self._hidden_points
 
         self._selected_points = within
         self.initGeometry()
@@ -1375,8 +1377,9 @@ class VisualisationWidget(QOpenGLWidget):
         start = min(self._last_selected_index, end_index)
         end = max(self._last_selected_index, end_index)
 
+        excluded = self._deleted_points | self._hidden_points
         for i in range(start, end + 1):
-            if i not in self._deleted_points:
+            if i not in excluded:
                 self._selected_points.add(i)
 
         self.selectionChanged.emit(self._selected_points.copy(), end_index)
@@ -1413,6 +1416,60 @@ class VisualisationWidget(QOpenGLWidget):
         self.update()
         logger.info(f"Restored {count} deleted points")
         return count
+
+    def hide_selected_points(self):
+        """Hide the currently selected points until they are shown again.
+
+        Returns:
+            int: Number of points hidden
+        """
+        if not self._selected_points:
+            return 0
+
+        count = len(self._selected_points)
+        self._hidden_points.update(self._selected_points)
+        self._selected_points.clear()
+        self._last_selected_index = None
+
+        self.selectionChanged.emit(self._selected_points.copy(), None)
+        self.hiddenCountChanged.emit(len(self._hidden_points))
+        self.initGeometry()
+        self.update()
+        return count
+
+    def show_hidden_points(self):
+        """Show all hidden points again.
+
+        Returns:
+            int: Number of points shown
+        """
+        count = len(self._hidden_points)
+        self._hidden_points.clear()
+
+        self.hiddenCountChanged.emit(0)
+        self.initGeometry()
+        self.update()
+        return count
+
+    def invert_selection(self):
+        """Select every visible point that is not selected, and deselect the rest.
+
+        Returns:
+            int: Number of points selected after inverting
+        """
+        vd = self._visual_data
+        if vd is None:
+            return 0
+
+        keep = self._visible_mask(vd)
+        visible = np.arange(vd.n_centroids) if keep is None else np.flatnonzero(keep)
+        self._selected_points = set(visible.tolist()) - self._selected_points
+        self._last_selected_index = None
+
+        self.selectionChanged.emit(self._selected_points.copy(), None)
+        self.initGeometry()
+        self.update()
+        return len(self._selected_points)
 
     def get_legend_info(self):
         """Return the most recently computed legend info dict, or None if not yet available."""
@@ -1494,8 +1551,8 @@ class VisualisationWidget(QOpenGLWidget):
         """Get XYZ data for the visible crystal points.
 
         Returns:
-            np.ndarray: XYZ data with deleted points and points outside the
-            active slice planes removed
+            np.ndarray: XYZ data with deleted points, hidden points and points
+            outside the active slice planes removed
         """
         if self._visual_data is None:
             return None
@@ -1520,14 +1577,23 @@ class VisualisationWidget(QOpenGLWidget):
         return raw if keep is None else raw[keep]
 
     def _visible_mask(self, vd: VisualData) -> np.ndarray | None:
-        """Keep-mask (N,) for *vd*'s centroids: active slice planes, plus deleted
-        points when *vd* is the crystal. None when nothing is filtered."""
+        """Keep-mask (N,) for *vd*'s centroids: active slice planes, plus deleted and
+        hidden points when *vd* is the crystal. None when nothing is filtered."""
         keep = self._slice_centroid_mask(vd.centroids)
-        if vd is self._visual_data and self._deleted_points:
-            if keep is None:
-                keep = np.ones(vd.n_centroids, dtype=bool)
-            keep[[i for i in self._deleted_points if i < vd.n_centroids]] = False
+        if vd is self._visual_data:
+            hide_mask = self._hide_mask(vd.n_centroids)
+            if hide_mask is not None:
+                keep = ~hide_mask if keep is None else keep & ~hide_mask
         return keep
+
+    def _hide_mask(self, n: int) -> np.ndarray | None:
+        """Boolean mask (n,), True for deleted or hidden points. None when there are none."""
+        removed = self._deleted_points | self._hidden_points
+        if not removed:
+            return None
+        mask = np.zeros(n, dtype=bool)
+        mask[[i for i in removed if i < n]] = True
+        return mask
 
     def get_display_count(self) -> tuple[int | None, str]:
         """(count, label) for the crystal-info panel based on the active render mode."""
@@ -1842,12 +1908,12 @@ class VisualisationWidget(QOpenGLWidget):
             if idx < len(selection_flags):
                 selection_flags[idx] = 1.0
 
-        # Combined mask: deleted points + slice planes
+        # Combined mask: deleted and hidden points + slice planes
         n_pts = len(points)
         combined_mask = np.ones(n_pts, dtype=bool)
-        for idx in self._deleted_points:
-            if idx < n_pts:
-                combined_mask[idx] = False
+        hide_mask = self._hide_mask(n_pts)
+        if hide_mask is not None:
+            combined_mask &= ~hide_mask
         slice_mask = self._slice_centroid_mask(points)
         if slice_mask is not None:
             combined_mask &= slice_mask
@@ -2722,7 +2788,7 @@ class VisualisationWidget(QOpenGLWidget):
             bond_radius=self._bond_radius,
             selected_indices=self._selected_points or None,
             slice_planes=self._active_slice_planes() or None,
-            deleted_indices=self._deleted_points or None,
+            deleted_indices=(self._deleted_points | self._hidden_points) or None,
         )
 
         if len(atom_arr) == 0:
