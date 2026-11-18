@@ -78,7 +78,7 @@ def _interpolate_directions(dirs_a: list, dirs_b: list, t: float) -> list:
 def interpolate_snapshot(a, b, t: float):
     """Interpolate between two CameraSnapshots at normalised time t.
 
-    Camera: lerp position/target/scale, nlerp up, slerp model_rotation.
+    Camera: lerp position/target/pivot/scale, nlerp up, slerp model_rotation.
     Style / color_by / colormap: constant, switch at t=0.5.
     single_color: lerp RGBA.
     Planes: match by index; interpolate origin when slice_enabled in both.
@@ -88,6 +88,7 @@ def interpolate_snapshot(a, b, t: float):
 
     position = _lerp_vec3(a.position, b.position, t)
     target = _lerp_vec3(a.target, b.target, t)
+    pivot = _lerp_vec3(a.pivot, b.pivot, t)
     scale = a.scale + (b.scale - a.scale) * t
 
     # Normalised linear interpolation for up vector (good enough, no gimbal lock)
@@ -127,6 +128,7 @@ def interpolate_snapshot(a, b, t: float):
         scale=scale,
         perspective=perspective,
         model_rotation=model_rotation,
+        pivot=pivot,
         point_size=point_size,
         style=style,
         color_by=color_by,

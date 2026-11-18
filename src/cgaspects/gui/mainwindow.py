@@ -349,10 +349,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             )
         )
         self.actionRender.triggered.connect(self.openglwidget.saveRenderDialog)
-        self.actionExportXYZ = QAction("Export XYZ", self)
+        self.actionExportXYZ = QAction("Export Points", self)
         self.actionExportXYZ.setObjectName("actionExportXYZ")
         self.actionExportXYZ.setShortcut("Ctrl+Shift+E")
-        self.actionExportXYZ.setToolTip("Export the current point cloud to an XYZ file")
+        self.actionExportXYZ.setToolTip(
+            "Export the visible (sliced) point cloud to an XYZ or PDB file"
+        )
         self.actionExportXYZ.triggered.connect(self.export_xyz)
         self.actionExportXYZ.setEnabled(False)  # Disabled until XYZ is loaded
         self.menuFile.addAction(self.actionExportXYZ)
@@ -1039,7 +1041,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             self.openglwidget.select_point(index, toggle=True)
 
     def export_xyz(self):
-        """Export the current point cloud to an XYZ file."""
+        """Export the visible (sliced) point cloud to an XYZ or PDB file."""
         if hasattr(self, "openglwidget") and self.openglwidget is not None:
             self.openglwidget.exportXYZDialog()
 

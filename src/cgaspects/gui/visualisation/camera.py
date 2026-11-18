@@ -35,6 +35,8 @@ class Camera:
         self.zoomSpeed = 0.02
         self.scale = 1.0
         self.model_rotation = QQuaternion()  # identity = no object rotation
+        # Model-space point placed at the world origin — the centre of zoom and rotation.
+        self.pivot = QVector3D(0, 0, 0)
         self.distance = (self.position - self.target).length()
         self.storeOrientation()
 
@@ -48,6 +50,7 @@ class Camera:
         model = QMatrix4x4()
         model.scale(self.scale, self.scale, self.scale)
         model.rotate(self.model_rotation)
+        model.translate(-self.pivot)
         return model
 
     def modelRotationMatrix(self):
@@ -92,6 +95,7 @@ class Camera:
             self.up,
             self.scale,
             QQuaternion(self.model_rotation),
+            self.pivot,
         )
 
     def resetOrientation(self):
@@ -102,6 +106,7 @@ class Camera:
             self.up,
             self.scale,
             self.model_rotation,
+            self.pivot,
         ) = self._stored_orientation
 
     def rotate_model(self, dx: float, dy: float) -> None:
@@ -193,6 +198,10 @@ class Camera:
             LOG.error(f"unknown projection mode: {kind}")
 
     def fitToObject(self, points):
+        """Zoom to *points*, align to their principal axis and pivot on their centre."""
+        lo, hi = bounding_box(points)
+        centre = (lo + hi) / 2.0
+        self.pivot = QVector3D(float(centre[0]), float(centre[1]), float(centre[2]))
         extents, axes = pca(points)
         self.right = QVector3D(axes[0, 0], axes[0, 1], axes[0, 2])
         self.up = QVector3D.crossProduct(self.target - self.position, self.right)
@@ -213,6 +222,7 @@ class Camera:
             scale=self.scale,
             perspective=self.perspectiveProjection,
             model_rotation=QQuaternion(self.model_rotation),
+            pivot=QVector3D(self.pivot),
         )
 
     def restore_snapshot(self, snap: "CameraSnapshot") -> None:
@@ -223,6 +233,7 @@ class Camera:
         self.scale = snap.scale
         self.perspectiveProjection = snap.perspective
         self.model_rotation = QQuaternion(snap.model_rotation)
+        self.pivot = QVector3D(snap.pivot)
         # Recompute derived vectors
         self.screen = (self.target - self.position).normalized()
         self.right = QVector3D.crossProduct(self.up, self.screen).normalized()

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 from scipy.spatial import ConvexHull
 
 from ...fileio.cg_checkpoint import Checkpoint
+from ...fileio.pdb_export import write_visual_data_pdb
 from ...fileio.xyz_file import CrystalCloud
 from ..widgets.overlay_widget import TransparentOverlay
 from .atom_renderer import AtomRenderer
@@ -427,12 +428,15 @@ class VisualisationWidget(QOpenGLWidget):
         return True
 
     def recentre_view(self):
-        """Fit the camera to the current geometry.  Used as a menu action (F)
-        and called automatically when entering Docking style."""
+        """Fit the camera to the visible geometry (after slicing and deletion) and
+        pivot on its centre.  Used as a menu action (F) and called automatically
+        when the visualisation mode changes."""
         vd = self._active_visual_data()
-        coords = vd.centroids if vd is not None and vd.n_centroids > 0 else None
-
-        if coords is not None and len(coords) > 0:
+        if vd is None or vd.n_centroids == 0:
+            return
+        keep = self._visible_mask(vd)
+        coords = vd.centroids if keep is None else vd.centroids[keep]
+        if len(coords) > 0:
             self.camera.fitToObject(coords)
             self.update()
 
@@ -669,7 +673,7 @@ class VisualisationWidget(QOpenGLWidget):
                 msgBox.exec_()
 
     def exportXYZDialog(self):
-        """Open dialog to export the current point cloud as an XYZ file."""
+        """Export the visible crystal points (after slicing and deletion) as XYZ or PDB."""
         if self._visual_data is None:
             QMessageBox.warning(
                 self,
@@ -678,33 +682,49 @@ class VisualisationWidget(QOpenGLWidget):
             )
             return
 
-        # Get active points (excluding deleted ones)
         active_xyz = self.get_active_xyz()
-        if active_xyz is None or len(active_xyz) == 0:
+        if len(active_xyz) == 0:
             QMessageBox.warning(
                 self,
                 "No Data",
-                "No points available to export (all points may have been deleted).",
+                "No points available to export (all points are deleted or outside the slice).",
             )
             return
 
-        file_name, _ = QFileDialog.getSaveFileName(
-            self, "Export XYZ File", "", "XYZ Files (*.XYZ);;All Files (*)"
+        file_name, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Points",
+            "",
+            "XYZ Files (*.XYZ);;PDB Files (*.pdb);;All Files (*)",
         )
 
         if file_name:
-            if not file_name.upper().endswith(".XYZ"):
+            is_pdb = file_name.lower().endswith(".pdb") or selected_filter.startswith("PDB")
+            if is_pdb and not file_name.lower().endswith(".pdb"):
+                file_name += ".pdb"
+            elif not is_pdb and not file_name.upper().endswith(".XYZ"):
                 file_name += ".XYZ"
 
             try:
-                self.exportXYZ(file_name, active_xyz)
-
-                # Confirmation dialog
-                deleted_count = len(self._deleted_points)
-                msg = f"XYZ file saved to:\n{file_name}\n\n"
-                msg += f"Points exported: {len(active_xyz)}"
-                if deleted_count > 0:
-                    msg += f"\nPoints omitted (deleted): {deleted_count}"
+                omitted = self._visual_data.n_centroids - len(active_xyz)
+                msg = f"{'PDB' if is_pdb else 'XYZ'} file saved to:\n{file_name}\n\n"
+                if is_pdb:
+                    keep = self._visible_mask(self._visual_data)
+                    vd = self._visual_data if keep is None else self._visual_data.subset(keep)
+                    expand = (
+                        self.vis_mode == "Crystal" and self.is_atom_view and bool(vd.templates)
+                    )
+                    _, n_written = write_visual_data_pdb(
+                        file_name, vd, self._mol_crystallography, expand_atoms=expand
+                    )
+                    msg += f"{'Atoms' if expand else 'Points'} exported: {n_written}"
+                    if self._mol_crystallography is None:
+                        msg += "\nNo structure file loaded: coordinates are in XYZ units, not Å."
+                else:
+                    self.exportXYZ(file_name, active_xyz)
+                    msg += f"Points exported: {len(active_xyz)}"
+                if omitted > 0:
+                    msg += f"\nPoints omitted (deleted or outside slice): {omitted}"
 
                 msgBox = QMessageBox(self)
                 msgBox.setWindowTitle("XYZ Exported")
@@ -722,11 +742,11 @@ class VisualisationWidget(QOpenGLWidget):
                     QDesktopServices.openUrl(QUrl.fromLocalFile(Path(file_name).parent))
 
             except Exception as e:
-                logger.error("Failed to export XYZ: %s", e)
+                logger.error("Failed to export %s: %s", file_name, e)
                 QMessageBox.critical(
                     self,
                     "Export Failed",
-                    f"Failed to export XYZ file:\n{str(e)}",
+                    f"Failed to export {Path(file_name).name}:\n{str(e)}",
                 )
 
     def exportXYZ(self, file_name, xyz_data=None):
@@ -1471,10 +1491,11 @@ class VisualisationWidget(QOpenGLWidget):
         self.renderedCountChanged.emit(int(count), label)
 
     def get_active_xyz(self):
-        """Get XYZ data excluding deleted points.
+        """Get XYZ data for the visible crystal points.
 
         Returns:
-            np.ndarray: XYZ data with deleted points removed
+            np.ndarray: XYZ data with deleted points and points outside the
+            active slice planes removed
         """
         if self._visual_data is None:
             return None
@@ -1495,13 +1516,18 @@ class VisualisationWidget(QOpenGLWidget):
                 cols.append(vd.energies.reshape(-1, 1).astype(float))
         raw = np.hstack(cols)
 
-        if not self._deleted_points:
-            return raw
-        mask = np.ones(n, dtype=bool)
-        for idx in self._deleted_points:
-            if idx < n:
-                mask[idx] = False
-        return raw[mask]
+        keep = self._visible_mask(vd)
+        return raw if keep is None else raw[keep]
+
+    def _visible_mask(self, vd: VisualData) -> np.ndarray | None:
+        """Keep-mask (N,) for *vd*'s centroids: active slice planes, plus deleted
+        points when *vd* is the crystal. None when nothing is filtered."""
+        keep = self._slice_centroid_mask(vd.centroids)
+        if vd is self._visual_data and self._deleted_points:
+            if keep is None:
+                keep = np.ones(vd.n_centroids, dtype=bool)
+            keep[[i for i in self._deleted_points if i < vd.n_centroids]] = False
+        return keep
 
     def get_display_count(self) -> tuple[int | None, str]:
         """(count, label) for the crystal-info panel based on the active render mode."""

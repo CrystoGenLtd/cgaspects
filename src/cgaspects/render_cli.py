@@ -232,11 +232,12 @@ def build_scene_from_snapshot(
         points = points[mask]
         colors = colors[mask]
 
-    # Bake model matrix (M = S · R → p' = s · (R @ p)) and viewport point size,
-    # matching the widget path: radius = point_size * 0.2 * scale.
+    # Bake model matrix (M = S · R · T(-pivot) → p' = s · (R @ (p - pivot))) and
+    # viewport point size, matching the widget path: radius = point_size * 0.2 * scale.
     scale = float(snapshot.scale)
     rot = _quat_matrix(snapshot.model_rotation)
-    centers = (points @ rot.T) * scale
+    pivot = np.array([snapshot.pivot.x(), snapshot.pivot.y(), snapshot.pivot.z()], dtype=np.float32)
+    centers = ((points - pivot) @ rot.T) * scale
     radii = np.full(len(points), float(snapshot.point_size) * 0.2 * scale,
                     dtype=np.float32)
     spheres = np.column_stack([centers, colors, radii]).astype(np.float32)

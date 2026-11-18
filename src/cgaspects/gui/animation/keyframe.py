@@ -91,6 +91,7 @@ class CameraSnapshot:
     scale: float
     perspective: bool
     model_rotation: QQuaternion
+    pivot: QVector3D = field(default_factory=QVector3D)  # model-space centre of view
     point_size: float = 2.0           # viewport point size
 
     # View / style state
@@ -120,6 +121,7 @@ class CameraSnapshot:
                 self.model_rotation.y(),
                 self.model_rotation.z(),
             ],
+            "pivot": [self.pivot.x(), self.pivot.y(), self.pivot.z()],
             "point_size": self.point_size,
             "style": self.style,
             "color_by": self.color_by,
@@ -135,6 +137,7 @@ class CameraSnapshot:
         t = d["target"]
         u = d["up"]
         r = d["model_rotation"]
+        pv = d.get("pivot", [0.0, 0.0, 0.0])
         return cls(
             position=QVector3D(p[0], p[1], p[2]),
             target=QVector3D(t[0], t[1], t[2]),
@@ -142,6 +145,7 @@ class CameraSnapshot:
             scale=float(d["scale"]),
             perspective=bool(d["perspective"]),
             model_rotation=QQuaternion(r[0], r[1], r[2], r[3]),
+            pivot=QVector3D(pv[0], pv[1], pv[2]),
             point_size=float(d.get("point_size", 2.0)),
             style=d.get("style", "Spheres"),
             color_by=d.get("color_by", "Layer"),

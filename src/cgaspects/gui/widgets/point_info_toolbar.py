@@ -162,8 +162,8 @@ class PointInfoToolbar(QWidget):
         self._delete_btn.clicked.connect(self.deleteSelectedRequested.emit)
         content_layout.addWidget(self._delete_btn)
 
-        self._export_btn = QPushButton("Export XYZ")
-        self._export_btn.setToolTip("Export point cloud to XYZ file")
+        self._export_btn = QPushButton("Export Points")
+        self._export_btn.setToolTip("Export the visible (sliced) point cloud to an XYZ or PDB file")
         self._export_btn.clicked.connect(self.exportXYZRequested.emit)
         content_layout.addWidget(self._export_btn)
 
