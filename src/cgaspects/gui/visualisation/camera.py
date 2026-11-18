@@ -203,7 +203,13 @@ class Camera:
         centre = (lo + hi) / 2.0
         self.pivot = QVector3D(float(centre[0]), float(centre[1]), float(centre[2]))
         extents, axes = pca(points)
-        self.right = QVector3D(axes[0, 0], axes[0, 1], axes[0, 2])
+        # Use the longest axis that is not along the line of sight: one parallel to
+        # it would leave the up vector, and so the view matrix, undefined.
+        view = (self.target - self.position).normalized()
+        for axis in axes:
+            self.right = QVector3D(axis[0], axis[1], axis[2])
+            if abs(QVector3D.dotProduct(self.right.normalized(), view)) < 0.99:
+                break
         self.up = QVector3D.crossProduct(self.target - self.position, self.right)
         self.scale = 1 / np.sqrt(np.max(extents))
         self.storeOrientation()

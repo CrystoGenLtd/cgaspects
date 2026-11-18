@@ -198,6 +198,50 @@ class WorkerCheckpointExpand(CancellableRunnable):
         self.signals.finished.emit()
 
 
+class WorkerSiteEnvironmentLoad(CancellableRunnable):
+    """Read a checkpoint and index its site types on a background thread.
+
+    Emits a :class:`~cgaspects.analysis.site_environments.SiteEnvironmentAnalysis`
+    via ``signals.result``.
+    """
+
+    def __init__(self, checkpoint_file, structure):
+        super().__init__()
+        self.checkpoint_file = checkpoint_file
+        self.structure = structure
+
+    @emit_error_on_exception
+    @Slot()
+    def run(self):
+        from ..fileio.cg_checkpoint import Checkpoint
+        from .site_environments import SiteEnvironmentAnalysis
+
+        checkpoint = Checkpoint.from_file(
+            self.checkpoint_file, self.structure.n_tiles, self.structure.cryst
+        )
+        self.signals.result.emit(SiteEnvironmentAnalysis(checkpoint, self.structure))
+        self.signals.finished.emit()
+
+
+class WorkerSiteEnvironmentBuild(CancellableRunnable):
+    """Enumerate one site type's environments on a background thread.
+
+    Emits ``(analysis, site, environments)`` via ``signals.result``.
+    """
+
+    def __init__(self, analysis, site):
+        super().__init__()
+        self.analysis = analysis
+        self.site = site
+
+    @emit_error_on_exception
+    @Slot()
+    def run(self):
+        environments = self.analysis.environments(self.site)
+        self.signals.result.emit((self.analysis, self.site, environments))
+        self.signals.finished.emit()
+
+
 class WorkerAspectRatios(CancellableRunnable):
     def __init__(
         self,

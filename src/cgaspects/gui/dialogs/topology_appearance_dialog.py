@@ -1,9 +1,9 @@
-"""Appearance & export settings for the Unit Cell Viewer.
+"""Appearance settings for the Topology Viewer.
 
 Non-modal dialog holding everything that only affects how the current scene
-is *drawn* (connection style, sizes) plus material/lighting settings and
-image/ray-trace export — kept out of the main viewer dialog so that dialog
-stays focused on data (supercell, net, selection, and per-item visibility).
+is *drawn* (connection style, sizes, sphere material and lighting) — kept out
+of the main viewer dialog so that dialog stays focused on data (supercell, net,
+selection, and per-item visibility).
 """
 
 from PySide6.QtWidgets import (
@@ -12,28 +12,23 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QPushButton,
     QVBoxLayout,
 )
 
-from .render_settings_dialog import RenderSettingsDialog
+from .render_settings_dialog import RenderSettingsPanel
 
 _BOND_RADIUS = 0.15
 
 
-class UnitCellAppearanceDialog(QDialog):
-    """Connection style, sizing, lighting and export controls for a UnitCellViewerWidget."""
+class TopologyAppearanceDialog(QDialog):
+    """Connection style, sizing, material and lighting controls for a TopologyViewerWidget."""
 
     def __init__(self, viewer, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Unit Cell Appearance & Export")
+        self.setWindowTitle("Topology Viewer Appearance")
         self.setModal(False)
-        self.setMinimumWidth(360)
-
-        self._viewer = viewer
-        self._render_settings_dialog: RenderSettingsDialog | None = None
-
-        outer = QVBoxLayout(self)
 
         # --------------------------------------------------------- connections
         conn_group = QGroupBox("Connections")
@@ -46,8 +41,6 @@ class UnitCellAppearanceDialog(QDialog):
             lambda idx: viewer.set_conn_tubes(idx == 1)
         )
         conn_form.addRow("Style:", self.conn_style_combo)
-
-        outer.addWidget(conn_group)
 
         # --------------------------------------------------------------- sizes
         size_group = QGroupBox("Sizes")
@@ -83,42 +76,40 @@ class UnitCellAppearanceDialog(QDialog):
         self.conn_radius_sb.valueChanged.connect(viewer.set_conn_radius_scale)
         size_form.addRow("Connection Radius Scale:", self.conn_radius_sb)
 
-        outer.addWidget(size_group)
+        # ------------------------------------------------- material & lighting
+        self.render_settings_panel = RenderSettingsPanel()
+        self.render_settings_panel.settingsChanged.connect(viewer.set_render_settings)
 
-        # ---------------------------------------------------- lighting button
-        self.light_btn = QPushButton("Sphere && Lighting Settings…")
-        self.light_btn.clicked.connect(self._open_render_settings)
-        outer.addWidget(self.light_btn)
-
-        # ------------------------------------------------------------- export
-        export_group = QGroupBox("Export")
-        export_layout = QVBoxLayout(export_group)
-
-        self.export_image_btn = QPushButton("Export Image (PNG)…")
-        self.export_image_btn.clicked.connect(viewer.export_image_dialog)
-        export_layout.addWidget(self.export_image_btn)
-
-        self.export_raytrace_btn = QPushButton("Export Ray-Traced Image (POV-Ray/Tachyon)…")
-        self.export_raytrace_btn.clicked.connect(viewer.export_raytrace_dialog)
-        export_layout.addWidget(self.export_raytrace_btn)
-
-        outer.addWidget(export_group)
+        # ------------------------------------------------------------- buttons
+        # Not auto-default, so Enter in a spin box cannot reset or close the dialog.
+        reset_btn = QPushButton("Reset Sphere && Lighting")
+        reset_btn.setAutoDefault(False)
+        reset_btn.clicked.connect(self.render_settings_panel.reset_defaults)
 
         close_btn = QPushButton("Close")
+        close_btn.setAutoDefault(False)
         close_btn.clicked.connect(self.close)
-        outer.addWidget(close_btn)
-        outer.addStretch()
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(reset_btn)
+        button_row.addStretch()
+        button_row.addWidget(close_btn)
+
+        # -------------------------------------------------------------- layout
+        scene_column = QVBoxLayout()
+        scene_column.addWidget(conn_group)
+        scene_column.addWidget(size_group)
+        scene_column.addStretch()
+
+        columns = QHBoxLayout()
+        columns.addLayout(scene_column)
+        columns.addWidget(self.render_settings_panel)
+
+        outer = QVBoxLayout(self)
+        outer.addLayout(columns)
+        outer.addLayout(button_row)
 
     # ------------------------------------------------------------------
-
-    def _open_render_settings(self):
-        if self._render_settings_dialog is None:
-            self._render_settings_dialog = RenderSettingsDialog(parent=self)
-            self._render_settings_dialog.settingsChanged.connect(
-                self._viewer.set_render_settings
-            )
-        self._render_settings_dialog.show()
-        self._render_settings_dialog.raise_()
 
     def set_available(self, has_connections: bool):
         """Enable/disable controls based on what data is currently loaded."""

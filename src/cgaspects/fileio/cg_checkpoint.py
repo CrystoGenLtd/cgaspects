@@ -17,13 +17,32 @@ class Checkpoint:
     n_tiles: int
     crystallography: Crystallography
     data: np.ndarray
-    # (a, b, c) bool mask flagging the edge cells of every strip block. The full
-    # ``data`` grid always holds *all* sites; ``edge_mask`` lets callers toggle the
-    # interior (middle) cells on/off without re-reading the file.
+    # (a, b, c) bool mask flagging the edge cells of every strip block. ``data``
+    # holds every cell written to the file; ``edge_mask`` lets callers toggle the
+    # interior (middle) cells on/off without re-reading the file. Runs of fully
+    # bulk cells are not written at all: see ``bulk_gaps`` and ``filled_data``.
     edge_mask: np.ndarray = None
     # When False (default) only edge cells are shown; when True the middle cells
     # are included too. Flip this and re-read ``visible_data`` — no file I/O needed.
     show_middle: bool = False
+    # Site-type populations from the file header, index 0 = site number 1.
+    populations: np.ndarray = None
+    # (M, 4) int array of (x_start, x_stop, y, z): the fully bulk runs between
+    # consecutive blocks of a strip, with x_stop exclusive.
+    bulk_gaps: np.ndarray = None
+
+    @property
+    def bulk_site_numbers(self) -> np.ndarray:
+        """Bulk site number per tile: the highest site number found on that tile."""
+        return self.data.reshape(-1, self.n_tiles).max(axis=0)
+
+    def filled_data(self) -> np.ndarray:
+        """Return a copy of ``data`` with the omitted fully bulk cells restored."""
+        filled = self.data.copy()
+        bulk = self.bulk_site_numbers
+        for x_start, x_stop, y, z in self.bulk_gaps:
+            filled[x_start:x_stop, y, z, :] = bulk
+        return filled
 
     @property
     def visible_data(self) -> np.ndarray:
@@ -119,6 +138,8 @@ class Checkpoint:
 
         a = b = c = None
         strip_idx = None
+        populations_idx = None
+        populations = None
         i = 0
         n_tokens = len(tokens)
         while i < n_tokens:
@@ -139,7 +160,12 @@ class Checkpoint:
                 a, b, c = dims
                 i = j
                 continue
+            if tok.startswith("populations"):
+                populations_idx = i + 1
             if tok.startswith("Strip"):
+                if populations_idx is None:
+                    raise ValueError("Site type populations were not found in checkpoint file")
+                populations = np.array(tokens[populations_idx:i], dtype=np.int64)
                 j = i + 1
                 while j < n_tokens and not _is_int(tokens[j]):
                     j += 1
@@ -167,15 +193,21 @@ class Checkpoint:
 
         total = len(nums)
         pos = 0
+        bulk_gaps = []
         try:
             while pos < total:
                 y, z, num_blocks = nums[pos], nums[pos + 1], nums[pos + 2]
                 pos += 3
 
+                previous_end = None
                 for _ in range(num_blocks):
                     start = nums[pos]
                     end = nums[pos + 1] + 1
                     pos += 2
+
+                    if previous_end is not None and start > previous_end:
+                        bulk_gaps.append((previous_end, start, y, z))
+                    previous_end = end
 
                     for cell in range(start, end):
                         if cell == start or cell == end - 1:
@@ -192,7 +224,15 @@ class Checkpoint:
         elapsed = time.perf_counter() - t_start
         LOG.info("Loaded %s in %.3f s", checkpoint_path.name, elapsed)
 
-        return cls(checkpoint_path, n_tiles, crysallography, grid, edge_mask)
+        return cls(
+            checkpoint_path,
+            n_tiles,
+            crysallography,
+            grid,
+            edge_mask,
+            populations=populations,
+            bulk_gaps=np.array(bulk_gaps, dtype=np.int32).reshape(-1, 4),
+        )
 
 
 if __name__ == "__main__":

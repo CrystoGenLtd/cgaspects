@@ -65,9 +65,9 @@ See [Animation & Movie Rendering](../features/animation.md) for the full workflo
 | Add Planes | `Ctrl+Shift+L` | Open the Planes dialog |
 | Set Lattice Parameters | — | Enter lattice parameters or load from CIF |
 | Switch to Fractional Axes | `Shift+A` | Toggle between Cartesian and fractional coordinate display |
-| Unit Cell Viewer | — | Open a standalone 3D view of the unit cell, molecule templates, and crystal net connections |
+| Topology Viewer | — | Open a standalone 3D view of the unit cell, crystal net connections, and site-type environments |
 
-See [Unit Cell Viewer](../features/unit-cell-viewer.md) for the full workflow.
+See [Topology Viewer](../features/topology-viewer.md) for the full workflow.
 
 ---
 

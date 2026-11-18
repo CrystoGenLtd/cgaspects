@@ -1,7 +1,9 @@
-"""Non-modal dialog for sphere material, lighting and ambient-occlusion settings.
+"""Sphere material, lighting and ambient-occlusion settings.
 
-Emits a fresh :class:`RenderSettings` on every change; the main window forwards
-it to ``VisualisationWidget.set_render_settings`` so edits preview live.
+:class:`RenderSettingsPanel` holds the controls and emits a fresh
+:class:`RenderSettings` on every change so edits preview live. The main window
+shows it through :class:`RenderSettingsDialog`; the Topology Viewer embeds it in
+its appearance dialog.
 """
 
 from PySide6.QtCore import Qt, Signal
@@ -18,23 +20,22 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..visualisation.shading import MATERIAL_PRESETS, RenderSettings
 
 
-class RenderSettingsDialog(QDialog):
+class RenderSettingsPanel(QWidget):
     settingsChanged = Signal(object)  # RenderSettings
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Sphere & Lighting Settings")
-        self.setModal(False)
-        self.resize(420, 520)
 
         self._updating = False  # guard against feedback while applying presets
 
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
         # ------------------------------------------------------------ material
         material_group = QGroupBox("Material")
@@ -112,17 +113,6 @@ class RenderSettingsDialog(QDialog):
 
         ao_group.setLayout(ao_layout)
         main_layout.addWidget(ao_group)
-
-        # ------------------------------------------------------------- buttons
-        button_layout = QHBoxLayout()
-        reset_button = QPushButton("Reset to Defaults")
-        reset_button.clicked.connect(self._reset_defaults)
-        button_layout.addWidget(reset_button)
-        button_layout.addStretch()
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-        button_layout.addWidget(close_button)
-        main_layout.addLayout(button_layout)
         main_layout.addStretch()
 
         self._apply_to_widgets(RenderSettings())
@@ -210,7 +200,35 @@ class RenderSettingsDialog(QDialog):
             return
         self.settingsChanged.emit(self.current_settings())
 
-    def _reset_defaults(self):
+    def reset_defaults(self):
         settings = RenderSettings()
         self._apply_to_widgets(settings)
         self.settingsChanged.emit(settings)
+
+
+class RenderSettingsDialog(QDialog):
+    """Non-modal window around a :class:`RenderSettingsPanel`."""
+
+    settingsChanged = Signal(object)  # RenderSettings
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sphere & Lighting Settings")
+        self.setModal(False)
+        self.resize(420, 520)
+
+        panel = RenderSettingsPanel()
+        panel.settingsChanged.connect(self.settingsChanged)
+
+        button_layout = QHBoxLayout()
+        reset_button = QPushButton("Reset to Defaults")
+        reset_button.clicked.connect(panel.reset_defaults)
+        button_layout.addWidget(reset_button)
+        button_layout.addStretch()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_layout.addWidget(close_button)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(panel)
+        main_layout.addLayout(button_layout)

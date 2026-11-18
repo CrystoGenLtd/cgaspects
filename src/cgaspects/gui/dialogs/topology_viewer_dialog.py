@@ -1,6 +1,6 @@
-"""Unit Cell / Crystal Net viewer dialog.
+"""Topology Viewer dialog: the unit cell, crystal net and site-type environments.
 
-Opens as a standalone window from the Crystallography menu.  Shows:
+Opens as a standalone window from the Crystallography menu.  The Unit Cell mode shows:
   - The unit cell box (or a user-grown supercell grid).
   - Molecule templates from the structure file positioned at their
     fractional coordinates inside each cell of the supercell.
@@ -17,6 +17,10 @@ visible and whose tile is ticked under "Show Connections From".
 
 All geometry is centred at the supercell centre so rotation always happens
 at the centre of mass, not the world origin.
+
+The Site Types mode reads a checkpoint, lists the distinct neighbour environments
+of a chosen site type by how often they occur, draws the selected environment and
+exports it as a docking site.
 """
 
 import dataclasses
@@ -25,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 from OpenGL.GL import GL_BLEND, GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST
-from PySide6.QtCore import Qt, QPoint, QUrl, Signal
+from PySide6.QtCore import Qt, QPoint, QRect, QThreadPool, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -43,6 +47,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -50,14 +56,25 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QTabBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
+from ...analysis.gui_threads import WorkerSiteEnvironmentBuild, WorkerSiteEnvironmentLoad
+from ...analysis.site_environments import SiteEnvironment, SiteEnvironmentAnalysis
 from ...fileio.cg_net import CGNet
+from ...fileio.pdb_export import write_docking_pdb
 from ...fileio.structure import Structure, TileConnection
 from ..animation.keyframe import AnimationTimeline, Keyframe
 from ..animation.timeline_widget import KeyframeTimelineWidget
@@ -77,12 +94,19 @@ from ..visualisation.unit_cell_renderer import (
     UnitCellRenderer,
 )
 from ..visualisation.visual_data import VisualData
-from .unit_cell_appearance_dialog import UnitCellAppearanceDialog
+from .topology_appearance_dialog import TopologyAppearanceDialog
 
-logger = logging.getLogger("CGA:UnitCellViewer")
+logger = logging.getLogger("CGA:TopologyViewer")
 
 _BOND_RADIUS = 0.15
 _MAX_SUPERCELL = 6
+# Orbit step (dx, dy) per arrow key press, matching the Crystal Viewer.
+_ARROW_KEY_ROTATION = {
+    Qt.Key_Up: (0, -10),
+    Qt.Key_Down: (0, 10),
+    Qt.Key_Left: (-10, 0),
+    Qt.Key_Right: (10, 0),
+}
 
 # Atoms whose positions round to the same value at this many decimals (Å) are
 # treated as occupying the same lattice site and drawn as one sectioned sphere.
@@ -103,13 +127,25 @@ _SHELL_COLORS = np.array(
     dtype=np.float32,
 )
 
+# Site Types mode colours, matching the main viewport's docking shell colours
+_SITE_TARGET_COLOR = np.array([1.0, 0.35, 0.0], dtype=np.float32)
+_SITE_FIRST_COLOR = np.array([0.0, 0.85, 0.2], dtype=np.float32)
+_SITE_SECOND_COLOR = np.array([0.15, 0.45, 1.0], dtype=np.float32)
+_SITE_EMPTY_COLOR = np.array([0.55, 0.55, 0.55], dtype=np.float32)
+_SITE_EMPTY_RADIUS = 0.45
+_SITE_CONTACT_RADIUS = 0.08
+_SHARE_BAR_COLOR = QColor(255, 140, 40, 110)
+_ENV_SHARE_COLUMN = 4
+
+_MODE_SITE_TYPES = 1
+
 
 # ---------------------------------------------------------------------------
 # OpenGL viewer widget
 # ---------------------------------------------------------------------------
 
 
-class UnitCellViewerWidget(QOpenGLWidget):
+class TopologyViewerWidget(QOpenGLWidget):
     """Lightweight QOpenGLWidget that renders a supercell of the crystal net.
 
     Item IDs used for selection and visibility:
@@ -151,6 +187,16 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._conn_tubes = False  # draw connections as energy-scaled tubes
         self._show_atom_labels = False
         self._show_mol_labels = False
+
+        # Site Types mode: one neighbour environment replaces the supercell
+        self._site_mode = False
+        self._site_env: SiteEnvironment | None = None
+        self._site_contacts: list = []
+        self._site_show_first = True
+        self._site_show_second = True
+        self._site_show_empty = True
+        self._site_show_contacts = True
+        self._site_color_by_shell = True
 
         # Label geometry cache (rebuilt on geometry upload)
         self._atom_label_data: list = []
@@ -265,7 +311,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
             self._cell_renderer.release()
 
         # Atoms + bonds
-        if self._show_molecules:
+        if self._show_molecules or self._site_mode:
             if self._atom_renderer.numberOfInstances() > 0:
                 self._atom_renderer.bind(gl)
                 self._atom_renderer.setUniforms(**uniforms)
@@ -283,7 +329,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 self._bond_renderer.release()
 
         # Interaction connections (lines or energy-scaled tubes)
-        if self._show_connections:
+        if self._site_show_contacts if self._site_mode else self._show_connections:
             if self._conn_tubes:
                 if self._conn_tube_renderer.numberOfInstances() > 0:
                     self._conn_tube_renderer.bind(gl)
@@ -349,6 +395,30 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self._conn_annotations = annotations
         self._mark_dirty()
 
+    def set_site_mode(self, enabled: bool):
+        """Switch between the unit-cell scene and the site-environment scene."""
+        self._site_mode = enabled
+        self._view_fitted = False
+        self._mark_dirty()
+
+    def set_site_environment(self, env: SiteEnvironment | None, contacts: list):
+        """Show one neighbour environment; ``None`` leaves the Site Types scene empty."""
+        self._site_env = env
+        self._site_contacts = contacts
+        self._view_fitted = False
+        self._mark_dirty()
+
+    def set_site_display(
+        self, first: bool, second: bool, empty: bool, contacts: bool, color_by_shell: bool
+    ):
+        """Choose which parts of the site environment are drawn, and their colouring."""
+        self._site_show_first = first
+        self._site_show_second = second
+        self._site_show_empty = empty
+        self._site_show_contacts = contacts
+        self._site_color_by_shell = color_by_shell
+        self._mark_dirty()
+
     def set_show_cell(self, enabled: bool):
         self._show_cell = enabled
         self.update()
@@ -379,6 +449,7 @@ class UnitCellViewerWidget(QOpenGLWidget):
         self.update()
 
     def reset_view(self):
+        self._camera.resetOrientation()
         self._view_fitted = False
         self._dirty = True
         self.update()
@@ -577,22 +648,29 @@ class UnitCellViewerWidget(QOpenGLWidget):
         selected: bool,
         atom_blocks: list,
         bond_blocks: list,
+        color: np.ndarray | None = None,
     ):
-        """Append one molecule instance's atoms/bonds/labels to the draw lists."""
+        """Append one molecule instance's atoms/bonds/labels to the draw lists.
+
+        ``color`` paints the whole molecule one colour instead of by element.
+        """
         tmpl = self._templates[tile]
         n = len(tmpl["cart"])
         pos = tmpl["cart"] + cell_cart - self._scene_centre
-        colors = tmpl["colors"]
+        colors = tmpl["colors"] if color is None else np.tile(color, (n, 1))
 
+        # Unit-cell hiding and selection do not apply to site environments
+        hidden_ids = set() if self._site_mode else self._hidden_ids
+        selected_ids = set() if self._site_mode else self._selected_ids
         visible = np.array(
-            [("atom", tile, i) not in self._hidden_ids for i in range(n)], dtype=bool
+            [("atom", tile, i) not in hidden_ids for i in range(n)], dtype=bool
         )
         if not visible.any():
             return
 
         sel = np.array(
             [
-                [1.0 if (selected or ("atom", tile, i) in self._selected_ids) else 0.0]
+                [1.0 if (selected or ("atom", tile, i) in selected_ids) else 0.0]
                 for i in range(n)
             ],
             dtype=np.float32,
@@ -628,7 +706,10 @@ class UnitCellViewerWidget(QOpenGLWidget):
         if self._crystallography is None:
             return
 
-        na, nb, nc = self._supercell
+        if self._site_mode:
+            self._upload_site_scene()
+            return
+
         cells = self.cells()
         cell_set = set(cells)
 
@@ -796,6 +877,27 @@ class UnitCellViewerWidget(QOpenGLWidget):
                 else np.empty((0, 10), dtype=np.float32)
             )
 
+        self._set_atom_geometry(atom_blocks, bond_blocks)
+        if not atom_blocks and not self._view_fitted:
+            corners = [
+                self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32)
+                + self._cell_cart(cell)
+                - scene_centre
+                for cell in cells
+            ]
+            self._camera.fitToObject(np.vstack(corners))
+            self._view_fitted = True
+
+        if not conns_active:
+            self._conn_tube_renderer.setBonds(np.empty((0, 10), dtype=np.float32))
+        self._conn_renderer.set_lines(
+            np.array(conn_vertices, dtype=np.float32).flatten()
+            if conn_vertices
+            else np.array([], dtype=np.float32)
+        )
+
+    def _set_atom_geometry(self, atom_blocks: list, bond_blocks: list):
+        """Upload atoms and bonds, fitting the camera to the atoms when needed."""
         if atom_blocks:
             atom_arr = np.vstack(atom_blocks).astype(np.float32)
             # Atoms sharing a lattice site are merged into one sphere split
@@ -811,15 +913,6 @@ class UnitCellViewerWidget(QOpenGLWidget):
             self._multi_atom_renderer.setPoints(
                 np.empty((0, self._multi_atom_renderer._in_floats), dtype=np.float32)
             )
-            if not self._view_fitted:
-                corners = [
-                    self._crystallography.frac_to_cart(_FRAC_CORNERS).astype(np.float32)
-                    + self._cell_cart(cell)
-                    - scene_centre
-                    for cell in cells
-                ]
-                self._camera.fitToObject(np.vstack(corners))
-                self._view_fitted = True
 
         self._bond_renderer.setBonds(
             np.array(bond_blocks, dtype=np.float32)
@@ -827,12 +920,74 @@ class UnitCellViewerWidget(QOpenGLWidget):
             else np.empty((0, 10), dtype=np.float32)
         )
 
-        if not conns_active:
-            self._conn_tube_renderer.setBonds(np.empty((0, 10), dtype=np.float32))
+    def _upload_site_scene(self):
+        """Rebuild the GPU geometry for the selected site environment."""
+        self._cell_renderer.set_lines(np.array([], dtype=np.float32))
+        self._atom_label_data = []
+        self._mol_label_data = []
+
+        atom_blocks: list = []
+        bond_blocks: list = []
+        contact_vertices: list = []
+        tube_blocks: list = []
+
+        env = self._site_env
+        if env is not None and self._templates:
+            # Rotate about the target molecule
+            self._scene_centre = self._templates[env.tile]["centroid"]
+
+            def centroid(site: tuple) -> np.ndarray:
+                tmpl = self._templates[site[3]]
+                return tmpl["centroid"] + self._cell_cart(site[:3]) - self._scene_centre
+
+            molecules = [((0, 0, 0, env.tile), _SITE_TARGET_COLOR)]
+            if self._site_show_first:
+                molecules += [(site, _SITE_FIRST_COLOR) for site in env.first_shell]
+            if self._site_show_second:
+                molecules += [(site, _SITE_SECOND_COLOR) for site in env.second_shell]
+
+            for site, color in molecules:
+                self._emit_molecule(
+                    site[3],
+                    self._cell_cart(site[:3]),
+                    False,
+                    atom_blocks,
+                    bond_blocks,
+                    color=color if self._site_color_by_shell else None,
+                )
+
+            if self._site_show_empty:
+                for site in env.empty_first_shell:
+                    atom_blocks.append(
+                        np.concatenate(
+                            [centroid(site), _SITE_EMPTY_COLOR, [0.0, _SITE_EMPTY_RADIUS]]
+                        )[None, :]
+                    )
+
+            second = set(env.second_shell)
+            for start, end in self._site_contacts:
+                reaches_second = end in second
+                if not self._site_show_first or (
+                    reaches_second and not self._site_show_second
+                ):
+                    continue
+                color = _SITE_SECOND_COLOR if reaches_second else _SITE_FIRST_COLOR
+                p1, p2 = centroid(start), centroid(end)
+                contact_vertices.append(np.concatenate([p1, color]))
+                contact_vertices.append(np.concatenate([p2, color]))
+                radius = _SITE_CONTACT_RADIUS * self._conn_radius_scale
+                tube_blocks.append(np.concatenate([p1, p2, color, [radius]]))
+
+        self._set_atom_geometry(atom_blocks, bond_blocks)
         self._conn_renderer.set_lines(
-            np.array(conn_vertices, dtype=np.float32).flatten()
-            if conn_vertices
+            np.array(contact_vertices, dtype=np.float32).flatten()
+            if contact_vertices
             else np.array([], dtype=np.float32)
+        )
+        self._conn_tube_renderer.setBonds(
+            np.array(tube_blocks, dtype=np.float32)
+            if tube_blocks
+            else np.empty((0, 10), dtype=np.float32)
         )
 
     def _partition_overlaps(self, atom_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1072,10 +1227,17 @@ class UnitCellViewerWidget(QOpenGLWidget):
         dy = pos.y() - self._last_mouse_pos.y()
         self._last_mouse_pos = pos
         if event.buttons() & Qt.LeftButton:
-            # Same quaternion object-rotation as the main viewer's object mode
-            # (Camera.rotate_model at full rotationSpeed) so drags feel identical.
-            self._camera.rotate_model(dx, dy)
+            # Same camera orbit as the Crystal Viewer's default interaction mode.
+            self._camera.orbit(dx, dy)
             self.update()
+
+    def keyPressEvent(self, event):
+        step = _ARROW_KEY_ROTATION.get(event.key())
+        if step is None:
+            super().keyPressEvent(event)
+            return
+        self._camera.orbit(*step)
+        self.update()
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -1088,20 +1250,59 @@ class UnitCellViewerWidget(QOpenGLWidget):
 # ---------------------------------------------------------------------------
 
 
-class UnitCellViewerDialog(QDialog):
-    """Tools → Unit Cell Viewer dialog."""
+class _WrappedLabel(QLabel):
+    """Word-wrapped label that reserves the height its text needs at the current width."""
+
+    def __init__(self, text: str):
+        super().__init__(text)
+        self.setWordWrap(True)
+
+    def setText(self, text: str):
+        super().setText(text)
+        self.setMinimumHeight(self.heightForWidth(self.width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setMinimumHeight(self.heightForWidth(self.width()))
+
+
+class _ShareBarDelegate(QStyledItemDelegate):
+    """Draws the fraction stored in a cell's user role as a bar across the cell."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        bar = QRect(option.rect)
+        bar.setWidth(max(1, round(option.rect.width() * index.data(Qt.UserRole))))
+        painter.fillRect(bar, _SHARE_BAR_COLOR)
+
+
+def _percent(fraction: float) -> str:
+    """Whole-number percentage that does not round a small share down to zero."""
+    return "<1%" if fraction < 0.01 else f"{fraction:.0%}"
+
+
+class TopologyViewerDialog(QDialog):
+    """Crystallography → Topology Viewer dialog."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Unit Cell Viewer")
+        self.setWindowTitle("Topology Viewer")
         self.setMinimumSize(860, 580)
         self.setWindowFlags(
             self.windowFlags() | Qt.WindowMaximizeButtonHint
         )
 
-        self._viewer = UnitCellViewerWidget()
+        self._viewer = TopologyViewerWidget()
         self._structure: Structure | None = None
         self._conn_annotations: dict | None = None
+
+        # Site Types mode state
+        self._sim_checkpoint_path: Path | None = None  # checkpoint of the open simulation
+        self._site_checkpoint_path: Path | None = None  # checkpoint currently in use
+        self._site_analysis: SiteEnvironmentAnalysis | None = None
+        self._site_environments: list[SiteEnvironment] = []
+        self._site_loading_key: tuple | None = None
+        self._site_pending: int | None = None
 
         # --- Supercell controls ---
         supercell_group = QGroupBox("Supercell")
@@ -1175,10 +1376,14 @@ class UnitCellViewerDialog(QDialog):
         self._status_label = QLabel("Load a simulation folder with a structure file to view molecules.")
         self._status_label.setWordWrap(True)
 
-        # --- Appearance & export (separate non-modal dialog) ---
-        self._appearance_dialog = UnitCellAppearanceDialog(self._viewer, parent=self)
-        self._appearance_btn = QPushButton("Appearance / Export…")
+        # --- Appearance (separate non-modal dialog) ---
+        self._appearance_dialog = TopologyAppearanceDialog(self._viewer, parent=self)
+        self._appearance_btn = QPushButton("Appearance…")
         self._appearance_btn.clicked.connect(self._show_appearance_dialog)
+
+        self._export_btn = QPushButton("Export Image…")
+        self._export_btn.setToolTip("Save the current view as a standard or ray-traced image")
+        self._export_btn.clicked.connect(self._on_export_image)
 
         # --- Animation (camera keyframes + video export) ---
         self._render_worker = None
@@ -1195,13 +1400,6 @@ class UnitCellViewerDialog(QDialog):
         self._anim_toggle_btn.toggled.connect(self._on_toggle_timeline)
 
         # --- Layout ---
-        net_group = QGroupBox("Interaction Energies (Net File)")
-        net_layout = QHBoxLayout(net_group)
-        net_layout.addWidget(self._net_label)
-        net_layout.addWidget(self._import_btn)
-        net_layout.addWidget(self._clear_net_btn)
-        net_layout.addStretch()
-
         display_group = QGroupBox("Display")
         display_layout = QVBoxLayout(display_group)
         display_layout.addWidget(self._show_cell_cb)
@@ -1215,11 +1413,39 @@ class UnitCellViewerDialog(QDialog):
         )
         self._import_struct_btn.clicked.connect(self._on_import_structure)
 
+        self._site_source_label = QLabel("No checkpoint loaded")
+        self._site_source_label.setWordWrap(True)
+        open_checkpoint_btn = QPushButton("Open Checkpoint…")
+        open_checkpoint_btn.setAutoDefault(False)
+        open_checkpoint_btn.setToolTip("Read site types from a CrystoGen checkpoint file")
+        open_checkpoint_btn.clicked.connect(self._on_open_checkpoint)
+
+        # The net file only applies to Unit Cell mode, the checkpoint to Site Types.
+        self._net_file_row = QWidget()
+        net_row_layout = QHBoxLayout(self._net_file_row)
+        net_row_layout.setContentsMargins(0, 0, 0, 0)
+        net_row_layout.addWidget(self._net_label, 1)
+        net_row_layout.addWidget(self._import_btn)
+        net_row_layout.addWidget(self._clear_net_btn)
+
+        self._checkpoint_file_row = QWidget()
+        checkpoint_row_layout = QHBoxLayout(self._checkpoint_file_row)
+        checkpoint_row_layout.setContentsMargins(0, 0, 0, 0)
+        checkpoint_row_layout.addWidget(self._site_source_label, 1)
+        checkpoint_row_layout.addWidget(open_checkpoint_btn)
+        self._checkpoint_file_row.setVisible(False)
+
+        files_group = QGroupBox("Files")
+        files_layout = QVBoxLayout(files_group)
+        files_layout.addWidget(self._import_struct_btn)
+        files_layout.addWidget(self._net_file_row)
+        files_layout.addWidget(self._checkpoint_file_row)
+
         view_group = QGroupBox("View")
         view_layout = QVBoxLayout(view_group)
-        view_layout.addWidget(self._import_struct_btn)
         view_layout.addWidget(self._reset_btn)
         view_layout.addWidget(self._appearance_btn)
+        view_layout.addWidget(self._export_btn)
         view_layout.addWidget(self._anim_toggle_btn)
 
         # --- Selection panel ---
@@ -1257,15 +1483,30 @@ class UnitCellViewerDialog(QDialog):
 
         self._viewer.itemTreeChanged.connect(self._rebuild_item_list)
 
+        unit_cell_page = QWidget()
+        unit_cell_layout = QVBoxLayout(unit_cell_page)
+        unit_cell_layout.setContentsMargins(0, 0, 0, 0)
+        unit_cell_layout.addWidget(supercell_group)
+        unit_cell_layout.addWidget(display_group)
+        unit_cell_layout.addWidget(self._sources_group)
+        unit_cell_layout.addWidget(sel_group)
+        unit_cell_layout.addStretch()
+
+        self._mode_stack = QStackedWidget()
+        self._mode_stack.addWidget(self._make_scrollable(unit_cell_page))
+        self._mode_stack.addWidget(self._make_scrollable(self._build_site_page()))
+
+        self._mode_tabs = QTabBar()
+        self._mode_tabs.addTab("Unit Cell")
+        self._mode_tabs.addTab("Site Types")
+        self._mode_tabs.currentChanged.connect(self._on_mode_changed)
+
         ctrl_layout = QVBoxLayout()
-        ctrl_layout.addWidget(supercell_group)
-        ctrl_layout.addWidget(display_group)
+        ctrl_layout.addWidget(files_group)
+        ctrl_layout.addWidget(self._mode_tabs)
+        ctrl_layout.addWidget(self._mode_stack, 1)
         ctrl_layout.addWidget(view_group)
-        ctrl_layout.addWidget(self._sources_group)
-        ctrl_layout.addWidget(sel_group)
-        ctrl_layout.addWidget(net_group)
         ctrl_layout.addWidget(self._status_label)
-        ctrl_layout.addStretch()
 
         content_row = QHBoxLayout()
         content_row.addLayout(ctrl_layout, 0)
@@ -1274,6 +1515,117 @@ class UnitCellViewerDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.addLayout(content_row, 1)
         main_layout.addWidget(self._timeline_widget)
+
+    def _make_scrollable(self, page: QWidget) -> QScrollArea:
+        """Scroll a mode page vertically so short windows never squeeze its controls."""
+        scroll = QScrollArea()
+        scroll.setWidget(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scrollbar_width = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        scroll.setMinimumWidth(page.minimumSizeHint().width() + scrollbar_width)
+        return scroll
+
+    def _build_site_page(self) -> QWidget:
+        """Build the control panel for the Site Types mode."""
+        page = QWidget()
+        page.setMinimumWidth(360)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # --- Site type choice ---
+        type_group = QGroupBox("Site Type")
+        type_layout = QVBoxLayout(type_group)
+        spin_row = QHBoxLayout()
+        self._site_spin = QSpinBox()
+        self._site_spin.setEnabled(False)
+        self._site_spin.setToolTip("Site number to build")
+        self._site_build_btn = QPushButton("Build")
+        self._site_build_btn.setDefault(True)
+        self._site_build_btn.setEnabled(False)
+        self._site_build_btn.setToolTip("List every environment of this site type")
+        self._site_build_btn.clicked.connect(self._on_build_site)
+        spin_row.addWidget(QLabel("Site number"))
+        spin_row.addWidget(self._site_spin, 1)
+        spin_row.addWidget(self._site_build_btn)
+        type_layout.addLayout(spin_row)
+
+        self._site_type_table = self._make_site_table(["Site", "State", "Sites", "Tiles"])
+        self._site_type_table.itemSelectionChanged.connect(self._on_site_type_selected)
+        type_layout.addWidget(self._site_type_table)
+
+        # --- Environments of the chosen type ---
+        env_group = QGroupBox("Environments")
+        env_layout = QVBoxLayout(env_group)
+        self._env_summary_label = _WrappedLabel("Choose a site type to list its environments.")
+        env_layout.addWidget(self._env_summary_label)
+        self._env_table = self._make_site_table(
+            ["#", "Pattern", "Tile", "Sites", "Share", "1st", "2nd"]
+        )
+        self._env_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._env_table.horizontalHeader().setSectionResizeMode(
+            _ENV_SHARE_COLUMN, QHeaderView.Stretch
+        )
+        self._env_table.setItemDelegateForColumn(
+            _ENV_SHARE_COLUMN, _ShareBarDelegate(self._env_table)
+        )
+        self._env_table.itemSelectionChanged.connect(self._on_environment_selected)
+        env_layout.addWidget(self._env_table)
+
+        self._site_export_btn = QPushButton("Export Docking Site…")
+        self._site_export_btn.setAutoDefault(False)
+        self._site_export_btn.setEnabled(False)
+        self._site_export_btn.setToolTip("Save the selected environment as docking XYZ or PDB")
+        self._site_export_btn.clicked.connect(self._on_export_docking_site)
+        env_layout.addWidget(self._site_export_btn)
+
+        # --- Display of the selected environment ---
+        site_display_group = QGroupBox("Display")
+        site_display_layout = QGridLayout(site_display_group)
+        legend = QLabel(
+            '<span style="color:#ff5900">●</span> Target&nbsp;&nbsp;'
+            '<span style="color:#00d933">●</span> 1st shell&nbsp;&nbsp;'
+            '<span style="color:#2673ff">●</span> 2nd shell&nbsp;&nbsp;'
+            '<span style="color:#8c8c8c">●</span> Empty position'
+        )
+        site_display_layout.addWidget(legend, 0, 0, 1, 2)
+
+        self._site_first_cb = QCheckBox("Show 1st Shell")
+        self._site_second_cb = QCheckBox("Show 2nd Shell")
+        self._site_empty_cb = QCheckBox("Show Empty Neighbour Positions")
+        self._site_contacts_cb = QCheckBox("Show Contacts")
+        self._site_shell_color_cb = QCheckBox("Colour by Shell")
+        for index, checkbox in enumerate(
+            (
+                self._site_first_cb,
+                self._site_second_cb,
+                self._site_contacts_cb,
+                self._site_shell_color_cb,
+                self._site_empty_cb,
+            )
+        ):
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._on_site_display_changed)
+            site_display_layout.addWidget(checkbox, 1 + index // 2, index % 2)
+
+        layout.addWidget(type_group, 2)
+        layout.addWidget(env_group, 3)
+        layout.addWidget(site_display_group)
+        return page
+
+    @staticmethod
+    def _make_site_table(headers: list[str]) -> QTableWidget:
+        """Create a read-only, single-row-selection table."""
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setMinimumHeight(110)
+        return table
 
     # ------------------------------------------------------------------
     # Public API (called from MainWindow)
@@ -1288,17 +1640,19 @@ class UnitCellViewerDialog(QDialog):
         if crystallography is not None:
             self._viewer.set_crystallography(crystallography)
 
+        structure_changed = structure is not self._structure
         self._structure = structure
+        if structure_changed:
+            self._reset_site_analysis()
         self._conn_annotations = None
         self._viewer.set_conn_annotations(None)
         self._net_label.setText("No net file loaded")
         self._clear_net_btn.setEnabled(False)
 
-        has_templates = bool(structure and structure.templates)
         has_connections = bool(structure and structure.connections)
 
         self._viewer.set_structure(structure)
-        self._show_mol_cb.setEnabled(has_templates)
+        self._show_mol_cb.setEnabled(bool(structure and structure.templates))
         self._show_conn_cb.setEnabled(has_connections)
         self._show_neigh_cb.setEnabled(has_connections)
         self._appearance_dialog.set_available(has_connections)
@@ -1306,6 +1660,16 @@ class UnitCellViewerDialog(QDialog):
             sorted(structure.connections) if has_connections else []
         )
 
+        if self._mode_tabs.currentIndex() == _MODE_SITE_TYPES:
+            self._ensure_site_analysis()
+        else:
+            self._show_structure_status()
+
+    def _show_structure_status(self):
+        """Describe the loaded structure in the status line."""
+        structure = self._structure
+        has_templates = bool(structure and structure.templates)
+        has_connections = bool(structure and structure.connections)
         if has_templates and has_connections:
             n_conn = sum(len(c) for c in structure.connections.values())
             self._status_label.setText(
@@ -1322,6 +1686,306 @@ class UnitCellViewerDialog(QDialog):
                 "No molecule templates found — showing cell edges only."
             )
 
+    def set_simulation_checkpoint(self, path: Path | None):
+        """Use the open simulation's checkpoint for the Site Types mode.
+
+        A checkpoint opened by hand stays in use until the simulation changes.
+        """
+        if path == self._sim_checkpoint_path:
+            return
+        self._sim_checkpoint_path = path
+        self._use_site_checkpoint(path)
+
+    # ------------------------------------------------------------------
+    # Site Types mode
+    # ------------------------------------------------------------------
+
+    def _on_mode_changed(self, index: int):
+        self._mode_stack.setCurrentIndex(index)
+        self._net_file_row.setVisible(index != _MODE_SITE_TYPES)
+        self._checkpoint_file_row.setVisible(index == _MODE_SITE_TYPES)
+        self._viewer.set_site_mode(index == _MODE_SITE_TYPES)
+        if index != _MODE_SITE_TYPES:
+            self._show_structure_status()
+            return
+        self._ensure_site_analysis()
+        if self._site_analysis is not None:
+            self._show_site_status()
+
+    def _show_site_status(self):
+        """Describe the selected environment, or prompt for a site type."""
+        analysis = self._site_analysis
+        if self._env_table.selectedItems():
+            env = self._selected_environment()
+            message = (
+                f"Site type {env.site}, environment #{env.rank}: {len(env.first_shell)} in the "
+                f"1st shell, {len(env.second_shell)} in the 2nd."
+            )
+        else:
+            message = (
+                f"{self._site_type_table.rowCount()} site types found. "
+                "Choose one to build its environments."
+            )
+        if not analysis.populations_match:
+            message = (
+                "Warning: site counts differ from the checkpoint header, so this checkpoint "
+                f"may not match the structure file. {message}"
+            )
+        self._status_label.setText(message)
+
+    def _on_open_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Checkpoint File", "", "Checkpoint Files (*.txt);;All Files (*)"
+        )
+        if path:
+            self._use_site_checkpoint(Path(path))
+
+    def _use_site_checkpoint(self, path: Path | None):
+        self._site_checkpoint_path = path
+        self._reset_site_analysis()
+        if self._mode_tabs.currentIndex() == _MODE_SITE_TYPES:
+            self._ensure_site_analysis()
+
+    def _reset_site_analysis(self):
+        """Forget the loaded checkpoint and clear the Site Types panel."""
+        self._site_analysis = None
+        self._site_loading_key = None
+        self._site_pending = None
+        path = self._site_checkpoint_path
+        self._site_source_label.setText(path.name if path else "No checkpoint loaded")
+        self._site_spin.setEnabled(False)
+        self._site_build_btn.setEnabled(False)
+        self._site_type_table.setRowCount(0)
+        self._show_environments([], "Choose a site type to list its environments.")
+
+    def _ensure_site_analysis(self):
+        """Start reading the current checkpoint unless it is loaded or loading."""
+        path = self._site_checkpoint_path
+        if path is None:
+            self._status_label.setText(
+                "No checkpoint for this simulation. Use Open Checkpoint… to choose one."
+            )
+            return
+
+        structure = self._structure
+        if not (structure and structure.templates and structure.connections and structure.cryst):
+            self._status_label.setText(
+                "Site types need a structure file with molecules and net connectivity."
+            )
+            return
+
+        if self._site_analysis is not None or self._is_site_loading(path, structure):
+            return
+
+        self._site_loading_key = (path, structure)
+        self._site_source_label.setText(f"Reading {path.name}…")
+        worker = WorkerSiteEnvironmentLoad(path, structure)
+        worker.signals.result.connect(self._on_site_analysis_loaded)
+        worker.signals.error.connect(self._on_site_worker_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _is_site_loading(self, path: Path, structure: Structure) -> bool:
+        key = self._site_loading_key
+        return key is not None and key[0] == path and key[1] is structure
+
+    def _on_site_worker_failed(self, error: tuple):
+        logger.error("Site type analysis failed: %s", error[2])
+        self._site_loading_key = None
+        self._site_pending = None
+        if self._site_checkpoint_path is not None:
+            self._site_source_label.setText(self._site_checkpoint_path.name)
+        self._status_label.setText(f"Could not read site types: {error[2]}")
+
+    def _on_site_analysis_loaded(self, analysis: SiteEnvironmentAnalysis):
+        # Ignore results for a checkpoint or structure that has since been replaced
+        if not self._is_site_loading(analysis.checkpoint_path, analysis.structure):
+            return
+        self._site_loading_key = None
+        self._site_analysis = analysis
+        self._site_source_label.setText(analysis.checkpoint_path.name)
+
+        summaries = analysis.site_types()
+        self._site_spin.setRange(1, analysis.n_ungrown_types * 2)
+        self._site_spin.setValue(summaries[0].site)
+        self._site_spin.setEnabled(True)
+        self._site_build_btn.setEnabled(True)
+
+        table = self._site_type_table
+        table.blockSignals(True)
+        table.setRowCount(len(summaries))
+        for row, summary in enumerate(summaries):
+            values = (
+                summary.site,
+                "Grown" if summary.grown else "Growth site",
+                f"{summary.count:,}",
+                ", ".join(f"M{tile}" for tile in summary.tiles),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, summary.site)
+                table.setItem(row, column, item)
+        table.blockSignals(False)
+
+        self._show_site_status()
+
+    def _on_site_type_selected(self):
+        items = self._site_type_table.selectedItems()
+        if items:
+            self._site_spin.setValue(items[0].data(Qt.UserRole))
+            self._on_build_site()
+
+    def _on_build_site(self):
+        analysis = self._site_analysis
+        site = self._site_spin.value()
+        self._site_pending = site
+
+        table = self._site_type_table
+        table.blockSignals(True)
+        table.clearSelection()
+        for row in range(table.rowCount()):
+            if table.item(row, 0).data(Qt.UserRole) == site:
+                table.selectRow(row)
+                table.scrollToItem(table.item(row, 0))
+                break
+        table.blockSignals(False)
+
+        self._status_label.setText(f"Building site type {site}…")
+        worker = WorkerSiteEnvironmentBuild(analysis, site)
+        worker.signals.result.connect(self._on_site_built)
+        worker.signals.error.connect(self._on_site_worker_failed)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_site_built(self, result: tuple):
+        analysis, site, environments = result
+        if analysis is not self._site_analysis or site != self._site_pending:
+            return
+        self._site_pending = None
+
+        if not environments:
+            self._show_environments([], f"Site type {site} is not present in this checkpoint.")
+            self._status_label.setText(f"Site type {site} has no sites to show.")
+            return
+
+        self._show_environments(environments, self._environment_summary(environments))
+
+    @staticmethod
+    def _environment_summary(environments: list[SiteEnvironment]) -> str:
+        """Describe how a site type's instances spread over its environments."""
+        total = sum(env.count for env in environments)
+        if len(environments) == 1:
+            return f"1 environment across {total:,} sites."
+
+        patterns = {env.pattern: env.pattern_fraction for env in environments}
+        shown = ", ".join(f"P{p} {_percent(patterns[p])}" for p in sorted(patterns)[:4])
+        if len(patterns) > 4:
+            shown += ", …"
+
+        top = environments[0]
+        tied = sum(env.count == top.count for env in environments)
+        most_common = (
+            f"#{top.rank} is the most common with {top.count:,} sites ({top.fraction:.1%})."
+            if tied == 1
+            else f"{tied} are tied as most common with {top.count:,} sites each "
+            f"({top.fraction:.1%})."
+        )
+        return (
+            f"{len(environments):,} environments across {total:,} sites, in "
+            f"{len(patterns)} first-shell patterns ({shown}). {most_common}"
+        )
+
+    def _show_environments(self, environments: list[SiteEnvironment], summary: str):
+        """Fill the environment table and select the most common entry."""
+        self._site_environments = environments
+        self._env_summary_label.setText(summary)
+
+        table = self._env_table
+        table.blockSignals(True)
+        table.clearSelection()
+        table.setRowCount(len(environments))
+        top_count = environments[0].count if environments else 0
+        bold = QFont()
+        bold.setBold(True)
+        for row, env in enumerate(environments):
+            is_top = env.count == top_count
+            values = (
+                f"★ {env.rank}" if is_top else str(env.rank),
+                f"P{env.pattern}",
+                f"M{env.tile}",
+                f"{env.count:,}",
+                f"{env.fraction:.1%}",
+                len(env.first_shell),
+                len(env.second_shell),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if is_top:
+                    item.setFont(bold)
+                if column == _ENV_SHARE_COLUMN:
+                    item.setData(Qt.UserRole, env.fraction)
+                table.setItem(row, column, item)
+        table.blockSignals(False)
+
+        if environments:
+            table.selectRow(0)
+        else:
+            self._site_export_btn.setEnabled(False)
+            self._viewer.set_site_environment(None, [])
+
+    def _selected_environment(self) -> SiteEnvironment:
+        return self._site_environments[self._env_table.selectedItems()[0].row()]
+
+    def _on_environment_selected(self):
+        if not self._env_table.selectedItems():
+            return
+        env = self._selected_environment()
+        self._viewer.set_site_environment(env, self._site_analysis.contacts(env))
+        self._site_export_btn.setEnabled(True)
+        self._show_site_status()
+
+    def _on_site_display_changed(self):
+        self._viewer.set_site_display(
+            self._site_first_cb.isChecked(),
+            self._site_second_cb.isChecked(),
+            self._site_empty_cb.isChecked(),
+            self._site_contacts_cb.isChecked(),
+            self._site_shell_color_cb.isChecked(),
+        )
+
+    def _on_export_docking_site(self):
+        env = self._selected_environment()
+        analysis = self._site_analysis
+        source = analysis.checkpoint_path
+        root = source.stem.removesuffix("_checkpoint")
+        default = source.parent / f"{root}_site{env.site}_env{env.rank}_docking.XYZ"
+
+        xyz_filter = "Docking XYZ (*.XYZ)"
+        pdb_filter = "PDB (*.pdb)"
+        chosen, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export Docking Site", str(default), f"{xyz_filter};;{pdb_filter}"
+        )
+        if not chosen:
+            return
+
+        as_pdb = selected_filter == pdb_filter
+        path = Path(chosen).with_suffix(".pdb" if as_pdb else ".XYZ")
+        try:
+            if as_pdb:
+                cryst = analysis.structure.cryst
+                write_docking_pdb(
+                    path,
+                    analysis.docking_data(env, path),
+                    self._viewer._templates,
+                    a_axis=cryst.cell.a,
+                    crystallography=cryst,
+                )
+            else:
+                analysis.write_docking_xyz(path, env)
+        except (OSError, ValueError) as exc:
+            logger.exception("Failed to export docking site: %s", exc)
+            QMessageBox.critical(self, "Export Docking Site", str(exc))
+            return
+        self._status_label.setText(f"Docking site exported: {path.name}")
+
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
@@ -1334,6 +1998,20 @@ class UnitCellViewerDialog(QDialog):
         self._appearance_dialog.show()
         self._appearance_dialog.raise_()
         self._appearance_dialog.activateWindow()
+
+    def _on_export_image(self):
+        """Ask for the image format, then hand over to that format's export."""
+        standard = "Standard Image (PNG)"
+        raytraced = "Ray-Traced Image (POV-Ray/Tachyon)"
+        image_format, ok = QInputDialog.getItem(
+            self, "Export Image", "Format:", [standard, raytraced], 0, False
+        )
+        if not ok:
+            return
+        if image_format == standard:
+            self._viewer.export_image_dialog()
+        else:
+            self._viewer.export_raytrace_dialog()
 
     # ------------------------------------------------------------------
     # Animation: camera keyframes + video export
@@ -1689,12 +2367,12 @@ class UnitCellViewerDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point (``cgaspects-uc``)
+# Standalone entry point (``cgaspects-top``)
 # ---------------------------------------------------------------------------
 
 
 def main():
-    """Launch the Unit Cell Viewer as a standalone window (``cgaspects-uc``)."""
+    """Launch the Topology Viewer as a standalone window (``cgaspects-top``)."""
     import argparse
     import sys
 
@@ -1702,7 +2380,7 @@ def main():
     from PySide6.QtWidgets import QApplication
 
     parser = argparse.ArgumentParser(
-        description="Open the CGAspects Unit Cell / Crystal Net viewer."
+        description="Open the CGAspects Topology Viewer."
     )
     parser.add_argument(
         "structure",
@@ -1717,9 +2395,9 @@ def main():
     QSurfaceFormat.setDefaultFormat(fmt)
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("CGAspects Unit Cell Viewer")
+    app.setApplicationName("CGAspects Topology Viewer")
 
-    dialog = UnitCellViewerDialog()
+    dialog = TopologyViewerDialog()
     if args.structure:
         structure = Structure.from_file(args.structure)
         dialog.set_structure(structure, structure.cryst)

@@ -67,7 +67,7 @@ nav:
       - Slicing: features/slicing.md
       - Site Highlighting: features/site-highlighting.md
       - Lattice Parameters: features/lattice-parameters.md
-      - Unit Cell Viewer: features/unit-cell-viewer.md
+      - Topology Viewer: features/topology-viewer.md
   - Analysis:
       - Aspect Ratios: analysis/aspect-ratios.md
       - Growth Rates: analysis/growth-rates.md

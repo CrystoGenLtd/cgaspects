@@ -182,7 +182,7 @@ def build_scene_from_widget(widget, width: int, height: int,
             cylinders = np.column_stack(
                 [starts, ends, bonds[:, 6:9], radii]).astype(np.float32)
 
-        # Optional extra cylinder set (e.g. the unit cell viewer's energy-scaled
+        # Optional extra cylinder set (e.g. the topology viewer's energy-scaled
         # interaction tubes) — absent on widgets that don't define it.
         extra_renderer = getattr(widget, "conn_tube_renderer", None)
         if extra_renderer is not None:

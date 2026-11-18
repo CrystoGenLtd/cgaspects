@@ -54,7 +54,7 @@ from .dialogs.planes_dialog import PlanesDialog
 from .dialogs.render_settings_dialog import RenderSettingsDialog
 from .dialogs.settings import SettingsDialog
 from .dialogs.site_highlight_dialog import SiteHighlightDialog
-from .dialogs.unit_cell_viewer_dialog import UnitCellViewerDialog
+from .dialogs.topology_viewer_dialog import TopologyViewerDialog
 from .load_ui import Ui_MainWindow
 from .shortcuts_manager import ShortcutsManager
 from .utils.crystallography import Crystallography
@@ -239,8 +239,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.atom_mode_settings_dialog.settingsChanged.connect(self._handle_atom_mode_settings)
         self.openglwidget.viewStateChanged.connect(self._on_view_state_changed)
 
-        # Create unit cell viewer dialog (Tools menu)
-        self.unit_cell_viewer_dialog = UnitCellViewerDialog(parent=self)
+        # Create topology viewer dialog (Tools menu)
+        self.topology_viewer_dialog = TopologyViewerDialog(parent=self)
 
         # Create site highlighting dialog
         self.site_highlight_dialog = SiteHighlightDialog(parent=self)
@@ -624,12 +624,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
         self.menuCrystallography.addSeparator()
 
-        self.actionUnitCellViewer = QAction("Unit Cell Viewer", self)
-        self.actionUnitCellViewer.setToolTip(
-            "View the unit cell, molecule templates, and crystal net connections"
+        self.actionTopologyViewer = QAction("Topology Viewer", self)
+        self.actionTopologyViewer.setToolTip(
+            "View the unit cell, crystal net connections, and site-type environments"
         )
-        self.actionUnitCellViewer.triggered.connect(self.show_unit_cell_viewer)
-        self.menuCrystallography.addAction(self.actionUnitCellViewer)
+        self.actionTopologyViewer.triggered.connect(self.show_topology_viewer)
+        self.menuCrystallography.addAction(self.actionTopologyViewer)
 
         # Tools menu
         self.menuTools = QMenu("Tools", self)
@@ -805,12 +805,13 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self._keyboard_shortcuts_dialog.raise_()
         self._keyboard_shortcuts_dialog.activateWindow()
 
-    def show_unit_cell_viewer(self):
-        """Open the Unit Cell / Net Viewer dialog (Tools menu)."""
-        self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
-        self.unit_cell_viewer_dialog.set_structure(self._structure, self.crystallography)
-        self.unit_cell_viewer_dialog.show()
-        self.unit_cell_viewer_dialog.raise_()
+    def show_topology_viewer(self):
+        """Open the Topology Viewer dialog (Crystallography menu)."""
+        self.topology_viewer_dialog.set_crystallography(self.crystallography)
+        self.topology_viewer_dialog.set_structure(self._structure, self.crystallography)
+        self._sync_topology_checkpoint()
+        self.topology_viewer_dialog.show()
+        self.topology_viewer_dialog.raise_()
 
     def show_thread_monitor(self):
         from .dialogs.thread_monitor_dialog import ThreadMonitorDialog
@@ -855,7 +856,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 # Update crystallography dialogs
                 self.directions_dialog.set_crystallography(self.crystallography)
                 self.planes_dialog.set_crystallography(self.crystallography)
-                self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
+                self.topology_viewer_dialog.set_crystallography(self.crystallography)
 
                 self.log_message(
                     f"Axes converted to fractional coordinates using lattice parameters: "
@@ -1788,7 +1789,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 # Update crystallography dialogs
                 self.directions_dialog.set_crystallography(self.crystallography)
                 self.planes_dialog.set_crystallography(self.crystallography)
-                self.unit_cell_viewer_dialog.set_crystallography(self.crystallography)
+                self.topology_viewer_dialog.set_crystallography(self.crystallography)
 
                 self.log_message(
                     f"Auto-loaded lattice parameters: a={cell.a:.2f} b={cell.b:.2f} c={cell.c:.2f}",
@@ -1799,7 +1800,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.openglwidget.set_molecular_data(
                     self._structure.templates, self.crystallography
                 )
-                self.unit_cell_viewer_dialog.set_structure(self._structure, self.crystallography)
+                self.topology_viewer_dialog.set_structure(self._structure, self.crystallography)
                 self.log_message(
                     f"Loaded {len(self._structure.templates)} molecule template(s) — "
                     "press Shift+V to switch to Atom view",
@@ -2114,8 +2115,16 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def _update_checkpoint_for_current_xyz(self):
         """Reload checkpoint data for the new XYZ if Checkpoint mode is active."""
+        self._sync_topology_checkpoint()
         if self.openglwidget.vis_mode == "Checkpoint":
             self._load_checkpoint_for_current_xyz()
+
+    def _sync_topology_checkpoint(self):
+        """Point the Topology Viewer's Site Types mode at the current simulation."""
+        path = None
+        if self.sim_num is not None and self.xyz_files:
+            path = self._checkpoint_file_map.get(self.xyz_files[self.sim_num])
+        self.topology_viewer_dialog.set_simulation_checkpoint(path)
 
     def _load_docking_for_current_xyz(self):
         """Load docking data for the current XYZ into the GL widget (for Docking style)."""
